@@ -19,8 +19,7 @@ h5t = "h5t._cli:main"
 dev = [
     "pytest>=8",
     "hypothesis>=6",
-    "mypy>=1.11",
-    "pyright>=1.1.380",
+    "ty>=0.1",
     "ruff>=0.6",
 ]
 
@@ -47,21 +46,9 @@ convention = "numpy"
 # (h5t.Dataset[h5t.f8, "n"]), which tests and the typing spike exercise on
 # purpose; B018 fires on attribute access inside pytest.raises blocks.
 "tests/**" = ["D", "F722", "F821", "UP037", "B018"]
-"typing_spike/**" = ["D", "F722", "F821", "UP037"]
 
-[tool.mypy]
-python_version = "3.11"
-strict = true
-files = ["src/h5t"]
-
-[[tool.mypy.overrides]]
-module = ["h5py", "h5py.*"]
-ignore_missing_imports = true
-
-[tool.pyright]
+[tool.ty.src]
 include = ["src/h5t"]
-pythonVersion = "3.11"
-typeCheckingMode = "standard"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
