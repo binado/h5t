@@ -1,0 +1,16 @@
+[[repos]]
+repo = "https://github.com/astral-sh/ruff-pre-commit"
+rev = "v0.16.4" # Ruff version.
+hooks = [
+    # Run the linter.
+    { id = "ruff-check", types_or = ["python", "pyi"] },
+    # Run the formatter.
+    { id = "ruff-format", types_or = ["python", "pyi"] },
+]
+
+[[repos]]
+repo = "https://github.com/astral-sh/ty-pre-commit"
+rev = "v0.0.74" # ty version.
+hooks = [
+    { id = "ty" },
+]
