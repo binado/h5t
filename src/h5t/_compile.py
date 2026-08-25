@@ -132,9 +132,13 @@ def _field_spec(
     elif is_group:
         kind = MemberKind.GROUP
         member_type = core
-    elif core is np.ndarray:
+    elif core is np.ndarray or typing.get_origin(core) is np.ndarray:
+        # Accept npt.NDArray[...] aliases. The dtype parameter is not validated
+        # (the adapter degrades to an isinstance check), so normalize to the
+        # plain type to keep declaration equivalence dtype-agnostic.
         kind = MemberKind.ARRAY
         member_type = None
+        core = np.ndarray
     elif _is_scalar_annotation(core):
         kind = MemberKind.ATTRIBUTE
         member_type = None

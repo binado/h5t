@@ -76,7 +76,9 @@ exits. Schema objects cannot be directly constructed, written, or serialized by 
 | scalar or `Literal[...]` | attribute | Pydantic validation |
 
 `Name("stored-name")` renames any field kind. `Attr` is valid only for attributes and
-`Eager` only for typed datasets. Unsupported collection-shaped child annotations fail
+`Eager` only for typed datasets. A parameterized alias such as
+`numpy.typing.NDArray[np.floating]` is accepted wherever `np.ndarray` is; the dtype
+parameter is not validated. Unsupported collection-shaped child annotations fail
 at class creation; dynamic collections are not yet supported.
 
 Each `Group` and `Dataset` subclass accepts `extras="ignore"` (the default) or

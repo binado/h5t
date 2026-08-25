@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 import h5t
@@ -34,6 +35,31 @@ def test_every_field_kind_and_markers_compile() -> None:
     assert fields["lazy"].kind is MemberKind.DATASET
     assert fields["eager"].eager
     assert fields["child"].kind is MemberKind.GROUP
+
+
+def test_ndarray_typing_aliases_classify_as_arrays() -> None:
+    class Aliased(h5t.Group):
+        payload: npt.NDArray[np.float64]
+        optional_payload: npt.NDArray[Any] | None
+
+    fields = {field.py_name: field for field in Aliased.__h5spec__.fields}
+    assert fields["payload"].kind is MemberKind.ARRAY
+    assert fields["optional_payload"].kind is MemberKind.ARRAY
+    assert fields["optional_payload"].optional
+
+
+def test_plain_and_aliased_ndarray_are_equivalent_in_diamonds() -> None:
+    class PlainBase(h5t.Group):
+        values: np.ndarray
+
+    class AliasBase(h5t.Group):
+        values: npt.NDArray[np.float64]
+
+    class Diamond(PlainBase, AliasBase):
+        pass
+
+    fields = {field.py_name: field for field in Diamond.__h5spec__.fields}
+    assert fields["values"].kind is MemberKind.ARRAY
 
 
 def test_inheritance_defaults_and_extras() -> None:
