@@ -18,13 +18,18 @@ from typing import Annotated, Literal
 import h5t
 
 
-class Posterior(h5t.Group, dims={"n_samples": h5t.FromAttr("n_samples")}):
-    mass_1: h5t.Dataset[h5t.f8, "n_samples"]
-    mass_2: h5t.Dataset[h5t.f8, "n_samples"]
-    log_likelihood: h5t.Dataset[h5t.f8, "n_samples"]
-    psd: h5t.Dataset[h5t.f8, "n_freq 2"]
+class Posterior(h5t.Group):
+    mass_1: h5t.Dataset[h5t.f8]
+    mass_2: h5t.Dataset[h5t.f8]
+    log_likelihood: h5t.Dataset[h5t.f8]
+    psd: h5t.Dataset[h5t.f8]
+    n_samples: int
     approximant: str
     f_ref: float = 20.0
+
+    def validate(self) -> None:
+        if self.mass_1.shape != (self.n_samples,):
+            raise h5t.Invalid("mass_1 must match n_samples")
 
 
 class PEResult(h5t.File):

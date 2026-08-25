@@ -16,11 +16,8 @@ import importlib
 import sys
 from typing import NoReturn
 
-import h5py
-
 from h5t._compile import File
 from h5t._errors import SchemaError
-from h5t._validate import run_validation
 
 
 def _fail(message: str) -> NoReturn:
@@ -72,16 +69,11 @@ def _cmd_check(args: argparse.Namespace) -> int:
     except SchemaError as exc:
         _fail(f"schema {args.schema!r} is incoherent: {exc}")
     try:
-        h5file = h5py.File(args.file, mode="r")
+        view = schema.open(args.file, validate=False)
     except OSError as exc:
         _fail(f"could not open {args.file!r}: {exc}")
-    with h5file:
-        report = run_validation(
-            schema.__h5spec__,
-            h5file,
-            filename=args.file,
-            schema_name=schema.__name__,
-        )
+    with view:
+        report = view.check()
     print(report.render())
     return 0 if report.ok else 1
 

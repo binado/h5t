@@ -1,8 +1,7 @@
-"""The plain spec tree that every schema class compiles to (PLAN.md section 9).
+"""The structural spec tree compiled from schema-class annotations.
 
-Class syntax is a front-end: ``__init_subclass__`` compiles annotations into
-this tree, and every operation — validate, read, describe — is a function
-over it that never touches class syntax.
+Built-in checks and view construction operate on these nodes. Each node
+also retains its view type so validation can invoke user-defined hooks.
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ from typing import Any
 import numpy as np
 
 from h5t._dtypes import DType, normalize_str
-from h5t._shape import Shape as ShapeTerms
 
 # --------------------------------------------------------------------------
 # Public annotation markers
@@ -48,46 +46,6 @@ class Keys:
     """
 
     pattern: str
-
-
-@dataclass(frozen=True)
-class Shape:
-    """Declare or rebind the shape of a dataset member in ``Annotated`` metadata.
-
-    This is the statically-checked spelling of the shape subscript:
-    ``Annotated[h5t.Dataset[h5t.f8], h5t.Shape("n_samples")]``. A bare
-    string in metadata position is accepted as shorthand.
-
-    Parameters
-    ----------
-    shape : str
-        A shape string in the grammar of PLAN.md section 4.
-    """
-
-    shape: str
-
-
-@dataclass(frozen=True)
-class FromAttr:
-    """Bind a declared dimension to an attribute of the declaring group.
-
-    The attribute value is resolved before dataset shapes are checked and
-    is authoritative: it is the difference between "these datasets agree
-    with each other" and "these datasets agree with the file's claimed
-    size".
-
-    Parameters
-    ----------
-    attr : str
-        HDF5 attribute name on the declaring group.
-    """
-
-    attr: str
-
-
-DimSource = FromAttr | None
-"""Source of a declared dimension: an attribute binding, or none (the
-declaration then only claims the dim as local to its class)."""
 
 
 class Extras(Enum):
@@ -226,8 +184,6 @@ class DatasetSpec:
     dtype : type of DType or None
         Declared element dtype token; ``None`` only in incomplete
         templates, never in a compiled member.
-    shape : tuple of dimension terms or None
-        Parsed shape terms; ``None`` only in incomplete templates.
     attrs : tuple of AttrSpec
         Attributes declared on the dataset itself.
     optional : bool
@@ -239,7 +195,6 @@ class DatasetSpec:
     py_name: str
     h5_name: str
     dtype: type[DType] | None
-    shape: ShapeTerms | None
     attrs: tuple[AttrSpec, ...] = ()
     optional: bool = False
     view_type: type | None = field(default=None, compare=False, repr=False)
@@ -252,8 +207,7 @@ class DynamicSpec:
     Attributes
     ----------
     item : GroupSpec or DatasetSpec
-        Schema every selected child must satisfy. Each child starts an
-        independent dimension scope.
+        Schema every selected child must satisfy.
     pattern : str or None
         ``Keys`` regular expression selecting children; ``None`` selects
         every child.
@@ -277,10 +231,6 @@ class GroupSpec:
         Statically declared child nodes, in declaration order.
     attrs : tuple of AttrSpec
         Attributes declared on the group.
-    dims : tuple of (str, DimSource) pairs
-        Dimensions *declared* by the class (the ``dims=`` kwarg). Declared
-        dims bind locally: every use of the class gets an independent
-        binding.
     extras : Extras
         Policy for undeclared children and attrs.
     dynamic : DynamicSpec or None
@@ -296,7 +246,6 @@ class GroupSpec:
     h5_name: str
     children: tuple[GroupSpec | DatasetSpec, ...] = ()
     attrs: tuple[AttrSpec, ...] = ()
-    dims: tuple[tuple[str, DimSource], ...] = ()
     extras: Extras = Extras.IGNORE
     dynamic: DynamicSpec | None = None
     optional: bool = False

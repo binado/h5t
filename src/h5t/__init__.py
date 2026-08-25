@@ -1,14 +1,14 @@
 """h5t: a schema layer for HDF5.
 
-Declare your file format as a Python class, validate files without reading
-dataset payloads, and share the class so downstream users load files
+Declare your file format as a Python class, validate its structure and
+domain invariants, and share the class so downstream users load files
 correctly.
 
 Examples
 --------
 >>> import h5t
 >>> class Posterior(h5t.Group):
-...     mass_1: h5t.Dataset[h5t.f8, "n_samples"]
+...     mass_1: h5t.Dataset[h5t.f8]
 ...     approximant: str
 >>> class PEResult(h5t.File):
 ...     runs: h5t.Group[Posterior]
@@ -33,6 +33,7 @@ from h5t._dtypes import (
 from h5t._errors import (
     ClosedFileError,
     H5TError,
+    Invalid,
     Problem,
     SchemaError,
     SchemaMismatchError,
@@ -40,7 +41,7 @@ from h5t._errors import (
     ValidationError,
     ValidationReport,
 )
-from h5t._spec import FromAttr, Keys, Name, Shape
+from h5t._spec import Keys, Name
 
 __version__ = "0.1.0"
 
@@ -49,16 +50,15 @@ __all__ = [
     "DType",
     "Dataset",
     "File",
-    "FromAttr",
     "Group",
     "H5TError",
+    "Invalid",
     "Keys",
     "Name",
     "Problem",
     "SchemaError",
     "SchemaMismatchError",
     "Severity",
-    "Shape",
     "ValidationError",
     "ValidationReport",
     "__version__",

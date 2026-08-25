@@ -19,7 +19,6 @@ import numpy as np
 from h5t._errors import (
     ClosedFileError,
     SchemaMismatchError,
-    ValidationError,
     ValidationReport,
 )
 from h5t._spec import AttrSpec, DatasetSpec, GroupSpec, NodeSpec, child_path
@@ -87,6 +86,26 @@ class ViewBase:
     _h5t_ctx: FileContext
     _h5t_path: str
 
+    def validate(self) -> None:
+        """Validate domain invariants for this node.
+
+        Schema classes override this hook and inspect ``self`` directly.
+        Raise :class:`h5t.Invalid` to add a finding to the aggregate report.
+        The base implementation accepts every node.
+        """
+
+    def check(self) -> ValidationReport:
+        """Recursively validate this view and return all findings."""
+        return run_validation(
+            self,
+            filename=self._h5t_ctx.filename,
+            schema_name=type(self).__name__,
+        )
+
+    def _h5t_bind(self, spec: NodeSpec, path: str) -> Any:
+        """Build another typed view sharing this view's file context."""
+        return make_view(spec, self._h5t_ctx, path)
+
     def _h5t_node(self) -> h5py.Group | h5py.Dataset:
         """Return the underlying h5py object for this view's path."""
         h5file = self._h5t_ctx.require()
@@ -137,7 +156,7 @@ def make_view(spec: NodeSpec, ctx: FileContext, path: str) -> Any:
 
 
 class GroupViewOps(ViewBase):
-    """Mapping semantics and validation entry points for group views.
+    """Mapping semantics for group views.
 
     The mapping API preserves HDF5's two namespaces: ``g["name"]``
     addresses a child and ``g.attrs["name"]`` addresses an attr. Bracket
@@ -184,37 +203,6 @@ class GroupViewOps(ViewBase):
                 )
             return make_view(dynamic.item, self._h5t_ctx, child_path(self._h5t_path, key))
         return group[key]
-
-    def validate(self) -> None:
-        """Validate the file subtree rooted at this view; raise on problems.
-
-        Raises
-        ------
-        ValidationError
-            Batching every problem found in the walk. The file handle is
-            left open (it is owned by the enclosing context manager).
-        """
-        report = self.check()
-        if not report.ok:
-            raise ValidationError(report, file_closed=False)
-
-    def check(self) -> ValidationReport:
-        """Run the same walk as :meth:`validate` but return the report.
-
-        Returns
-        -------
-        ValidationReport
-            All findings; empty when the subtree conforms.
-        """
-        spec = self._h5t_spec
-        assert isinstance(spec, GroupSpec)
-        return run_validation(
-            spec,
-            self._h5t_group(),
-            filename=self._h5t_ctx.filename,
-            schema_name=type(self).__name__,
-            base_path=self._h5t_path,
-        )
 
 
 def _dynamic_match(pattern: str | None, key: str) -> bool:

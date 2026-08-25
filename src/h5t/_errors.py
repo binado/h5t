@@ -1,9 +1,8 @@
 """Exception types and the structured validation report.
 
-Two error channels are kept strictly separate (PLAN.md section 6):
-
-- :class:`SchemaError` means *the schema itself* is incoherent.
-- :class:`ValidationError` means *the file* does not match a coherent schema.
+``SchemaError`` describes an incoherent declaration, ``Invalid`` is the
+local signal used inside node hooks, and ``ValidationError`` aggregates a
+file's reported problems.
 """
 
 from __future__ import annotations
@@ -20,8 +19,17 @@ class SchemaError(H5TError):
     """The schema declaration itself is incoherent.
 
     Raised at class-creation time (or by ``validate_schema()``) for problems
-    such as unresolvable dtypes, malformed shape strings, duplicate HDF5
-    names within one namespace, or conflicting redeclarations across bases.
+    such as unresolvable dtypes, duplicate HDF5 names within one namespace,
+    or conflicting redeclarations across bases.
+    """
+
+
+class Invalid(H5TError):
+    """Signal invalid content from a user-defined node validator.
+
+    The validation walk catches this exception, attaches the invoking
+    node's path, and records its message in the aggregate report. Other
+    exceptions propagate as bugs in validator code.
     """
 
 
