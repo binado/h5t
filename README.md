@@ -1,88 +1,114 @@
 # h5t
 
-*A schema layer for HDF5: declare your file format as a Python class, validate its
-structure and domain invariants, and share the class so downstream users load files
-correctly.*
-
-## Why
-
-HDF5 in scientific Python is an undocumented nested dict. `h5t` checks the repetitive
-parts of a format — names, node kinds, dtypes, and attrs — and lets ordinary Python
-express relationships between nodes. Built-in checks read metadata only; custom
-validators may also inspect dataset values when the format requires it.
+`h5t` loads HDF5 groups into detached, typed Python records. Group attributes and
+ordinary NumPy-array fields are materialized while the file is open. Typed datasets
+keep snapshot metadata and can read their payload lazily without retaining an open
+file descriptor.
 
 ## Example
 
 ```python
-from typing import Annotated, Literal
+import json
+from pathlib import Path
+from typing import Annotated, Any
+
+import numpy as np
 
 import h5t
 
 
-class Posterior(h5t.Group):
-    """Posterior samples from one PE run."""
-
-    mass_1: h5t.Dataset[h5t.f8]
-    mass_2: h5t.Dataset[h5t.f8]
-    log_likelihood: h5t.Dataset[h5t.f8]
-    spins: h5t.Dataset[h5t.f8] | None  # optional member
-    psd: h5t.Dataset[h5t.f8]
-
-    n_samples: int
-    approximant: str  # attr, by elimination
-    f_ref: float = 20.0  # default applied on write
-
-    def validate(self) -> None:
-        expected = (self.n_samples,)
-        if self.mass_1.shape != expected:
-            raise h5t.Invalid(f"mass_1 must have shape {expected}")
-        if self.mass_2.shape != expected:
-            raise h5t.Invalid(f"mass_2 must have shape {expected}")
-        if self.log_likelihood.shape != expected:
-            raise h5t.Invalid(f"log_likelihood must have shape {expected}")
-        if self.spins is not None and self.spins.shape != (self.n_samples, 3):
-            raise h5t.Invalid(f"spins must have shape ({self.n_samples}, 3)")
-        if self.psd.ndim != 2 or self.psd.shape[1] != 2:
-            raise h5t.Invalid("psd must have shape (n_freq, 2)")
+class Measurement(h5t.Dataset, extras="forbid"):
+    unit: str
 
 
-class PEResult(h5t.File, extras="ignore"):
-    """LVK-style parameter estimation result."""
+class Nested(h5t.Group):
+    label: str
 
-    runs: Annotated[
-        h5t.Group[Posterior],
-        h5t.Keys(pattern=r"C\d+:.*"),
+
+class Result(h5t.Group, extras="ignore"):
+    version: int                              # implicit HDF5 attribute
+    title: Annotated[str, h5t.Name("name")] # renamed attribute
+    config: Annotated[
+        dict[str, Any],
+        h5t.Attr(converter=json.loads),
     ]
-    format_version: Annotated[
-        Literal["1.0"],
-        h5t.Name("version"),
-    ]
+    array_attr: Annotated[np.ndarray, h5t.Attr()]
+    values: np.ndarray                        # eager dataset payload
+    measurement: Measurement                  # lazy detached dataset
+    eager_measurement: Annotated[Measurement, h5t.Eager()]
+    nested: Nested                            # recursively loaded group
+    note: str | None                          # absent becomes None
+    revision: int = 1                         # absent uses a validated default
+
+
+result = Result.from_file(Path("result.h5"), root="/")
 ```
+
+`result.attrs` and `result.measurement.attrs` are immutable mappings keyed by their
+on-disk HDF5 names. Declared attributes contain their Pydantic-processed values;
+undeclared attributes retained under `extras="ignore"` contain the raw h5py values.
+
+Typed datasets expose snapshot metadata and explicit data access:
 
 ```python
-with PEResult.open("GW150914.h5") as f:  # validated on open
-    m1 = f.runs["C01:IMRPhenomXPHM"].mass_1[:]  # reads only here
+dataset = result.measurement
+dataset.path, dataset.shape, dataset.dtype, dataset.ndim
+
+complete = dataset.data      # first access reads and caches an ndarray
+assert dataset.read() is complete
+
+with dataset.open() as live:
+    first_hundred = live[:100]  # fresh file view, useful for slices
 ```
+
+Both `from_file()` and `Dataset.open()` close every handle on normal and exceptional
+exits. Schema objects cannot be directly constructed, written, or serialized by h5t.
+
+## Field rules
+
+| Annotation | HDF5 representation | Loading behavior |
+| --- | --- | --- |
+| `Group` subclass | child group | recursively materialized |
+| `Dataset` or subclass | child dataset | metadata/attrs snapshot, payload lazy |
+| `Annotated[DatasetSubtype, Eager()]` | child dataset | complete payload cached during loading |
+| `np.ndarray` | child dataset | complete payload loaded as an ndarray |
+| `Annotated[T, Attr(...)]` | attribute | converter, then Pydantic validation |
+| scalar or `Literal[...]` | attribute | Pydantic validation |
+
+`Name("stored-name")` renames any field kind. `Attr` is valid only for attributes and
+`Eager` only for typed datasets. Unsupported collection-shaped child annotations fail
+at class creation; dynamic collections are not yet supported.
+
+Each `Group` and `Dataset` subclass accepts `extras="ignore"` (the default) or
+`extras="forbid"`. A group policy applies to its immediate child and attribute
+names. A typed dataset policy applies to its attributes. Nested schemas keep their own
+policy, while a plain `np.ndarray` field never checks the dataset's attributes.
+
+## Snapshot consistency
+
+A loaded model is a snapshot, with one deliberate exception:
+
+- Group and dataset attributes, dataset shape/dtype/path, eager datasets, and plain
+  arrays reflect the file during `from_file()`.
+- A lazy dataset's first `.data`/`.read()` observes the file at that later moment and
+  caches the resulting array permanently.
+- `.open()` always opens the current file and current dataset. It may therefore observe
+  replacements or fail if the source was changed or deleted.
 
 ## CLI
 
 ```bash
-h5t check GW150914.h5 --schema gwlib.schemas:PEResult
+h5t check result.h5 --schema mypackage.schemas:Result --root /results/latest
 ```
 
-## Principles
-
-1. Built-in validation reads metadata; custom validators control whether payloads are read.
-2. The class declares a schema; its instances are lazy views.
-3. Datasets are lazy, attrs are eager.
-4. h5py's shape, not a new one — mapping semantics plus typed attribute access.
-5. Relationships between nodes are ordinary Python in `validate(self)` hooks.
+Exit status is 0 on success, 1 for the first file/schema mismatch, and 2 for import,
+declaration, usage, or I/O errors.
 
 ## Development
 
 ```bash
 uv sync
 uv run pytest
-uv run mypy
-uv run ruff check
+uv run ty check
+uv run ruff check .
 ```

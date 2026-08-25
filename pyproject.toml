@@ -1,7 +1,7 @@
 [project]
 name = "h5t"
-version = "0.1.0"
-description = "A schema layer for HDF5: declare structure and domain invariants as Python classes."
+version = "0.2.0"
+description = "Load HDF5 groups as detached, typed Python records."
 readme = "README.md"
 authors = [
     { name = "binado", email = "bernardopveronese@gmail.com" }
@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "h5py>=3.10",
     "numpy>=1.26",
+    "pydantic>=2,<3",
 ]
 
 [project.scripts]
@@ -19,7 +20,7 @@ h5t = "h5t._cli:main"
 dev = [
     "pytest>=8",
     "hypothesis>=6",
-    "ty>=0.1",
+    "ty>=0.0.74",
     "ruff>=0.6",
 ]
 
@@ -46,7 +47,7 @@ convention = "numpy"
 "tests/**" = ["D", "B018"]
 
 [tool.ty.src]
-include = ["src/h5t"]
+include = ["src/h5t", "tests/acceptance_example.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
