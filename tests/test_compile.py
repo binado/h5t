@@ -6,14 +6,12 @@ local names that string evaluation cannot resolve (a documented v0.1
 limitation of the compiler).
 """
 
-from dataclasses import replace
 from typing import Annotated, Literal
 
 import numpy as np
 import pytest
 
 import h5t
-from h5t._shape import FixedDim, NamedDim
 from h5t._spec import DatasetSpec, Extras, GroupSpec
 
 from .conftest import PEResult, Posterior
@@ -22,29 +20,14 @@ from .conftest import PEResult, Posterior
 class TestMemberKinds:
     def test_inline_dataset_subscript(self):
         class S(h5t.Group):
-            x: h5t.Dataset[h5t.f8, "n"]
+            x: h5t.Dataset[h5t.f8]
 
         (child,) = S.__h5spec__.children
         assert isinstance(child, DatasetSpec)
         assert child.dtype is h5t.f8
-        assert child.shape == (NamedDim("n"),)
-
-    def test_annotated_spelling_compiles_identically(self):
-        class A(h5t.Group):
-            x: h5t.Dataset[h5t.f8, "n 3"]
-
-        class B(h5t.Group):
-            x: Annotated[h5t.Dataset[h5t.f8], h5t.Shape("n 3")]
-
-        class C(h5t.Group):
-            x: Annotated[h5t.Dataset[h5t.f8], "n 3"]  # bare-string shorthand
-
-        assert A.__h5spec__.children[0] == B.__h5spec__.children[0]
-        assert A.__h5spec__.children[0] == C.__h5spec__.children[0]
-        assert B.__h5spec__.children[0].shape == (NamedDim("n"), FixedDim(3))
 
     def test_named_dataset_subclass_with_attrs(self):
-        class StrainSeries(h5t.Dataset, dtype=h5t.f8, shape="n_time"):
+        class StrainSeries(h5t.Dataset, dtype=h5t.f8):
             unit: Literal["strain"]
             t0: float
             dt: float
@@ -55,28 +38,25 @@ class TestMemberKinds:
         (child,) = Detector.__h5spec__.children
         assert isinstance(child, DatasetSpec)
         assert child.dtype is h5t.f8
-        assert child.shape == (NamedDim("n_time"),)
         assert {a.py_name for a in child.attrs} == {"unit", "t0", "dt"}
 
-    def test_use_site_rebind_subscript_and_annotated(self):
-        class Mass(h5t.Dataset, dtype=h5t.f8, shape="n"):
+    def test_named_dataset_validator_is_preserved_at_use_site(self):
+        class Mass(h5t.Dataset, dtype=h5t.f8):
             unit: Literal["Msun"]
 
-        class S(h5t.Group):
-            a: Mass
-            b: Mass["n_samples"]
-            c: Annotated[Mass, h5t.Shape("n_samples")]
+            def validate(self) -> None:
+                raise h5t.Invalid("mass failure")
 
-        a, b, c = S.__h5spec__.children
-        assert a.shape == (NamedDim("n"),)
-        assert b.shape == (NamedDim("n_samples"),)
-        # Both rebind spellings compile to the same structure (names aside).
-        assert replace(b, py_name="x", h5_name="x") == replace(c, py_name="x", h5_name="x")
-        assert {x.py_name for x in b.attrs} == {"unit"}
+        class S(h5t.Group):
+            mass: Mass
+
+        (mass,) = S.__h5spec__.children
+        assert mass.view_type is Mass
+        assert {attr.py_name for attr in mass.attrs} == {"unit"}
 
     def test_group_subclass_member(self):
         class Inner(h5t.Group):
-            x: h5t.Dataset[h5t.f8, "n"]
+            x: h5t.Dataset[h5t.f8]
 
         class Outer(h5t.Group):
             inner: Inner
@@ -131,7 +111,7 @@ class TestNames:
 
     def test_collision_across_namespaces_is_allowed(self):
         class Observation(h5t.Group):
-            duration: h5t.Dataset[h5t.f8, ""]
+            duration: h5t.Dataset[h5t.f8]
             duration_attr: Annotated[float, h5t.Name("duration")]
 
         spec = Observation.__h5spec__
@@ -149,21 +129,25 @@ class TestNames:
         with pytest.raises(h5t.SchemaError, match="shadows the h5t API"):
 
             class S(h5t.Group):
-                keys: h5t.Dataset[h5t.i8, "n"]
+                keys: h5t.Dataset[h5t.i8]
 
     def test_safe_alias_for_reserved_names(self):
         class S(h5t.Group):
-            keys_: Annotated[h5t.Dataset[h5t.i8, "n"], h5t.Name("keys")]
+            keys_: Annotated[h5t.Dataset[h5t.i8], h5t.Name("keys")]
 
         assert S.__h5spec__.children[0].h5_name == "keys"
 
 
 class TestErrors:
+    def test_removed_shape_api_is_not_exported(self):
+        assert not hasattr(h5t, "Shape")
+        assert not hasattr(h5t, "FromAttr")
+
     def test_dataset_body_cannot_declare_children(self):
         with pytest.raises(h5t.SchemaError, match="cannot contain child nodes"):
 
-            class D(h5t.Dataset, dtype=h5t.f8, shape="n"):
-                child: h5t.Dataset[h5t.f8, "n"]
+            class D(h5t.Dataset, dtype=h5t.f8):
+                child: h5t.Dataset[h5t.f8]
 
     def test_dataset_member_needs_dtype(self):
         with pytest.raises(h5t.SchemaError, match="no dtype"):
@@ -171,17 +155,11 @@ class TestErrors:
             class S(h5t.Group):
                 x: h5t.Dataset
 
-    def test_dataset_member_needs_shape(self):
-        with pytest.raises(h5t.SchemaError, match="no shape"):
-
-            class S(h5t.Group):
-                x: h5t.Dataset[h5t.f8]
-
     def test_default_on_dataset_member_raises(self):
         with pytest.raises(h5t.SchemaError, match="attrs only"):
 
             class S(h5t.Group):
-                x: h5t.Dataset[h5t.f8, "n"] = 3  # type: ignore[assignment]
+                x: h5t.Dataset[h5t.f8] = 3  # type: ignore[assignment]
 
     def test_non_optional_union_raises(self):
         with pytest.raises(h5t.SchemaError, match="unions"):
@@ -207,34 +185,43 @@ class TestErrors:
             class S(h5t.Group):
                 x: Annotated[str, h5t.Keys(pattern=".*")]
 
-    def test_bad_dims_kwarg_raises(self):
-        with pytest.raises(h5t.SchemaError, match="FromAttr"):
-
-            class S(h5t.Group, dims={"n": "n"}):  # type: ignore[dict-item]
-                pass
-
-    def test_malformed_shape_raises_at_class_creation(self):
-        with pytest.raises(h5t.SchemaError, match="malformed shape"):
+    def test_shape_metadata_is_rejected(self):
+        with pytest.raises(h5t.SchemaError, match="no longer supported"):
 
             class S(h5t.Group):
-                x: h5t.Dataset[h5t.f8, "n+1"]
+                x: Annotated[h5t.Dataset[h5t.f8], "n"]
 
     def test_invalid_subscript_raises(self):
         with pytest.raises(h5t.SchemaError, match="invalid Dataset subscript"):
             h5t.Dataset[h5t.f8, 3]
 
+    def test_shape_subscript_is_rejected(self):
+        with pytest.raises(h5t.SchemaError, match="override validate"):
+            h5t.Dataset[h5t.f8, "n"]
+
+    def test_removed_shape_and_dims_kwargs_are_rejected(self):
+        with pytest.raises(TypeError):
+
+            class Shaped(h5t.Dataset, dtype=h5t.f8, shape="n"):
+                pass
+
+        with pytest.raises(TypeError):
+
+            class Dimmed(h5t.Group, dims={"n": None}):
+                pass
+
 
 class TestInheritance:
     def test_partial_schemas_flatten(self):
         class HasFoo(h5t.File):
-            foo: h5t.Dataset[h5t.f8, "n"]
+            foo: h5t.Dataset[h5t.f8]
             calibration: str
 
         class NeedsBar(HasFoo):
-            bar: h5t.Dataset[h5t.f8, "n"]
+            bar: h5t.Dataset[h5t.f8]
 
         class NeedsBaz(HasFoo):
-            baz: h5t.Dataset[h5t.f8, "n"]
+            baz: h5t.Dataset[h5t.f8]
 
         class MyFile(NeedsBar, NeedsBaz):
             pass
@@ -249,10 +236,10 @@ class TestInheritance:
 
     def test_conflicting_sibling_redeclarations_raise(self):
         class A(h5t.File):
-            foo: h5t.Dataset[h5t.f8, "n"]
+            foo: h5t.Dataset[h5t.f8]
 
         class B(h5t.File):
-            foo: h5t.Dataset[h5t.f4, "n"]
+            foo: h5t.Dataset[h5t.f4]
 
         with pytest.raises(h5t.SchemaError, match="conflicting redeclarations"):
 
@@ -261,10 +248,10 @@ class TestInheritance:
 
     def test_identical_sibling_redeclarations_are_fine(self):
         class A(h5t.File):
-            foo: h5t.Dataset[h5t.f8, "n"]
+            foo: h5t.Dataset[h5t.f8]
 
         class B(h5t.File):
-            foo: h5t.Dataset[h5t.f8, "n"]
+            foo: h5t.Dataset[h5t.f8]
 
         class C(A, B):
             pass
@@ -273,12 +260,12 @@ class TestInheritance:
 
     def test_subclass_override_wins(self):
         class A(h5t.Group):
-            x: h5t.Dataset[h5t.f8, "n"]
+            x: h5t.Dataset[h5t.f8]
 
         class B(A):
-            x: h5t.Dataset[h5t.f8, "m"]
+            x: h5t.Dataset[h5t.f4]
 
-        assert B.__h5spec__.children[0].shape == (NamedDim("m"),)
+        assert B.__h5spec__.children[0].dtype is h5t.f4
 
     def test_extras_is_inherited_unless_overridden(self):
         class A(h5t.Group, extras="forbid"):
@@ -293,8 +280,8 @@ class TestInheritance:
         assert B.__h5spec__.extras is Extras.FORBID
         assert C.__h5spec__.extras is Extras.WARN
 
-    def test_dataset_inherits_dtype_and_shape(self):
-        class Base(h5t.Dataset, dtype=h5t.f8, shape="n"):
+    def test_dataset_inherits_dtype(self):
+        class Base(h5t.Dataset, dtype=h5t.f8):
             unit: str
 
         class Derived(Base):
@@ -302,7 +289,6 @@ class TestInheritance:
 
         spec = Derived.__h5spec__
         assert spec.dtype is h5t.f8
-        assert spec.shape == (NamedDim("n"),)
         assert {a.py_name for a in spec.attrs} == {"unit", "frame"}
 
 
@@ -320,25 +306,9 @@ class TestValidateSchema:
         assert not issubclass(h5t.ValidationError, h5t.SchemaError)
 
 
-class TestSpecShape:
-    def test_dims_kwarg_recorded(self):
-        spec = Posterior.__h5spec__
-        assert spec.dims == (("n_samples", h5t.FromAttr("n_samples")),)
-
-    def test_sourceless_dim(self):
-        class Detector(h5t.Group, dims={"n_time": None}):
-            strain: h5t.Dataset[h5t.f8, "n_time"]
-
-        assert Detector.__h5spec__.dims == (("n_time", None),)
-
+class TestSpec:
     def test_optional_members(self):
         spec = Posterior.__h5spec__
         by_name = {c.py_name: c for c in spec.children}
         assert by_name["spins"].optional
         assert not by_name["mass_1"].optional
-
-    def test_scalar_shape(self):
-        class S(h5t.Group):
-            x: h5t.Dataset[h5t.f8, ""]
-
-        assert S.__h5spec__.children[0].shape == ()

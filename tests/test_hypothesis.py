@@ -1,10 +1,4 @@
-"""Property-based coverage of the validation matrix, driven by generated specs.
-
-`mock` is deferred past v0.1, so the strategies build files directly with
-h5py from the same structure description the schema class is generated
-from: a conforming file must validate clean, and truncating one dataset on
-a shared dimension must produce the specific dim-conflict error.
-"""
+"""Property coverage for generated schemas and self-based validators."""
 
 from __future__ import annotations
 
@@ -19,7 +13,6 @@ from hypothesis import strategies as st
 
 import h5t
 from h5t._dtypes import DType
-from h5t._validate import run_validation
 
 DTYPE_TOKENS: list[type[DType]] = [h5t.f4, h5t.f8, h5t.i2, h5t.i4, h5t.i8, h5t.u1, h5t.c16]
 DIM_NAMES = ["na", "nb", "nc"]
@@ -78,13 +71,20 @@ def structures(draw: st.DrawFn, *, shared_dim: bool = False) -> Structure:
 def build_schema(structure: Structure) -> type[h5t.File]:
     annotations: dict[str, object] = {}
     for ds in structure.datasets:
-        annotations[ds.name] = h5t.Dataset[ds.dtype, " ".join(ds.dims)]
+        annotations[ds.name] = h5t.Dataset[ds.dtype]
     for attr in structure.attrs:
         annotations[attr.name] = attr.type
+
+    def validate(self) -> None:
+        for dataset in structure.datasets:
+            expected = tuple(_axis_length(dim, structure.dim_values) for dim in dataset.dims)
+            if getattr(self, dataset.name).shape != expected:
+                raise h5t.Invalid(f"{dataset.name} must have shape {expected}")
+
     return type(
         "GeneratedSchema",
         (h5t.File,),
-        {"__annotations__": annotations, "__module__": __name__},
+        {"__annotations__": annotations, "__module__": __name__, "validate": validate},
     )
 
 
@@ -107,8 +107,8 @@ def build_file(path: Path, structure: Structure) -> None:
 
 
 def check(schema: type[h5t.File], path: Path) -> h5t.ValidationReport:
-    with h5py.File(path, "r") as f:
-        return run_validation(schema.__h5spec__, f, filename=str(path), schema_name=schema.__name__)
+    with schema.open(path, validate=False) as view:
+        return view.check()
 
 
 @settings(max_examples=30, deadline=None)
@@ -124,7 +124,7 @@ def test_conforming_files_validate_clean(structure: Structure, tmp_path_factory)
 
 @settings(max_examples=30, deadline=None)
 @given(structure=structures(shared_dim=True))
-def test_truncating_a_shared_dim_is_detected(structure: Structure, tmp_path_factory):
+def test_validator_detects_a_mutated_shape(structure: Structure, tmp_path_factory):
     path = tmp_path_factory.mktemp("hyp") / "t.h5"
     schema = build_schema(structure)
     build_file(path, structure)
@@ -133,14 +133,13 @@ def test_truncating_a_shared_dim_is_detected(structure: Structure, tmp_path_fact
         old = f[victim.name]
         assert isinstance(old, h5py.Dataset)
         shape = list(old.shape)
-        shape[0] += 1  # 'na' axis now disagrees with its sibling
+        shape[0] += 1
         dtype = old.dtype
         del f[victim.name]
         f.create_dataset(victim.name, shape=tuple(shape), dtype=dtype)
     report = check(schema, path)
     assert not report.ok
-    assert any("'na' has inconsistent values" in p.message for p in report.errors), report.render()
-    # Both conflicting sites are named: order never implies which is correct.
-    (problem,) = [p for p in report.errors if "'na'" in p.message]
-    assert f"./{structure.datasets[0].name}" in problem.message
-    assert f"./{structure.datasets[1].name}" in problem.message
+    assert [problem.message for problem in report.errors] == [
+        f"{victim.name} must have shape "
+        f"{tuple(_axis_length(dim, structure.dim_values) for dim in victim.dims)}"
+    ]

@@ -13,17 +13,28 @@ import pytest
 import h5t
 
 
-class Posterior(h5t.Group, dims={"n_samples": h5t.FromAttr("n_samples")}):
+class Posterior(h5t.Group):
     """Posterior samples from one PE run (the PLAN.md example)."""
 
-    mass_1: h5t.Dataset[h5t.f8, "n_samples"]
-    mass_2: h5t.Dataset[h5t.f8, "n_samples"]
-    log_likelihood: h5t.Dataset[h5t.f8, "n_samples"]
-    spins: h5t.Dataset[h5t.f8, "n_samples 3"] | None
-    psd: h5t.Dataset[h5t.f8, "n_freq 2"]
+    mass_1: h5t.Dataset[h5t.f8]
+    mass_2: h5t.Dataset[h5t.f8]
+    log_likelihood: h5t.Dataset[h5t.f8]
+    spins: h5t.Dataset[h5t.f8] | None
+    psd: h5t.Dataset[h5t.f8]
 
+    n_samples: int
     approximant: str
     f_ref: float = 20.0
+
+    def validate(self) -> None:
+        expected = (self.n_samples,)
+        for name in ("mass_1", "mass_2", "log_likelihood"):
+            if getattr(self, name).shape != expected:
+                raise h5t.Invalid(f"{name} must have shape {expected}")
+        if self.spins is not None and self.spins.shape != (self.n_samples, 3):
+            raise h5t.Invalid(f"spins must have shape ({self.n_samples}, 3)")
+        if self.psd.ndim != 2 or self.psd.shape[1] != 2:
+            raise h5t.Invalid("psd must have shape (n_freq, 2)")
 
     @property
     def chirp_mass(self) -> np.ndarray:

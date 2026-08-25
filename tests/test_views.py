@@ -112,12 +112,12 @@ def test_dynamic_group_missing_key_raises_schema_mismatch(pe_file: Path):
             f.runs["C99:NOPE"]
 
 
-def test_subtree_check_and_validate(pe_file: Path):
+def test_subtree_check_and_direct_hook(pe_file: Path):
     with PEResult.open(pe_file) as f:
         run = f.runs["C01:XPHM"]
         report = run.check()
         assert report.ok
-        run.validate()  # should not raise
+        run.validate()  # direct call runs only this node's hook
 
 
 def test_repr_names_path_and_state(pe_file: Path):

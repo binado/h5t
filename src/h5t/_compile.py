@@ -23,7 +23,6 @@ import re
 import types
 import typing
 import warnings
-from collections.abc import Mapping
 from dataclasses import replace
 from typing import Annotated, Any, ClassVar, Generic, Literal, Self, TypeVar, cast
 
@@ -32,22 +31,18 @@ import numpy as np
 
 from h5t._dtypes import DType
 from h5t._errors import SchemaError, ValidationError
-from h5t._shape import parse_shape
 from h5t._spec import (
     AttrSpec,
     AttrType,
     DatasetSpec,
     DynamicSpec,
     Extras,
-    FromAttr,
     GroupSpec,
     Keys,
     MemberSpec,
     Name,
     NodeSpec,
-    Shape,
 )
-from h5t._validate import run_validation
 from h5t._views import (
     AttrDescriptor,
     DatasetViewOps,
@@ -106,16 +101,10 @@ def _unwrap_annotation(owner: type, py_name: str, ann: Any) -> tuple[Any, list[A
 
 def _extract_metadata(
     owner: type, py_name: str, metadata: list[Any]
-) -> tuple[str | None, str | None, str | None]:
-    """Pull ``Name``, ``Keys``, and ``Shape`` markers out of Annotated metadata.
-
-    A bare string in metadata position is accepted as ``Shape`` shorthand.
-    Unknown metadata objects are ignored so third-party markers can ride
-    along.
-    """
+) -> tuple[str | None, str | None]:
+    """Pull ``Name`` and ``Keys`` markers out of Annotated metadata."""
     h5_name: str | None = None
     pattern: str | None = None
-    shape: str | None = None
     for item in metadata:
         if isinstance(item, Name):
             h5_name = item.name
@@ -127,11 +116,12 @@ def _extract_metadata(
                     f"{owner.__name__}.{py_name}: invalid Keys pattern {item.pattern!r}: {exc}"
                 ) from exc
             pattern = item.pattern
-        elif isinstance(item, Shape):
-            shape = item.shape
         elif isinstance(item, str):
-            shape = item
-    return h5_name, pattern, shape
+            raise SchemaError(
+                f"{owner.__name__}.{py_name}: shape metadata is no longer supported;"
+                " override validate() to check dataset shapes"
+            )
+    return h5_name, pattern
 
 
 def _attr_type_for(owner: type, py_name: str, core: Any) -> AttrType:
@@ -166,7 +156,7 @@ def _classify_member(
 ) -> MemberSpec:
     """Compile one annotated class-body member into its spec."""
     core, metadata, optional = _unwrap_annotation(owner, py_name, ann)
-    name_meta, pattern, shape_meta = _extract_metadata(owner, py_name, metadata)
+    name_meta, pattern = _extract_metadata(owner, py_name, metadata)
     h5_name = name_meta if name_meta is not None else py_name
 
     # Dataset member: inline subscript form or named subclass.
@@ -176,18 +166,12 @@ def _classify_member(
         if has_default:
             raise SchemaError(f"{owner.__name__}.{py_name}: defaults apply to attrs only")
         template = core.__h5spec__
-        shape = parse_shape(shape_meta) if shape_meta is not None else template.shape
         if template.dtype is None:
             raise SchemaError(
                 f"{owner.__name__}.{py_name}: dataset member has no dtype;"
-                " use h5t.Dataset[h5t.f8, ...] or the dtype= class kwarg"
+                " use h5t.Dataset[h5t.f8] or the dtype= class kwarg"
             )
-        if shape is None:
-            raise SchemaError(
-                f"{owner.__name__}.{py_name}: dataset member has no shape;"
-                ' use h5t.Shape("...") metadata, a subscript, or the shape= class kwarg'
-            )
-        return replace(template, py_name=py_name, h5_name=h5_name, shape=shape, optional=optional)
+        return replace(template, py_name=py_name, h5_name=h5_name, optional=optional)
 
     # Dynamic group member: Group[T] inline.
     origin = typing.get_origin(core)
@@ -246,10 +230,9 @@ def _dynamic_item_spec(owner: type, py_name: str, args: tuple[Any, ...]) -> Node
         return None
     if issubclass(arg, Dataset):
         item = arg.__h5spec__
-        if item.dtype is None or item.shape is None:
+        if item.dtype is None:
             raise SchemaError(
-                f"{owner.__name__}.{py_name}: dynamic item type"
-                f" {arg.__name__} needs both a dtype and a shape"
+                f"{owner.__name__}.{py_name}: dynamic item type {arg.__name__} needs a dtype"
             )
         return item
     if issubclass(arg, Group):
@@ -374,24 +357,6 @@ def _resolve_extras(cls: type, extras: str | None) -> Extras:
     return Extras.IGNORE
 
 
-def _resolve_dims(
-    cls: type, dims: Mapping[str, FromAttr | None] | None
-) -> tuple[tuple[str, FromAttr | None], ...]:
-    """Validate and normalise the ``dims=`` class kwarg."""
-    if dims is None:
-        return ()
-    resolved: list[tuple[str, FromAttr | None]] = []
-    for name, source in dims.items():
-        if not isinstance(name, str) or not name.isidentifier():
-            raise SchemaError(f"{cls.__name__}: dim name {name!r} is not an identifier")
-        if source is not None and not isinstance(source, FromAttr):
-            raise SchemaError(
-                f"{cls.__name__}: dim {name!r} source must be h5t.FromAttr(...) or None"
-            )
-        resolved.append((name, source))
-    return tuple(resolved)
-
-
 def _inherited_dynamic(cls: type) -> DynamicSpec | None:
     """Find the dynamic child spec from ``Group[T]`` bases or inherited specs."""
     for base in getattr(cls, "__orig_bases__", ()):
@@ -427,14 +392,13 @@ def _reserved_dataset_names() -> frozenset[str]:
 
 def _compile_group_class(
     cls: type,
-    dims: Mapping[str, FromAttr | None] | None,
     extras: str | None,
 ) -> None:
     """Compile a Group (or File) subclass body into its ``__h5spec__``."""
     resolved_extras = _resolve_extras(cls, extras)
     own = _own_members(cls, allow_children=True, default_extras=resolved_extras)
     _check_reserved(cls, own, _reserved_group_names())
-    cls.__h5members_own__ = own  # type: ignore[attr-defined]
+    cls.__h5members_own__ = own  # ty: ignore[unresolved-attribute]
     members = _merged_members(cls)
     _check_namespaces(cls, members)
     children = tuple(s for s in members.values() if not isinstance(s, AttrSpec))
@@ -444,19 +408,17 @@ def _compile_group_class(
         h5_name="",
         children=children,
         attrs=attrs,
-        dims=_resolve_dims(cls, dims),
         extras=resolved_extras,
         dynamic=_inherited_dynamic(cls),
         view_type=cls,
     )
-    cls.__h5spec__ = spec  # type: ignore[attr-defined]
+    cls.__h5spec__ = spec  # ty: ignore[unresolved-attribute]
     _install_descriptors(cls, members)
 
 
 def _compile_dataset_class(
     cls: type,
     dtype: type[DType] | None,
-    shape: str | None,
 ) -> None:
     """Compile a Dataset subclass body into its ``__h5spec__``."""
     if dtype is not None and not (isinstance(dtype, type) and issubclass(dtype, DType)):
@@ -469,12 +431,9 @@ def _compile_dataset_class(
             break
     if dtype is None and inherited is not None:
         dtype = inherited.dtype
-    parsed_shape = parse_shape(shape) if shape is not None else None
-    if parsed_shape is None and inherited is not None:
-        parsed_shape = inherited.shape
     own = _own_members(cls, allow_children=False, default_extras=Extras.IGNORE)
     _check_reserved(cls, own, _reserved_dataset_names())
-    cls.__h5members_own__ = own  # type: ignore[attr-defined]
+    cls.__h5members_own__ = own  # ty: ignore[unresolved-attribute]
     members = _merged_members(cls)
     _check_namespaces(cls, members)
     attrs = tuple(s for s in members.values() if isinstance(s, AttrSpec))
@@ -482,11 +441,10 @@ def _compile_dataset_class(
         py_name="",
         h5_name="",
         dtype=dtype,
-        shape=parsed_shape,
         attrs=attrs,
         view_type=cls,
     )
-    cls.__h5spec__ = spec  # type: ignore[attr-defined]
+    cls.__h5spec__ = spec  # ty: ignore[unresolved-attribute]
     _install_descriptors(cls, members)
 
 
@@ -495,12 +453,7 @@ def _check_spec(spec: NodeSpec, context: str) -> None:
     if isinstance(spec, DatasetSpec):
         if spec.dtype is None:
             raise SchemaError(f"{context}: dataset has no dtype")
-        if spec.shape is None:
-            raise SchemaError(f"{context}: dataset has no shape")
         return
-    for name, _ in spec.dims:
-        if not name.isidentifier():
-            raise SchemaError(f"{context}: dim name {name!r} is not an identifier")
     if spec.dynamic is not None:
         if spec.dynamic.pattern is not None:
             try:
@@ -524,14 +477,12 @@ class Dataset(DatasetViewOps, Generic[DT]):
 
     Configure via class kwargs, not by subclassing the subscript::
 
-        class StrainSeries(h5t.Dataset, dtype=h5t.f8, shape="n_time"):
+        class StrainSeries(h5t.Dataset, dtype=h5t.f8):
             unit: Literal["strain"]
 
     Ordinary class-body annotations declare *attrs on the dataset* — a
     dataset cannot contain child nodes. The subscript form
-    ``h5t.Dataset[h5t.f8, "n"]`` builds an inline anonymous subclass at
-    runtime; the statically-checked equivalent is
-    ``Annotated[h5t.Dataset[h5t.f8], h5t.Shape("n")]``.
+    ``h5t.Dataset[h5t.f8]`` builds an inline anonymous subclass at runtime.
     """
 
     __h5spec__: ClassVar[DatasetSpec]
@@ -541,46 +492,31 @@ class Dataset(DatasetViewOps, Generic[DT]):
         cls,
         *,
         dtype: type[DType] | None = None,
-        shape: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init_subclass__(**kwargs)
-        _compile_dataset_class(cls, dtype, shape)
+        _compile_dataset_class(cls, dtype)
 
     def __class_getitem__(cls, item: Any) -> Any:
-        """Build an inline subclass: subscript sets dtype and shape.
+        """Build an inline subclass whose subscript sets its dtype.
 
-        ``Dataset[f8]`` sets the dtype, ``Dataset[f8, "n"]`` sets both, and
-        ``Mass["n"]`` rebinds the shape of a named type at the use site.
         TypeVar subscriptions are delegated to ``Generic``.
         """
         parts = item if isinstance(item, tuple) else (item,)
         if any(isinstance(p, TypeVar) for p in parts):
             return super().__class_getitem__(item)  # type: ignore[misc]
-        dtype: type[DType] | None = None
-        shape: str | None = None
-        for part in parts:
-            if isinstance(part, str):
-                if shape is not None:
-                    raise SchemaError(f"duplicate shape in Dataset subscript: {part!r}")
-                parse_shape(part)
-                shape = part
-            elif isinstance(part, type) and issubclass(part, DType):
-                if dtype is not None:
-                    raise SchemaError(f"duplicate dtype in Dataset subscript: {part!r}")
-                dtype = part
-            else:
-                raise SchemaError(
-                    f"invalid Dataset subscript {part!r}; expected a dtype token"
-                    " and/or a shape string"
-                )
-        rendered = ", ".join(p.__name__ if isinstance(p, type) else repr(p) for p in parts)
+        if len(parts) != 1 or not (isinstance(parts[0], type) and issubclass(parts[0], DType)):
+            raise SchemaError(
+                f"invalid Dataset subscript {item!r}; expected one dtype token;"
+                " override validate() to check dataset shapes"
+            )
+        dtype = parts[0]
+        rendered = dtype.__name__
         return type(
             f"{cls.__name__}[{rendered}]",
             (cls,),
             {"__module__": cls.__module__, "__qualname__": f"{cls.__qualname__}[{rendered}]"},
             dtype=dtype,
-            shape=shape,
         )
 
     @classmethod
@@ -602,9 +538,8 @@ class Dataset(DatasetViewOps, Generic[DT]):
 class Group(GroupViewOps, Generic[T]):
     """Base class for group schemas; instances are lazy views onto groups.
 
-    Class-body annotations declare child nodes and attrs; the ``dims=``
-    class kwarg declares dimension bindings; ``extras=`` sets the policy
-    for undeclared children and attrs (``"ignore"`` by default).
+    Class-body annotations declare child nodes and attrs; ``extras=`` sets
+    the policy for undeclared children and attrs (``"ignore"`` by default).
 
     ``Group[T]`` in an annotation says the group's dynamically named
     children satisfy ``T``; subclassing ``Group[T]`` gives the collection
@@ -617,12 +552,11 @@ class Group(GroupViewOps, Generic[T]):
     def __init_subclass__(
         cls,
         *,
-        dims: Mapping[str, FromAttr | None] | None = None,
         extras: Literal["ignore", "warn", "forbid"] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init_subclass__(**kwargs)
-        _compile_group_class(cls, dims, extras)
+        _compile_group_class(cls, extras)
 
     def __getitem__(self, key: str) -> T:
         """Address a child by HDF5 name.
@@ -649,7 +583,7 @@ class Group(GroupViewOps, Generic[T]):
 # Base classes carry empty template specs so they are usable as bare
 # annotations and as merge anchors; subclass compilation replaces them.
 Group.__h5spec__ = GroupSpec(py_name="", h5_name="", view_type=Group)
-Dataset.__h5spec__ = DatasetSpec(py_name="", h5_name="", dtype=None, shape=None, view_type=Dataset)
+Dataset.__h5spec__ = DatasetSpec(py_name="", h5_name="", dtype=None, view_type=Dataset)
 
 
 class File(Group[Any]):
@@ -665,7 +599,6 @@ class File(Group[Any]):
         path: str | os.PathLike[str],
         *,
         validate: bool = True,
-        deep: bool = False,
     ) -> Self:
         """Open a file read-only as a validated, lazy view of this schema.
 
@@ -678,9 +611,6 @@ class File(Group[Any]):
             broken files; member access then raises targeted
             :class:`~h5t._errors.SchemaMismatchError` on nonconforming
             nodes.
-        deep : bool, optional
-            Reserved for opt-in value-level validators. v0.1 defines no
-            value validators, so this flag currently has no effect.
 
         Returns
         -------
@@ -695,18 +625,21 @@ class File(Group[Any]):
             problems are batched into one exception and the file handle is
             closed before raising.
         """
-        del deep  # reserved: no value-level validators exist in v0.1
         h5file = h5py.File(path, mode="r")
         ctx = FileContext(h5file, str(path))
         spec = cls.__h5spec__
+        view = cast(Self, make_view(spec, ctx, "/"))
         if validate:
-            report = run_validation(spec, h5file, filename=str(path), schema_name=cls.__name__)
-            for problem in report.warnings:
-                warnings.warn(f"{problem.path}: {problem.message}", stacklevel=2)
-            if not report.ok:
+            try:
+                report = view.check()
+                for problem in report.warnings:
+                    warnings.warn(f"{problem.path}: {problem.message}", stacklevel=2)
+                if not report.ok:
+                    raise ValidationError(report, file_closed=True)
+            except BaseException:
                 ctx.close()
-                raise ValidationError(report, file_closed=True)
-        return cast(Self, make_view(spec, ctx, "/"))
+                raise
+        return view
 
     def close(self) -> None:
         """Close the shared file handle; all retained views become invalid."""

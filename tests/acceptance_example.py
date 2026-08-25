@@ -2,9 +2,8 @@
 
 This module is never executed; test_typing_acceptance.py runs both type
 checkers over it and asserts zero errors. It exercises every form the
-typing spike froze (see typing_spike/FINDINGS.md): the Annotated dataset
-spelling, Group[T], optional members, use-site rebinding of a named
-dataset type, class kwargs, and inherited partial schemas.
+typing spike froze: dtype-only datasets, Group[T], optional members,
+custom validators, class kwargs, and inherited partial schemas.
 """
 
 from __future__ import annotations
@@ -17,20 +16,27 @@ import numpy.typing as npt
 import h5t
 
 
-class Mass(h5t.Dataset[h5t.f8], dtype=h5t.f8, shape="n"):
+class Mass(h5t.Dataset[h5t.f8], dtype=h5t.f8):
     unit: Literal["Msun"]
     frame: Literal["source", "detector"]
 
 
-class Posterior(h5t.Group, dims={"n_samples": h5t.FromAttr("n_samples")}):
-    mass_1: Annotated[h5t.Dataset[h5t.f8], h5t.Shape("n_samples")]
-    mass_2: Annotated[Mass, h5t.Shape("n_samples")]
-    log_likelihood: Annotated[h5t.Dataset[h5t.f8], "n_samples"]
-    spins: Annotated[h5t.Dataset[h5t.f8], h5t.Shape("n_samples 3")] | None
-    psd: Annotated[h5t.Dataset[h5t.f8], h5t.Shape("n_freq 2")]
+class Posterior(h5t.Group):
+    mass_1: h5t.Dataset[h5t.f8]
+    mass_2: Mass
+    log_likelihood: h5t.Dataset[h5t.f8]
+    spins: h5t.Dataset[h5t.f8] | None
+    psd: h5t.Dataset[h5t.f8]
 
+    n_samples: int
     approximant: str
     f_ref: float = 20.0
+
+    def validate(self) -> None:
+        if self.mass_1.shape != (self.n_samples,):
+            raise h5t.Invalid("mass_1 must match n_samples")
+        if self.mass_2.shape != (self.n_samples,):
+            raise h5t.Invalid("mass_2 must match n_samples")
 
     @property
     def chirp_mass(self) -> npt.NDArray[np.float64]:
@@ -69,16 +75,16 @@ def access(path: str) -> None:
 
 
 class HasFoo(h5t.File):
-    foo: Annotated[h5t.Dataset[h5t.f8], h5t.Shape("n_samples")]
+    foo: h5t.Dataset[h5t.f8]
     calibration: str
 
 
 class NeedsBar(HasFoo):
-    bar: Annotated[h5t.Dataset[h5t.f8], h5t.Shape("n_samples")]
+    bar: h5t.Dataset[h5t.f8]
 
 
 class NeedsBaz(HasFoo):
-    baz: Annotated[h5t.Dataset[h5t.f8], h5t.Shape("n_samples")]
+    baz: h5t.Dataset[h5t.f8]
 
 
 class MyFile(NeedsBar, NeedsBaz):
