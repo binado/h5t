@@ -615,8 +615,7 @@ def _load_attribute(
             except Exception as exc:
                 raise ConversionError(path, f"attribute converter failed: {exc}") from exc
         value = _validate_value(field, value, path)
-    if field.h5_name in raw:
-        attrs[field.h5_name] = value
+    attrs[field.h5_name] = value
     return value
 
 
