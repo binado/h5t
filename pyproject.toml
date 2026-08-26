@@ -7,6 +7,12 @@ authors = [
     { name = "binado", email = "bernardopveronese@gmail.com" }
 ]
 requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 dependencies = [
     "h5py>=3.10",
     "numpy>=1.26",
