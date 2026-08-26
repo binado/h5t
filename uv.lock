@@ -100,7 +100,7 @@ dev = [
 requires-dist = [
     { name = "h5py", specifier = ">=3.10" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "pydantic", specifier = ">=2,<3" },
+    { name = "pydantic", specifier = ">=2.4,<3" },
 ]
 
 [package.metadata.requires-dev]
