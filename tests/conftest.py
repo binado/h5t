@@ -1,10 +1,11 @@
-"""Shared example schemas and file builders for the h5t test suite."""
+"""Shared detached-model schemas and HDF5 fixtures."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import h5py
 import numpy as np
@@ -13,76 +14,61 @@ import pytest
 import h5t
 
 
-class Posterior(h5t.Group):
-    """Posterior samples from one PE run (the PLAN.md example)."""
+class Measurement(h5t.Dataset, extras="ignore"):
+    """Dataset carrying typed attrs."""
 
-    mass_1: h5t.Dataset[h5t.f8]
-    mass_2: h5t.Dataset[h5t.f8]
-    log_likelihood: h5t.Dataset[h5t.f8]
-    spins: h5t.Dataset[h5t.f8] | None
-    psd: h5t.Dataset[h5t.f8]
-
-    n_samples: int
-    approximant: str
-    f_ref: float = 20.0
-
-    def validate(self) -> None:
-        expected = (self.n_samples,)
-        for name in ("mass_1", "mass_2", "log_likelihood"):
-            if getattr(self, name).shape != expected:
-                raise h5t.Invalid(f"{name} must have shape {expected}")
-        if self.spins is not None and self.spins.shape != (self.n_samples, 3):
-            raise h5t.Invalid(f"spins must have shape ({self.n_samples}, 3)")
-        if self.psd.ndim != 2 or self.psd.shape[1] != 2:
-            raise h5t.Invalid("psd must have shape (n_freq, 2)")
-
-    @property
-    def chirp_mass(self) -> np.ndarray:
-        m1, m2 = self.mass_1[:], self.mass_2[:]
-        return (m1 * m2) ** 0.6 / (m1 + m2) ** 0.2
+    unit: Literal["m"]
+    scale: float = 1.0
 
 
-class PEResult(h5t.File, extras="ignore"):
-    """LVK-style parameter estimation result (the PLAN.md example)."""
+class Nested(h5t.Group, extras="forbid"):
+    """Nested group fixture schema."""
 
-    runs: Annotated[
-        h5t.Group[Posterior],
-        h5t.Keys(pattern=r"C\d+:.*"),
-    ]
-    format_version: Annotated[
-        Literal["1.0"],
-        h5t.Name("version"),
-    ]
+    answer: int
 
 
-def write_run(group: h5py.Group, n_samples: int = 100, n_freq: int = 32) -> None:
-    """Populate one conforming Posterior group."""
-    group.attrs["n_samples"] = n_samples
-    group.attrs["approximant"] = "IMRPhenomXPHM"
-    group.attrs["f_ref"] = 20.0
-    rng = np.random.default_rng(0)
-    group.create_dataset("mass_1", data=rng.random(n_samples))
-    group.create_dataset("mass_2", data=rng.random(n_samples))
-    group.create_dataset("log_likelihood", data=rng.random(n_samples))
-    group.create_dataset("psd", data=rng.random((n_freq, 2)))
+class Result(h5t.Group, extras="ignore"):
+    """Representative schema containing every supported field kind."""
+
+    version: int
+    renamed: Annotated[str, h5t.Name("stored-name")]
+    config: Annotated[dict[str, Any], h5t.Attr(converter=json.loads)]
+    array_attr: Annotated[np.ndarray, h5t.Attr()]
+    values: np.ndarray
+    measurement: Measurement
+    eager_measurement: Annotated[Measurement, h5t.Eager()]
+    nested: Nested
+    optional_note: str | None
+    defaulted: int = "42"  # type: ignore[assignment]
 
 
-def write_pe_result(path: Path | str, run_keys: tuple[str, ...] = ("C01:XPHM",)) -> None:
-    """Write a conforming PEResult file."""
-    with h5py.File(path, "w") as f:
-        f.attrs["version"] = "1.0"
-        for key in run_keys:
-            write_run(f.create_group(f"runs/{key}"))
+def write_result(path: Path, *, root: str = "/") -> None:
+    """Write a file conforming to ``Result`` at ``root``."""
+    with h5py.File(path, "w") as file:
+        group = file.require_group(root)
+        group.attrs["version"] = np.int64(2)
+        group.attrs["stored-name"] = "current"
+        group.attrs["config"] = '{"enabled": true}'
+        group.attrs["array_attr"] = np.arange(3)
+        group.attrs["undeclared"] = "raw"
+        values = group.create_dataset("values", data=np.arange(4))
+        values.attrs["ignored"] = "plain arrays do not inspect this"
+        for name in ("measurement", "eager_measurement"):
+            dataset = group.create_dataset(name, data=np.arange(5))
+            dataset.attrs["unit"] = "m"
+            dataset.attrs["extra"] = name
+        group.create_group("nested").attrs["answer"] = 42
+        group.create_dataset("ignored-child", data=[1])
 
 
 @pytest.fixture
-def pe_file(tmp_path: Path) -> Path:
-    """A conforming PEResult file on disk."""
-    path = tmp_path / "pe.h5"
-    write_pe_result(path)
+def result_file(tmp_path: Path) -> Path:
+    """A conforming result file."""
+    path = tmp_path / "result.h5"
+    write_result(path)
     return path
 
 
 def open_fd_count() -> int:
-    """Number of open file descriptors of this process (POSIX)."""
+    """Return the process's open descriptor count on POSIX."""
     return len(os.listdir("/dev/fd"))

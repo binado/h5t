@@ -1,279 +1,91 @@
-"""The structural spec tree compiled from schema-class annotations.
-
-Built-in checks and view construction operate on these nodes. Each node
-also retains its view type so validation can invoke user-defined hooks.
-"""
+"""Compiled schema records and public annotation markers."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-import numpy as np
-
-from h5t._dtypes import DType, normalize_str
-
-# --------------------------------------------------------------------------
-# Public annotation markers
-# --------------------------------------------------------------------------
+from pydantic import TypeAdapter
 
 
 @dataclass(frozen=True)
 class Name:
-    """Map a Python field name to its canonical on-disk HDF5 name.
-
-    Parameters
-    ----------
-    name : str
-        The HDF5 name, which may be invalid or reserved as a Python
-        identifier (e.g. ``"run-id"`` or ``"keys"``).
-    """
+    """Use ``name`` for this member in the HDF5 file."""
 
     name: str
 
 
 @dataclass(frozen=True)
-class Keys:
-    """Select which children of a dynamic group are validated as the item type.
+class Attr:
+    """Declare a field as an HDF5 attribute.
 
-    Parameters
-    ----------
-    pattern : str
-        A regular expression; children whose names fully match are
-        validated as the item schema, nonmatching children follow the
-        group's extras policy.
+    ``converter`` is applied to the value returned by h5py before Pydantic
+    validation. It is useful for serialized attributes such as JSON strings.
     """
 
-    pattern: str
+    converter: Callable[[Any], Any] | None = None
+
+
+@dataclass(frozen=True)
+class Eager:
+    """Load a detached dataset's complete payload during ``from_file``."""
 
 
 class Extras(Enum):
-    """Policy for undeclared children and attrs."""
+    """Policy for undeclared immediate HDF5 members."""
 
     IGNORE = "ignore"
-    WARN = "warn"
     FORBID = "forbid"
 
 
-# --------------------------------------------------------------------------
-# Attr types
-# --------------------------------------------------------------------------
+class MemberKind(Enum):
+    """How a declared field is represented in HDF5."""
+
+    ATTRIBUTE = "attribute"
+    ARRAY = "array"
+    DATASET = "dataset"
+    GROUP = "group"
+
+
+_NO_DEFAULT = object()
 
 
 @dataclass(frozen=True)
-class AttrType:
-    """The checked type of an HDF5 attribute member.
-
-    Exactly one of :attr:`base` or :attr:`literals` is set.
-
-    Attributes
-    ----------
-    base : type or None
-        One of ``str``, ``int``, ``float``, ``bool``, or ``numpy.ndarray``.
-    literals : tuple or None
-        Closed set of allowed values (from ``Literal[...]``); values are
-        normalised before membership is checked.
-    """
-
-    base: type | None = None
-    literals: tuple[Any, ...] | None = None
-
-    def describe(self) -> str:
-        """Return a short human-readable description of the type."""
-        if self.literals is not None:
-            return "Literal[" + ", ".join(repr(v) for v in self.literals) + "]"
-        assert self.base is not None
-        return self.base.__name__
-
-    def check(self, raw: object) -> tuple[bool, Any, str | None]:
-        """Check and normalise a raw attribute value against this type.
-
-        Parameters
-        ----------
-        raw : object
-            The value as returned by h5py.
-
-        Returns
-        -------
-        ok : bool
-            Whether the value conforms.
-        normalized : object
-            The normalised Python value when ``ok``; otherwise ``None``.
-        message : str or None
-            A human-readable failure description when not ``ok``.
-        """
-        if self.literals is not None:
-            expected_type = type(self.literals[0])
-            ok, value, msg = AttrType(base=expected_type).check(raw)
-            if not ok:
-                return False, None, msg
-            if value not in self.literals:
-                return False, None, f"value {value!r} not in {self.describe()}"
-            return True, value, None
-        assert self.base is not None
-        if self.base is str:
-            try:
-                return True, normalize_str(raw), None
-            except ValueError as exc:
-                return False, None, str(exc)
-        if self.base is bool:
-            if isinstance(raw, (bool, np.bool_)):
-                return True, bool(raw), None
-            return False, None, f"expected bool, got {type(raw).__name__}"
-        if self.base is int:
-            if isinstance(raw, (bool, np.bool_)):
-                return False, None, "expected int, got bool"
-            if isinstance(raw, (int, np.integer)):
-                return True, int(raw), None
-            return False, None, f"expected int, got {type(raw).__name__}"
-        if self.base is float:
-            if isinstance(raw, (bool, np.bool_)):
-                return False, None, "expected float, got bool"
-            if isinstance(raw, (int, float, np.integer, np.floating)):
-                return True, float(raw), None
-            return False, None, f"expected float, got {type(raw).__name__}"
-        if self.base is np.ndarray:
-            if isinstance(raw, np.ndarray):
-                return True, raw, None
-            return False, None, f"expected an array-valued attr, got {type(raw).__name__}"
-        raise AssertionError(f"unreachable attr base type {self.base!r}")
-
-
-# --------------------------------------------------------------------------
-# Spec nodes
-# --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class AttrSpec:
-    """Spec of one HDF5 attribute member.
-
-    Attributes
-    ----------
-    py_name : str
-        Python field name.
-    h5_name : str
-        On-disk attribute name (differs from ``py_name`` under ``Name``).
-    type : AttrType
-        The checked attribute type.
-    optional : bool
-        Whether the attribute may be absent (``| None`` in the annotation).
-    default : object or None
-        Write-time default. Never applied on read: a missing required attr
-        is a validation error even when a default exists.
-    """
+class FieldSpec:
+    """The compiled loading instructions for one annotated field."""
 
     py_name: str
     h5_name: str
-    type: AttrType
+    kind: MemberKind
+    annotation: Any
+    adapter: TypeAdapter[Any] = field(compare=False, repr=False)
     optional: bool = False
-    default: Any | None = None
+    default: Any = _NO_DEFAULT
+    converter: Callable[[Any], Any] | None = None
+    eager: bool = False
+    member_type: type | None = None
+
+    @property
+    def has_default(self) -> bool:
+        """Whether the class body supplied a default."""
+        return self.default is not _NO_DEFAULT
 
 
 @dataclass(frozen=True)
-class DatasetSpec:
-    """Spec of one dataset member (or a dataset class template).
+class ClassSpec:
+    """The flattened schema compiled for a ``Group`` or ``Dataset`` class."""
 
-    Attributes
-    ----------
-    py_name : str
-        Python field name; empty for a class-level template.
-    h5_name : str
-        On-disk dataset name; empty for a class-level template.
-    dtype : type of DType or None
-        Declared element dtype token; ``None`` only in incomplete
-        templates, never in a compiled member.
-    attrs : tuple of AttrSpec
-        Attributes declared on the dataset itself.
-    optional : bool
-        Whether the dataset may be absent.
-    view_type : type
-        Class used to build the lazy view for this member.
-    """
-
-    py_name: str
-    h5_name: str
-    dtype: type[DType] | None
-    attrs: tuple[AttrSpec, ...] = ()
-    optional: bool = False
-    view_type: type | None = field(default=None, compare=False, repr=False)
-
-
-@dataclass(frozen=True)
-class DynamicSpec:
-    """Spec of the dynamically named children of a ``Group[T]`` collection.
-
-    Attributes
-    ----------
-    item : GroupSpec or DatasetSpec
-        Schema every selected child must satisfy.
-    pattern : str or None
-        ``Keys`` regular expression selecting children; ``None`` selects
-        every child.
-    """
-
-    item: GroupSpec | DatasetSpec
-    pattern: str | None = None
-
-
-@dataclass(frozen=True)
-class GroupSpec:
-    """Spec of one group member, a group class, or the file root.
-
-    Attributes
-    ----------
-    py_name : str
-        Python field name; empty for a class-level spec or the file root.
-    h5_name : str
-        On-disk group name; empty for the file root.
-    children : tuple of GroupSpec or DatasetSpec
-        Statically declared child nodes, in declaration order.
-    attrs : tuple of AttrSpec
-        Attributes declared on the group.
-    extras : Extras
-        Policy for undeclared children and attrs.
-    dynamic : DynamicSpec or None
-        Present when the group's dynamically named children must satisfy an
-        item schema (``Group[T]``).
-    optional : bool
-        Whether the group may be absent.
-    view_type : type
-        Class used to build the lazy view for this member.
-    """
-
-    py_name: str
-    h5_name: str
-    children: tuple[GroupSpec | DatasetSpec, ...] = ()
-    attrs: tuple[AttrSpec, ...] = ()
+    fields: tuple[FieldSpec, ...] = ()
     extras: Extras = Extras.IGNORE
-    dynamic: DynamicSpec | None = None
-    optional: bool = False
-    view_type: type | None = field(default=None, compare=False, repr=False)
 
 
-MemberSpec = GroupSpec | DatasetSpec | AttrSpec
-"""Any compiled class-body member."""
-
-NodeSpec = GroupSpec | DatasetSpec
-"""Any spec node that corresponds to an HDF5 object (group or dataset)."""
+def child_path(parent: str, name: str) -> str:
+    """Join an absolute group path and one immediate child name."""
+    return f"/{name}" if parent == "/" else f"{parent.rstrip('/')}/{name}"
 
 
-def child_path(parent: str, h5_name: str) -> str:
-    """Join an HDF5 parent path and a child name.
-
-    Parameters
-    ----------
-    parent : str
-        Absolute parent path (``"/"`` for the root).
-    h5_name : str
-        Child name.
-
-    Returns
-    -------
-    str
-        The absolute child path.
-    """
-    if parent.endswith("/"):
-        return parent + h5_name
-    return f"{parent}/{h5_name}"
+def attr_path(parent: str, name: str) -> str:
+    """Return a display path for an HDF5 attribute."""
+    return f"{parent.rstrip('/') or '/'}@{name}"

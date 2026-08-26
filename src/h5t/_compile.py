@@ -1,652 +1,617 @@
-"""The class-syntax front-end: schema classes compile to plain spec trees.
-
-``__init_subclass__`` on :class:`Group` and :class:`Dataset` compiles class
-bodies into :mod:`h5t._spec` nodes stored on ``__h5spec__``. Member kinds
-are inferred from the annotation alone (PLAN.md section 4):
-
-============================  =======================================
-Annotation                    Kind
-============================  =======================================
-``h5t.Dataset[...]``          dataset, declared inline
-``h5t.Dataset`` subclass      dataset, named type with its own attrs
-``h5t.Group`` subclass        subgroup with statically declared contents
-``h5t.Group[T]``              subgroup whose dynamic children satisfy T
-anything else                 attribute
-============================  =======================================
-"""
+"""Schema compilation and detached HDF5 loading."""
 
 from __future__ import annotations
 
 import inspect
 import os
-import re
+import posixpath
+import reprlib
+import sys
 import types
 import typing
-import warnings
-from dataclasses import replace
-from typing import Annotated, Any, ClassVar, Generic, Literal, Self, TypeVar, cast
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from enum import Enum
+from types import MappingProxyType
+from typing import Annotated, Any, ClassVar, Literal, Self
 
 import h5py
 import numpy as np
+from pydantic import ConfigDict, TypeAdapter
+from pydantic import ValidationError as PydanticValidationError
 
-from h5t._dtypes import DType
-from h5t._errors import SchemaError, ValidationError
+from h5t._errors import ConversionError, SchemaError, ValidationError
 from h5t._spec import (
-    AttrSpec,
-    AttrType,
-    DatasetSpec,
-    DynamicSpec,
+    _NO_DEFAULT,
+    Attr,
+    ClassSpec,
+    Eager,
     Extras,
-    GroupSpec,
-    Keys,
-    MemberSpec,
+    FieldSpec,
+    MemberKind,
     Name,
-    NodeSpec,
-)
-from h5t._views import (
-    AttrDescriptor,
-    DatasetViewOps,
-    FileContext,
-    GroupViewOps,
-    NodeDescriptor,
-    make_view,
+    attr_path,
+    child_path,
 )
 
-DT = TypeVar("DT", bound=DType)
-T = TypeVar("T")
-
-_ATTR_BASES = (str, int, float, bool)
+_SCALAR_TYPES = (str, int, float, bool, bytes, complex)
+_DATA_NOT_LOADED = object()
 
 
-# --------------------------------------------------------------------------
-# Annotation classification
-# --------------------------------------------------------------------------
+def _schema_error(owner: type, field: str, message: str) -> SchemaError:
+    return SchemaError(f"{owner.__name__}.{field}: {message}")
 
 
-def _unwrap_annotation(owner: type, py_name: str, ann: Any) -> tuple[Any, list[Any], bool]:
-    """Strip ``Annotated`` and ``| None`` layers off an annotation.
-
-    Returns
-    -------
-    core : object
-        The remaining core annotation.
-    metadata : list
-        Collected ``Annotated`` metadata, outermost first.
-    optional : bool
-        Whether ``None`` appeared in a union layer.
-    """
+def _split_annotation(owner: type, py_name: str, annotation: Any) -> tuple[Any, list[Any], bool]:
+    """Extract h5t/constraint metadata and optionality from an annotation."""
     metadata: list[Any] = []
     optional = False
-    core = ann
+    core = annotation
     while True:
         if typing.get_origin(core) is Annotated:
-            metadata.extend(core.__metadata__)
-            core = typing.get_args(core)[0]
+            args = typing.get_args(core)
+            core = args[0]
+            metadata.extend(args[1:])
             continue
         origin = typing.get_origin(core)
-        if origin is typing.Union or origin is types.UnionType:
-            args = list(typing.get_args(core))
-            non_none = [a for a in args if a is not type(None)]
-            if len(non_none) != len(args):
+        if origin in (typing.Union, types.UnionType):
+            args = typing.get_args(core)
+            without_none = tuple(arg for arg in args if arg is not type(None))
+            if len(without_none) != len(args):
                 optional = True
-            if len(non_none) != 1:
-                raise SchemaError(
-                    f"{owner.__name__}.{py_name}: unions other than '| None'"
-                    " are not supported in v0.1"
+            if len(without_none) != 1:
+                raise _schema_error(
+                    owner,
+                    py_name,
+                    "only optional unions of the form 'T | None' are supported",
                 )
-            core = non_none[0]
+            core = without_none[0]
             continue
         return core, metadata, optional
 
 
-def _extract_metadata(
-    owner: type, py_name: str, metadata: list[Any]
-) -> tuple[str | None, str | None]:
-    """Pull ``Name`` and ``Keys`` markers out of Annotated metadata."""
-    h5_name: str | None = None
-    pattern: str | None = None
-    for item in metadata:
-        if isinstance(item, Name):
-            h5_name = item.name
-        elif isinstance(item, Keys):
-            try:
-                re.compile(item.pattern)
-            except re.error as exc:
-                raise SchemaError(
-                    f"{owner.__name__}.{py_name}: invalid Keys pattern {item.pattern!r}: {exc}"
-                ) from exc
-            pattern = item.pattern
-        elif isinstance(item, str):
-            raise SchemaError(
-                f"{owner.__name__}.{py_name}: shape metadata is no longer supported;"
-                " override validate() to check dataset shapes"
-            )
-    return h5_name, pattern
+def _adapter_annotation(core: Any, metadata: list[Any], optional: bool) -> Any:
+    foreign = tuple(item for item in metadata if not isinstance(item, (Name, Attr, Eager)))
+    annotation = Annotated[core, *foreign] if foreign else core
+    return annotation | None if optional else annotation
 
 
-def _attr_type_for(owner: type, py_name: str, core: Any) -> AttrType:
-    """Build the checked :class:`AttrType` for an attr-by-elimination member."""
-    if typing.get_origin(core) is Literal:
-        values = typing.get_args(core)
-        if not values:
-            raise SchemaError(f"{owner.__name__}.{py_name}: empty Literal")
-        for value in values:
-            if not isinstance(value, _ATTR_BASES):
-                raise SchemaError(
-                    f"{owner.__name__}.{py_name}: unsupported Literal value {value!r}"
-                )
-        return AttrType(literals=values)
-    if core in _ATTR_BASES or core is np.ndarray:
-        return AttrType(base=core)
-    raise SchemaError(
-        f"{owner.__name__}.{py_name}: unsupported attr type {core!r};"
-        " v0.1 supports str, int, float, bool, Literal[...], and np.ndarray"
-    )
+def _build_adapter(owner: type, py_name: str, annotation: Any) -> TypeAdapter[Any]:
+    try:
+        return TypeAdapter(annotation, config=ConfigDict(arbitrary_types_allowed=True))
+    except Exception as exc:
+        raise _schema_error(owner, py_name, f"cannot construct a validator: {exc}") from exc
 
 
-def _classify_member(
+def _marker(metadata: list[Any], marker_type: type, owner: type, py_name: str) -> Any | None:
+    found = [item for item in metadata if isinstance(item, marker_type)]
+    if len(found) > 1:
+        raise _schema_error(owner, py_name, f"{marker_type.__name__} may appear only once")
+    return found[0] if found else None
+
+
+def _is_scalar_annotation(core: Any) -> bool:
+    if core in _SCALAR_TYPES or typing.get_origin(core) is Literal:
+        return True
+    return isinstance(core, type) and (issubclass(core, Enum) or issubclass(core, np.generic))
+
+
+def _field_spec(
     owner: type,
     py_name: str,
-    ann: Any,
+    annotation: Any,
     default: Any,
-    has_default: bool,
     *,
-    allow_children: bool,
-    default_extras: Extras,
-) -> MemberSpec:
-    """Compile one annotated class-body member into its spec."""
-    core, metadata, optional = _unwrap_annotation(owner, py_name, ann)
-    name_meta, pattern = _extract_metadata(owner, py_name, metadata)
-    h5_name = name_meta if name_meta is not None else py_name
+    dataset_owner: bool,
+) -> FieldSpec:
+    core, metadata, optional = _split_annotation(owner, py_name, annotation)
+    name_marker = _marker(metadata, Name, owner, py_name)
+    attr_marker = _marker(metadata, Attr, owner, py_name)
+    eager_marker = _marker(metadata, Eager, owner, py_name)
 
-    # Dataset member: inline subscript form or named subclass.
-    if isinstance(core, type) and issubclass(core, Dataset):
-        if not allow_children:
-            raise SchemaError(f"{owner.__name__}.{py_name}: a dataset cannot contain child nodes")
-        if has_default:
-            raise SchemaError(f"{owner.__name__}.{py_name}: defaults apply to attrs only")
-        template = core.__h5spec__
-        if template.dtype is None:
-            raise SchemaError(
-                f"{owner.__name__}.{py_name}: dataset member has no dtype;"
-                " use h5t.Dataset[h5t.f8] or the dtype= class kwarg"
-            )
-        return replace(template, py_name=py_name, h5_name=h5_name, optional=optional)
+    h5_name = name_marker.name if name_marker is not None else py_name
+    if not isinstance(h5_name, str) or not h5_name:
+        raise _schema_error(owner, py_name, "Name requires a non-empty string")
+    if attr_marker is not None and attr_marker.converter is not None:
+        if not callable(attr_marker.converter):
+            raise _schema_error(owner, py_name, "Attr.converter must be callable")
+    if attr_marker is not None and eager_marker is not None:
+        raise _schema_error(owner, py_name, "Attr and Eager cannot be combined")
 
-    # Dynamic group member: Group[T] inline.
-    origin = typing.get_origin(core)
-    if isinstance(origin, type) and issubclass(origin, Group):
-        if not allow_children:
-            raise SchemaError(f"{owner.__name__}.{py_name}: a dataset cannot contain child nodes")
-        item = _dynamic_item_spec(owner, py_name, typing.get_args(core))
-        if item is None:
-            raise SchemaError(
-                f"{owner.__name__}.{py_name}: Group[...] requires a Group or"
-                " Dataset schema as its item type"
-            )
-        return GroupSpec(
-            py_name=py_name,
-            h5_name=h5_name,
-            extras=default_extras,
-            dynamic=DynamicSpec(item=item, pattern=pattern),
-            optional=optional,
-            view_type=origin,
+    is_dataset = isinstance(core, type) and issubclass(core, Dataset)
+    is_group = isinstance(core, type) and issubclass(core, Group)
+
+    if attr_marker is not None:
+        if is_dataset or is_group:
+            raise _schema_error(owner, py_name, "Attr cannot annotate a Group or Dataset field")
+        kind = MemberKind.ATTRIBUTE
+        member_type = None
+    elif is_dataset:
+        kind = MemberKind.DATASET
+        member_type = core
+    elif is_group:
+        kind = MemberKind.GROUP
+        member_type = core
+    elif core is np.ndarray or typing.get_origin(core) is np.ndarray:
+        # Accept npt.NDArray[...] aliases. The dtype parameter is not validated
+        # (the adapter degrades to an isinstance check), so normalize to the
+        # plain type to keep declaration equivalence dtype-agnostic.
+        kind = MemberKind.ARRAY
+        member_type = None
+        core = np.ndarray
+    elif _is_scalar_annotation(core):
+        kind = MemberKind.ATTRIBUTE
+        member_type = None
+    else:
+        raise _schema_error(
+            owner,
+            py_name,
+            f"unsupported annotation {core!r}; containers require Attr(), and dynamic "
+            "collections are not supported",
         )
 
-    # Static subgroup member: named Group subclass.
-    if isinstance(core, type) and issubclass(core, Group):
-        if not allow_children:
-            raise SchemaError(f"{owner.__name__}.{py_name}: a dataset cannot contain child nodes")
-        if has_default:
-            raise SchemaError(f"{owner.__name__}.{py_name}: defaults apply to attrs only")
-        spec = core.__h5spec__
-        if pattern is not None:
-            if spec.dynamic is None:
-                raise SchemaError(
-                    f"{owner.__name__}.{py_name}: Keys(...) requires a dynamic Group[T] member"
-                )
-            spec = replace(spec, dynamic=replace(spec.dynamic, pattern=pattern))
-        return replace(spec, py_name=py_name, h5_name=h5_name, optional=optional)
+    if eager_marker is not None and kind is not MemberKind.DATASET:
+        raise _schema_error(owner, py_name, "Eager applies only to Dataset fields")
+    if dataset_owner and kind is not MemberKind.ATTRIBUTE:
+        raise _schema_error(owner, py_name, "a Dataset subclass may declare only attributes")
+    if kind is not MemberKind.ATTRIBUTE and "/" in h5_name:
+        raise _schema_error(owner, py_name, "a child Name cannot contain '/'")
 
-    # Everything else is an attribute, by elimination.
-    if pattern is not None:
-        raise SchemaError(f"{owner.__name__}.{py_name}: Keys(...) applies to dynamic group members")
-    attr_type = _attr_type_for(owner, py_name, core)
-    return AttrSpec(
+    adapter_ann = _adapter_annotation(core, metadata, optional)
+    return FieldSpec(
         py_name=py_name,
         h5_name=h5_name,
-        type=attr_type,
+        kind=kind,
+        annotation=adapter_ann,
+        adapter=_build_adapter(owner, py_name, adapter_ann),
         optional=optional,
-        default=default if has_default else None,
+        default=default,
+        converter=attr_marker.converter if attr_marker is not None else None,
+        eager=eager_marker is not None,
+        member_type=member_type,
     )
 
 
-def _dynamic_item_spec(owner: type, py_name: str, args: tuple[Any, ...]) -> NodeSpec | None:
-    """Resolve the item spec of a ``Group[T]`` subscription, if valid."""
-    if len(args) != 1:
-        return None
-    (arg,) = args
-    if not isinstance(arg, type):
-        return None
-    if issubclass(arg, Dataset):
-        item = arg.__h5spec__
-        if item.dtype is None:
-            raise SchemaError(
-                f"{owner.__name__}.{py_name}: dynamic item type {arg.__name__} needs a dtype"
-            )
-        return item
-    if issubclass(arg, Group):
-        return arg.__h5spec__
-    return None
+def _resolved_annotations(cls: type) -> dict[str, Any]:
+    """Return ``cls``'s own annotations, evaluating PEP 563 strings.
 
-
-# --------------------------------------------------------------------------
-# Class-body compilation
-# --------------------------------------------------------------------------
-
-_MISSING = object()
-
-
-def _own_members(
-    cls: type, *, allow_children: bool, default_extras: Extras
-) -> dict[str, MemberSpec]:
-    """Compile the annotations declared directly on ``cls``."""
+    Names resolve against the defining module, then the local scope captured
+    when the class was created, then the class body.
+    """
+    annotations = inspect.get_annotations(cls, eval_str=False)
+    if not any(isinstance(annotation, str) for annotation in annotations.values()):
+        return annotations
+    module = sys.modules.get(cls.__module__)
+    scope: dict[str, Any] = dict(vars(module)) if module is not None else {}
+    scope.update(cls.__dict__.get("_h5t_scope", {}))
+    scope.update(vars(cls))
     try:
-        annotations = inspect.get_annotations(cls, eval_str=True)
-    except NameError as exc:
-        raise SchemaError(
-            f"{cls.__name__}: could not resolve an annotation ({exc});"
-            " forward references to not-yet-defined schemas are not supported in v0.1"
-        ) from exc
-    members: dict[str, MemberSpec] = {}
-    for py_name, ann in annotations.items():
-        if py_name.startswith("_"):
+        return {
+            name: eval(annotation, scope) if isinstance(annotation, str) else annotation
+            for name, annotation in annotations.items()
+        }
+    except Exception as exc:
+        raise SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}") from exc
+
+
+def _own_fields(cls: type, *, dataset_owner: bool) -> dict[str, FieldSpec]:
+    annotations = _resolved_annotations(cls)
+    fields: dict[str, FieldSpec] = {}
+    for py_name, annotation in annotations.items():
+        if py_name.startswith("_") or typing.get_origin(annotation) is ClassVar:
             continue
-        origin: Any = typing.get_origin(ann)
-        if origin is ClassVar:
-            continue
-        default = cls.__dict__.get(py_name, _MISSING)
-        members[py_name] = _classify_member(
+        default = cls.__dict__.get(py_name, _NO_DEFAULT)
+        fields[py_name] = _field_spec(
             cls,
             py_name,
-            ann,
-            default if default is not _MISSING else None,
-            default is not _MISSING,
-            allow_children=allow_children,
-            default_extras=default_extras,
+            annotation,
+            default,
+            dataset_owner=dataset_owner,
         )
-    return members
+    return fields
 
 
-def _merged_members(cls: type) -> dict[str, MemberSpec]:
-    """Merge compiled members across the MRO.
-
-    Bases are flattened in MRO order; a more-derived class overrides its
-    ancestors, while *sibling* bases redeclaring the same member with
-    different specs raise :class:`SchemaError` — that divergence is always
-    a bug, and the MRO would otherwise silently pick one.
-    """
-    merged: dict[str, tuple[type, MemberSpec]] = {}
-    for klass in reversed(cls.__mro__):
-        own = klass.__dict__.get("__h5members_own__")
+def _merged_fields(cls: type) -> dict[str, FieldSpec]:
+    merged: dict[str, tuple[type, FieldSpec]] = {}
+    for candidate in reversed(cls.__mro__):
+        own = candidate.__dict__.get("_h5t_own")
         if not own:
             continue
-        for name, spec in own.items():
-            if name not in merged:
-                merged[name] = (klass, spec)
+        for name, field in own.items():
+            previous = merged.get(name)
+            if previous is None:
+                merged[name] = (candidate, field)
                 continue
-            owner, existing = merged[name]
-            if issubclass(klass, owner):
-                merged[name] = (klass, spec)
-            elif existing != spec:
+            previous_owner, previous_field = previous
+            if issubclass(candidate, previous_owner):
+                merged[name] = (candidate, field)
+            elif not _fields_equivalent(field, previous_field):
                 raise SchemaError(
-                    f"{cls.__name__}.{name}: conflicting redeclarations in bases"
-                    f" {owner.__name__} and {klass.__name__}"
+                    f"{cls.__name__}.{name}: conflicting declarations in bases "
+                    f"{previous_owner.__name__} and {candidate.__name__}"
                 )
-    return {name: spec for name, (_, spec) in merged.items()}
+    return {name: field for name, (_, field) in merged.items()}
 
 
-def _check_namespaces(cls: type, members: dict[str, MemberSpec]) -> None:
-    """Enforce HDF5 name uniqueness per namespace and API-shadowing rules."""
-    child_names: dict[str, str] = {}
-    attr_names: dict[str, str] = {}
-    for py_name, spec in members.items():
-        namespace = attr_names if isinstance(spec, AttrSpec) else child_names
-        kind = "attr" if isinstance(spec, AttrSpec) else "child"
-        if spec.h5_name in namespace:
-            raise SchemaError(
-                f"{cls.__name__}: duplicate HDF5 {kind} name {spec.h5_name!r}"
-                f" (fields {namespace[spec.h5_name]!r} and {py_name!r})"
-            )
-        namespace[spec.h5_name] = py_name
+def _fields_equivalent(left: FieldSpec, right: FieldSpec) -> bool:
+    """Compare declarations without adapter identity or array-valued equality."""
+    return (
+        left.py_name == right.py_name
+        and left.h5_name == right.h5_name
+        and left.kind is right.kind
+        and repr(left.annotation) == repr(right.annotation)
+        and left.optional == right.optional
+        and repr(left.default) == repr(right.default)
+        and left.converter is right.converter
+        and left.eager == right.eager
+        and left.member_type is right.member_type
+    )
 
 
-def _check_reserved(cls: type, own: dict[str, MemberSpec], reserved: frozenset[str]) -> None:
-    """Reject fields that would shadow the public view API."""
-    for py_name in own:
-        if py_name in reserved:
-            raise SchemaError(
-                f"{cls.__name__}.{py_name}: field shadows the h5t API;"
-                f" use a safe alias such as '{py_name}_:"
-                f' Annotated[..., h5t.Name("{py_name}")]\''
-            )
-
-
-def _install_descriptors(cls: type, members: dict[str, MemberSpec]) -> None:
-    """Install one lazy, per-instance-cached descriptor per member."""
-    for py_name, spec in members.items():
-        if isinstance(spec, AttrSpec):
-            setattr(cls, py_name, AttrDescriptor(spec))
-        else:
-            setattr(cls, py_name, NodeDescriptor(spec))
-
-
-def _resolve_extras(cls: type, extras: str | None) -> Extras:
-    """Resolve the extras policy: explicit kwarg, else inherited, else ignore."""
-    if extras is not None:
+def _resolve_extras(cls: type) -> Extras:
+    requested = cls.__dict__.get("_h5t_extras")
+    if requested is not None:
         try:
-            return Extras(extras)
+            return Extras(requested)
         except ValueError:
             raise SchemaError(
-                f"{cls.__name__}: extras must be 'ignore', 'warn', or 'forbid', got {extras!r}"
+                f"{cls.__name__}: extras must be 'ignore' or 'forbid', got {requested!r}"
             ) from None
     for base in cls.__mro__[1:]:
-        spec = base.__dict__.get("__h5spec__")
-        if isinstance(spec, GroupSpec):
+        spec = base.__dict__.get("_h5t_spec")
+        if spec is not None:
             return spec.extras
     return Extras.IGNORE
 
 
-def _inherited_dynamic(cls: type) -> DynamicSpec | None:
-    """Find the dynamic child spec from ``Group[T]`` bases or inherited specs."""
-    for base in getattr(cls, "__orig_bases__", ()):
-        origin = typing.get_origin(base)
-        if isinstance(origin, type) and issubclass(origin, Group):
-            args = typing.get_args(base)
-            if len(args) == 1 and isinstance(args[0], TypeVar):
-                continue
-            # Non-schema args such as Any fall through _dynamic_item_spec as None.
-            item = _dynamic_item_spec(cls, "<base>", args)
-            if item is not None:
-                return DynamicSpec(item=item, pattern=None)
+def _reserved_names(base: type) -> frozenset[str]:
+    return frozenset(name for name in dir(base) if not name.startswith("_"))
+
+
+def _check_fields(cls: type, own: Mapping[str, FieldSpec], fields: Mapping[str, FieldSpec]) -> None:
+    base = Dataset if issubclass(cls, Dataset) else Group
+    reserved = _reserved_names(base)
+    for name in own:
+        if name in reserved:
+            raise _schema_error(
+                cls,
+                name,
+                f"field shadows the h5t API; rename it and use Name({name!r})",
+            )
+
+    attr_names: dict[str, str] = {}
+    child_names: dict[str, str] = {}
+    for py_name, field in fields.items():
+        namespace = attr_names if field.kind is MemberKind.ATTRIBUTE else child_names
+        if field.h5_name in namespace:
+            raise SchemaError(
+                f"{cls.__name__}: duplicate HDF5 name {field.h5_name!r} for fields "
+                f"{namespace[field.h5_name]!r} and {py_name!r}"
+            )
+        namespace[field.h5_name] = py_name
+
+
+def _compile_class(cls: SchemaMeta) -> None:
+    """Compile ``cls`` into its own fields and its flattened schema."""
     for base in cls.__mro__[1:]:
-        spec = base.__dict__.get("__h5spec__")
-        if isinstance(spec, GroupSpec) and spec.dynamic is not None:
-            return spec.dynamic
-    return None
+        if isinstance(base, SchemaMeta):
+            # _merged_fields and _resolve_extras read compiled state off the bases.
+            _ensure_compiled(base)
+    own = _own_fields(cls, dataset_owner=issubclass(cls, Dataset))
+    cls._h5t_own = own
+    fields = _merged_fields(cls)
+    _check_fields(cls, own, fields)
+    cls._h5t_spec = ClassSpec(tuple(fields.values()), _resolve_extras(cls))
 
 
-def _reserved_group_names() -> frozenset[str]:
-    """Public API names a group schema field may not shadow."""
-    names = {n for n in dir(Group) if not n.startswith("_")}
-    file_cls = globals().get("File")
-    if file_cls is not None:
-        names |= {n for n in dir(file_cls) if not n.startswith("_")}
-    return frozenset(names)
+def _ensure_compiled(cls: SchemaMeta) -> None:
+    if "_h5t_spec" not in cls.__dict__:
+        _compile_class(cls)
 
 
-def _reserved_dataset_names() -> frozenset[str]:
-    """Public API names a dataset schema field may not shadow."""
-    return frozenset(n for n in dir(Dataset) if not n.startswith("_"))
+class SchemaMeta(type):
+    """Metaclass that compiles a schema class the first time its spec is read.
 
-
-def _compile_group_class(
-    cls: type,
-    extras: str | None,
-) -> None:
-    """Compile a Group (or File) subclass body into its ``__h5spec__``."""
-    resolved_extras = _resolve_extras(cls, extras)
-    own = _own_members(cls, allow_children=True, default_extras=resolved_extras)
-    _check_reserved(cls, own, _reserved_group_names())
-    cls.__h5members_own__ = own  # ty: ignore[unresolved-attribute]
-    members = _merged_members(cls)
-    _check_namespaces(cls, members)
-    children = tuple(s for s in members.values() if not isinstance(s, AttrSpec))
-    attrs = tuple(s for s in members.values() if isinstance(s, AttrSpec))
-    spec = GroupSpec(
-        py_name="",
-        h5_name="",
-        children=children,
-        attrs=attrs,
-        extras=resolved_extras,
-        dynamic=_inherited_dynamic(cls),
-        view_type=cls,
-    )
-    cls.__h5spec__ = spec  # ty: ignore[unresolved-attribute]
-    _install_descriptors(cls, members)
-
-
-def _compile_dataset_class(
-    cls: type,
-    dtype: type[DType] | None,
-) -> None:
-    """Compile a Dataset subclass body into its ``__h5spec__``."""
-    if dtype is not None and not (isinstance(dtype, type) and issubclass(dtype, DType)):
-        raise SchemaError(f"{cls.__name__}: dtype= must be an h5t dtype token, got {dtype!r}")
-    inherited = None
-    for base in cls.__mro__[1:]:
-        candidate = base.__dict__.get("__h5spec__")
-        if isinstance(candidate, DatasetSpec):
-            inherited = candidate
-            break
-    if dtype is None and inherited is not None:
-        dtype = inherited.dtype
-    own = _own_members(cls, allow_children=False, default_extras=Extras.IGNORE)
-    _check_reserved(cls, own, _reserved_dataset_names())
-    cls.__h5members_own__ = own  # ty: ignore[unresolved-attribute]
-    members = _merged_members(cls)
-    _check_namespaces(cls, members)
-    attrs = tuple(s for s in members.values() if isinstance(s, AttrSpec))
-    spec = DatasetSpec(
-        py_name="",
-        h5_name="",
-        dtype=dtype,
-        attrs=attrs,
-        view_type=cls,
-    )
-    cls.__h5spec__ = spec  # ty: ignore[unresolved-attribute]
-    _install_descriptors(cls, members)
-
-
-def _check_spec(spec: NodeSpec, context: str) -> None:
-    """Recursively check a compiled spec for coherence (``validate_schema``)."""
-    if isinstance(spec, DatasetSpec):
-        if spec.dtype is None:
-            raise SchemaError(f"{context}: dataset has no dtype")
-        return
-    if spec.dynamic is not None:
-        if spec.dynamic.pattern is not None:
-            try:
-                re.compile(spec.dynamic.pattern)
-            except re.error as exc:
-                raise SchemaError(
-                    f"{context}: invalid Keys pattern {spec.dynamic.pattern!r}: {exc}"
-                ) from exc
-        _check_spec(spec.dynamic.item, f"{context}[<dynamic>]")
-    for child in spec.children:
-        _check_spec(child, f"{context}/{child.h5_name}")
-
-
-# --------------------------------------------------------------------------
-# Public schema base classes
-# --------------------------------------------------------------------------
-
-
-class Dataset(DatasetViewOps, Generic[DT]):
-    """Base class for dataset schemas; instances are lazy dataset views.
-
-    Configure via class kwargs, not by subclassing the subscript::
-
-        class StrainSeries(h5t.Dataset, dtype=h5t.f8):
-            unit: Literal["strain"]
-
-    Ordinary class-body annotations declare *attrs on the dataset* — a
-    dataset cannot contain child nodes. The subscript form
-    ``h5t.Dataset[h5t.f8]`` builds an inline anonymous subclass at runtime.
+    Deferring compilation keeps import cheap, lets annotations name classes
+    defined later in the module, and confines the cost to the first
+    ``from_file`` call.
     """
 
-    __h5spec__: ClassVar[DatasetSpec]
-    __h5members_own__: ClassVar[dict[str, MemberSpec]]
+    _h5t_own: dict[str, FieldSpec]
+    _h5t_spec: ClassSpec
+
+    @property
+    def __h5spec__(cls) -> ClassSpec:
+        """The flattened schema of this class, compiled on first access."""
+        _ensure_compiled(cls)
+        return cls._h5t_spec
+
+
+def _short_pydantic_error(exc: PydanticValidationError) -> str:
+    errors = exc.errors(include_url=False, include_context=False, include_input=False)
+    if not errors:
+        return str(exc).splitlines()[0]
+    first = errors[0]
+    location = ".".join(str(part) for part in first.get("loc", ()))
+    message = str(first.get("msg", "invalid value"))
+    return f"{location}: {message}" if location else message
+
+
+def _validate_value(field: FieldSpec, value: Any, path: str) -> Any:
+    try:
+        return field.adapter.validate_python(value)
+    except PydanticValidationError as exc:
+        raise ValidationError(path, _short_pydantic_error(exc)) from exc
+
+
+def _missing_value(field: FieldSpec, path: str) -> Any:
+    if field.has_default:
+        return _validate_value(field, field.default, path)
+    if field.optional:
+        return None
+    kind = field.kind.value
+    raise ValidationError(path, f"required {kind} {field.h5_name!r} is missing")
+
+
+def _raw_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
+    return {str(name): node.attrs[name] for name in node.attrs}
+
+
+def _check_group_extras(spec: ClassSpec, group: h5py.Group, path: str) -> None:
+    if spec.extras is Extras.IGNORE:
+        return
+    attrs = {field.h5_name for field in spec.fields if field.kind is MemberKind.ATTRIBUTE}
+    children = {field.h5_name for field in spec.fields if field.kind is not MemberKind.ATTRIBUTE}
+    for name in group.attrs:
+        rendered = str(name)
+        if rendered not in attrs:
+            raise ValidationError(attr_path(path, rendered), "unexpected attribute")
+    for name in group.keys():
+        rendered = str(name)
+        if rendered not in children:
+            raise ValidationError(child_path(path, rendered), "unexpected child node")
+
+
+def _check_dataset_extras(spec: ClassSpec, dataset: h5py.Dataset, path: str) -> None:
+    if spec.extras is Extras.IGNORE:
+        return
+    attrs = {field.h5_name for field in spec.fields}
+    for name in dataset.attrs:
+        rendered = str(name)
+        if rendered not in attrs:
+            raise ValidationError(attr_path(path, rendered), "unexpected attribute")
+
+
+def _load_attribute(
+    field: FieldSpec,
+    raw: Mapping[str, Any],
+    attrs: dict[str, Any],
+    parent_path: str,
+) -> Any:
+    path = attr_path(parent_path, field.h5_name)
+    if field.h5_name not in raw:
+        value = _missing_value(field, path)
+    else:
+        value = raw[field.h5_name]
+        if field.converter is not None:
+            try:
+                value = field.converter(value)
+            except Exception as exc:
+                raise ConversionError(path, f"attribute converter failed: {exc}") from exc
+        value = _validate_value(field, value, path)
+    if field.h5_name in raw:
+        attrs[field.h5_name] = value
+    return value
+
+
+def _load_dataset(
+    dataset_type: type[Dataset],
+    dataset: h5py.Dataset,
+    filename: str,
+    path: str,
+) -> Dataset:
+    spec = dataset_type.__h5spec__
+    _check_dataset_extras(spec, dataset, path)
+    raw = _raw_attrs(dataset)
+    attrs = dict(raw)
+    values: dict[str, Any] = {}
+    for field in spec.fields:
+        values[field.py_name] = _load_attribute(field, raw, attrs, path)
+
+    instance = object.__new__(dataset_type)
+    object.__setattr__(instance, "_h5t_filename", filename)
+    object.__setattr__(instance, "_h5t_path", path)
+    object.__setattr__(instance, "_h5t_shape", tuple(dataset.shape))
+    object.__setattr__(instance, "_h5t_dtype", np.dtype(dataset.dtype))
+    object.__setattr__(instance, "_h5t_attrs", MappingProxyType(attrs))
+    object.__setattr__(instance, "_h5t_data", _DATA_NOT_LOADED)
+    for name, value in values.items():
+        object.__setattr__(instance, name, value)
+    return instance
+
+
+def _load_group(group_type: type[Group], group: h5py.Group, filename: str, path: str) -> Group:
+    spec = group_type.__h5spec__
+    _check_group_extras(spec, group, path)
+    raw = _raw_attrs(group)
+    attrs = dict(raw)
+    values: dict[str, Any] = {}
+
+    for field in spec.fields:
+        if field.kind is MemberKind.ATTRIBUTE:
+            values[field.py_name] = _load_attribute(field, raw, attrs, path)
+            continue
+
+        member_path = child_path(path, field.h5_name)
+        if field.h5_name not in group:
+            values[field.py_name] = _missing_value(field, member_path)
+            continue
+        node = group[field.h5_name]
+        if field.kind is MemberKind.GROUP:
+            if not isinstance(node, h5py.Group):
+                raise ValidationError(member_path, "expected a group, found a dataset")
+            assert field.member_type is not None
+            nested_group_type = typing.cast(type[Group], field.member_type)
+            value = _load_group(nested_group_type, node, filename, member_path)
+        elif field.kind is MemberKind.DATASET:
+            if not isinstance(node, h5py.Dataset):
+                raise ValidationError(member_path, "expected a dataset, found a group")
+            assert field.member_type is not None
+            dataset_type = typing.cast(type[Dataset], field.member_type)
+            value = _load_dataset(dataset_type, node, filename, member_path)
+            if field.eager:
+                object.__setattr__(value, "_h5t_data", np.asarray(node[()]))
+        else:
+            if not isinstance(node, h5py.Dataset):
+                raise ValidationError(member_path, "expected a dataset, found a group")
+            value = np.asarray(node[()])
+        values[field.py_name] = _validate_value(field, value, member_path)
+
+    instance = object.__new__(group_type)
+    object.__setattr__(instance, "_h5t_attrs", MappingProxyType(attrs))
+    for name, value in values.items():
+        object.__setattr__(instance, name, value)
+    return instance
+
+
+class _Record(metaclass=SchemaMeta):
+    """Shared declaration handling and repr for detached schema records."""
+
+    _h5t_extras: ClassVar[str | None] = None
+    _h5t_scope: ClassVar[Mapping[str, Any]] = {}
 
     def __init_subclass__(
         cls,
         *,
-        dtype: type[DType] | None = None,
+        extras: Literal["ignore", "forbid"] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init_subclass__(**kwargs)
-        _compile_dataset_class(cls, dtype)
+        cls._h5t_extras = extras
+        # Annotations are resolved on first use, when the defining scope may be gone:
+        # capture it now so schemas declared inside a function still resolve. Module
+        # and class bodies expose their namespace dict directly; a function scope
+        # yields a snapshot (or, from 3.13, a proxy that must not outlive its frame).
+        frame = inspect.currentframe()
+        scope = frame.f_back.f_locals if frame is not None and frame.f_back else {}
+        cls._h5t_scope = scope if isinstance(scope, dict) else dict(scope)
 
-    def __class_getitem__(cls, item: Any) -> Any:
-        """Build an inline subclass whose subscript sets its dtype.
+    def _h5t_repr_fields(self) -> list[tuple[str, Any]]:
+        spec = type(self).__h5spec__
+        return [(field.py_name, getattr(self, field.py_name)) for field in spec.fields]
 
-        TypeVar subscriptions are delegated to ``Generic``.
-        """
-        parts = item if isinstance(item, tuple) else (item,)
-        if any(isinstance(p, TypeVar) for p in parts):
-            return super().__class_getitem__(item)  # type: ignore[misc]
-        if len(parts) != 1 or not (isinstance(parts[0], type) and issubclass(parts[0], DType)):
-            raise SchemaError(
-                f"invalid Dataset subscript {item!r}; expected one dtype token;"
-                " override validate() to check dataset shapes"
-            )
-        dtype = parts[0]
-        rendered = dtype.__name__
-        return type(
-            f"{cls.__name__}[{rendered}]",
-            (cls,),
-            {"__module__": cls.__module__, "__qualname__": f"{cls.__qualname__}[{rendered}]"},
-            dtype=dtype,
+    def __repr__(self) -> str:
+        fields = ", ".join(
+            f"{name}={reprlib.repr(value)}" for name, value in self._h5t_repr_fields()
+        )
+        return f"{type(self).__name__}({fields})"
+
+
+class Dataset(_Record):
+    """A detached HDF5 dataset with snapshotted metadata and lazy payload data."""
+
+    _h5t_filename: str
+    _h5t_path: str
+    _h5t_shape: tuple[int, ...]
+    _h5t_dtype: np.dtype[Any]
+    _h5t_attrs: Mapping[str, Any]
+    _h5t_data: object
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(f"{type(self).__name__} objects are created by Group.from_file()")
+
+    @property
+    def attrs(self) -> Mapping[str, Any]:
+        """Immutable snapshot of all dataset attributes."""
+        return self._h5t_attrs
+
+    @property
+    def path(self) -> str:
+        """Absolute HDF5 path of this dataset."""
+        return self._h5t_path
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Dataset shape captured while the model was loaded."""
+        return self._h5t_shape
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        """Dataset dtype captured while the model was loaded."""
+        return self._h5t_dtype
+
+    @property
+    def ndim(self) -> int:
+        """Number of dimensions in the captured shape."""
+        return len(self._h5t_shape)
+
+    @property
+    def data(self) -> np.ndarray:
+        """Read and cache the complete current payload as a NumPy array."""
+        if self._h5t_data is _DATA_NOT_LOADED:
+            with self.open() as dataset:
+                value = np.asarray(dataset[()])
+            object.__setattr__(self, "_h5t_data", value)
+        return typing.cast(np.ndarray, self._h5t_data)
+
+    def read(self) -> np.ndarray:
+        """Return the same cached complete payload as ``data``."""
+        return self.data
+
+    @contextmanager
+    def open(self) -> Iterator[h5py.Dataset]:
+        """Open the current source file and yield this dataset for live access."""
+        with h5py.File(self._h5t_filename, mode="r") as h5file:
+            node = h5file.get(self._h5t_path)
+            if node is None:
+                raise ValidationError(self._h5t_path, "dataset no longer exists")
+            if not isinstance(node, h5py.Dataset):
+                raise ValidationError(self._h5t_path, "expected a dataset, found a group")
+            yield node
+
+    def _h5t_repr_fields(self) -> list[tuple[str, Any]]:
+        fields: list[tuple[str, Any]] = [
+            ("path", self.path),
+            ("shape", self.shape),
+            ("dtype", self.dtype),
+        ]
+        fields.extend(super()._h5t_repr_fields())
+        return fields
+
+
+class Group(_Record):
+    """Base class for detached, typed HDF5 group records."""
+
+    _h5t_attrs: Mapping[str, Any]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(
+            f"{type(self).__name__} objects are created by {type(self).__name__}.from_file()"
         )
 
-    @classmethod
-    def validate_schema(cls) -> None:
-        """Check that this schema itself is coherent.
-
-        Schema errors are a separate channel from file errors: this raises
-        :class:`SchemaError` for problems in the *declaration*, never for
-        problems in any file.
-
-        Raises
-        ------
-        SchemaError
-            If the compiled spec is incomplete or incoherent.
-        """
-        _check_spec(cls.__h5spec__, cls.__name__)
-
-
-class Group(GroupViewOps, Generic[T]):
-    """Base class for group schemas; instances are lazy views onto groups.
-
-    Class-body annotations declare child nodes and attrs; ``extras=`` sets
-    the policy for undeclared children and attrs (``"ignore"`` by default).
-
-    ``Group[T]`` in an annotation says the group's dynamically named
-    children satisfy ``T``; subclassing ``Group[T]`` gives the collection
-    group attrs of its own.
-    """
-
-    __h5spec__: ClassVar[GroupSpec]
-    __h5members_own__: ClassVar[dict[str, MemberSpec]]
-
-    def __init_subclass__(
-        cls,
-        *,
-        extras: Literal["ignore", "warn", "forbid"] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init_subclass__(**kwargs)
-        _compile_group_class(cls, extras)
-
-    def __getitem__(self, key: str) -> T:
-        """Address a child by HDF5 name.
-
-        On a dynamic ``Group[T]`` collection, keys selected by the
-        ``Keys`` pattern return typed, lazy ``T`` views. On statically
-        declared groups this is the untyped mapping escape hatch and
-        returns the raw h5py object.
-        """
-        return cast(T, self._h5t_getitem(key))
+    @property
+    def attrs(self) -> Mapping[str, Any]:
+        """Immutable snapshot of all group attributes."""
+        return self._h5t_attrs
 
     @classmethod
-    def validate_schema(cls) -> None:
-        """Check that this schema itself is coherent.
-
-        Raises
-        ------
-        SchemaError
-            If the compiled spec is incomplete or incoherent.
-        """
-        _check_spec(cls.__h5spec__, cls.__name__)
-
-
-# Base classes carry empty template specs so they are usable as bare
-# annotations and as merge anchors; subclass compilation replaces them.
-Group.__h5spec__ = GroupSpec(py_name="", h5_name="", view_type=Group)
-Dataset.__h5spec__ = DatasetSpec(py_name="", h5_name="", dtype=None, view_type=Dataset)
-
-
-class File(Group[Any]):
-    """Base class for file schemas: a group schema rooted at ``/``.
-
-    ``open()`` validates by default and returns a lazy, typed view; the
-    context manager owns the shared handle's lifetime.
-    """
-
-    @classmethod
-    def open(
-        cls,
-        path: str | os.PathLike[str],
-        *,
-        validate: bool = True,
-    ) -> Self:
-        """Open a file read-only as a validated, lazy view of this schema.
-
-        Parameters
-        ----------
-        path : str or path-like
-            Path of the HDF5 file.
-        validate : bool, optional
-            Validate on open (the default). Pass ``False`` to inspect
-            broken files; member access then raises targeted
-            :class:`~h5t._errors.SchemaMismatchError` on nonconforming
-            nodes.
-
-        Returns
-        -------
-        Self
-            The root view. Use as a context manager; retained child views
-            raise :class:`~h5t._errors.ClosedFileError` after exit.
-
-        Raises
-        ------
-        ValidationError
-            When ``validate`` is true and the file does not conform. All
-            problems are batched into one exception and the file handle is
-            closed before raising.
-        """
-        h5file = h5py.File(path, mode="r")
-        ctx = FileContext(h5file, str(path))
-        spec = cls.__h5spec__
-        view = cast(Self, make_view(spec, ctx, "/"))
-        if validate:
-            try:
-                report = view.check()
-                for problem in report.warnings:
-                    warnings.warn(f"{problem.path}: {problem.message}", stacklevel=2)
-                if not report.ok:
-                    raise ValidationError(report, file_closed=True)
-            except BaseException:
-                ctx.close()
-                raise
-        return view
-
-    def close(self) -> None:
-        """Close the shared file handle; all retained views become invalid."""
-        self._h5t_ctx.close()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
+    def from_file(cls, path: str | os.PathLike[str], root: str = "/") -> Self:
+        """Load this group schema from ``root`` and close the HDF5 file."""
+        _ensure_compiled(cls)  # report a SchemaError before touching the filesystem
+        try:
+            filesystem_path = os.fsdecode(os.fspath(path))
+        except TypeError as exc:
+            raise TypeError("path must be a filesystem path") from exc
+        if not isinstance(root, str) or not posixpath.isabs(root):
+            raise ValueError("root must be an absolute HDF5 group path")
+        normalized_root = posixpath.normpath(root)
+        if normalized_root.startswith("//"):
+            normalized_root = "/" + normalized_root.lstrip("/")
+        filename = os.path.abspath(filesystem_path)
+        with h5py.File(filename, mode="r") as h5file:
+            node = h5file.get(normalized_root)
+            if node is None:
+                raise ValidationError(normalized_root, "root group does not exist")
+            if not isinstance(node, h5py.Group):
+                raise ValidationError(normalized_root, "expected a group, found a dataset")
+            return typing.cast(Self, _load_group(cls, node, filename, normalized_root))
