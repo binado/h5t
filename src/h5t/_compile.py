@@ -118,8 +118,19 @@ def _field_spec(
     if attr_marker is not None and eager_marker is not None:
         raise _schema_error(owner, py_name, "Attr and Eager cannot be combined")
 
-    is_dataset = isinstance(core, type) and issubclass(core, Dataset)
-    is_group = isinstance(core, type) and issubclass(core, Group)
+    # Forward-declared Dataset/Group may not be defined yet at function load time;
+    # we delay the issubclass checks until after annotations are resolved, but
+    # we also guard against string leftovers.
+    is_dataset = (
+        isinstance(core, type) and issubclass(core, Dataset)
+        if isinstance(core, type)
+        else False
+    )
+    is_group = (
+        isinstance(core, type) and issubclass(core, Group)
+        if isinstance(core, type)
+        else False
+    )
 
     if attr_marker is not None:
         if is_dataset or is_group:
@@ -133,9 +144,6 @@ def _field_spec(
         kind = MemberKind.GROUP
         member_type = core
     elif core is np.ndarray or typing.get_origin(core) is np.ndarray:
-        # Accept npt.NDArray[...] aliases. The dtype parameter is not validated
-        # (the adapter degrades to an isinstance check), so normalize to the
-        # plain type to keep declaration equivalence dtype-agnostic.
         kind = MemberKind.ARRAY
         member_type = None
         core = np.ndarray
@@ -294,14 +302,62 @@ def _check_fields(cls: type, own: Mapping[str, FieldSpec], fields: Mapping[str, 
         namespace[field.h5_name] = py_name
 
 
-def _compile_class(cls: type, extras: str | None, *, dataset_owner: bool) -> None:
+def _compile_class(cls: type) -> None:
+    """Compile ``cls`` into ``__h5fields_own__`` and ``__h5spec__`` (lazy entry)."""
+    dataset_owner = issubclass(cls, Dataset)
+    requested: str | None = cls.__dict__.get("__h5t_extras__")
+    # Ensure bases are compiled first so _resolve_extras sees their specs.
+    for base in cls.__mro__[1:]:
+        if base in (Dataset, Group, object):
+            continue
+        # Only consider schema bases
+        try:
+            if issubclass(base, (Group, Dataset)):
+                if "__h5spec__" not in base.__dict__:
+                    _ensure_compiled(base)
+        except Exception:
+            pass
     own = _own_fields(cls, dataset_owner=dataset_owner)
-    cls.__h5fields_own__ = own  # ty: ignore[unresolved-attribute]
+    # Use type.__setattr__ to bypass metaclass getattribute side-effects
+    type.__setattr__(cls, "__h5fields_own__", own)
     fields = _merged_fields(cls)
     _check_fields(cls, own, fields)
-    cls.__h5spec__ = ClassSpec(  # ty: ignore[unresolved-attribute]
-        tuple(fields.values()), _resolve_extras(cls, extras)
-    )
+    spec = ClassSpec(tuple(fields.values()), _resolve_extras(cls, requested))
+    type.__setattr__(cls, "__h5spec__", spec)
+
+
+def _ensure_compiled(cls: type) -> None:
+    if "__h5spec__" in cls.__dict__ and isinstance(cls.__dict__["__h5spec__"], ClassSpec):
+        return
+    # Avoid compiling the abstract bases themselves
+    if cls in (Dataset, Group):
+        return
+    _compile_class(cls)
+
+
+class SchemaMeta(type):
+    """Metaclass that compiles ``__h5spec__`` lazily on first access."""
+
+    def __getattribute__(cls, name: str) -> Any:
+        if name in ("__h5spec__", "__h5fields_own__"):
+            # Bypass for the abstract bases – they have empty specs without compilation.
+            if cls.__name__ in ("Group", "Dataset") and cls.__module__ == "h5t._compile":
+                # If already set, return it; otherwise return empty.
+                d = type.__getattribute__(cls, "__dict__")
+                if name in d:
+                    return d[name]
+                if name == "__h5spec__":
+                    return ClassSpec()
+                return {}
+            d = type.__getattribute__(cls, "__dict__")
+            if name not in d:
+                # Trigger lazy compilation; this may raise SchemaError.
+                _ensure_compiled(cls)
+                d = type.__getattribute__(cls, "__dict__")
+                if name in d:
+                    return d[name]
+                # Fall through to normal lookup (will raise AttributeError if truly missing)
+        return super().__getattribute__(name)
 
 
 def _short_pydantic_error(exc: PydanticValidationError) -> str:
@@ -465,7 +521,7 @@ class _RecordRepr:
         return f"{type(self).__name__}({fields})"
 
 
-class Dataset(_RecordRepr):
+class Dataset(_RecordRepr, metaclass=SchemaMeta):
     """A detached HDF5 dataset with snapshotted metadata and lazy payload data."""
 
     __h5spec__: ClassVar[ClassSpec]
@@ -484,7 +540,9 @@ class Dataset(_RecordRepr):
         **kwargs: Any,
     ) -> None:
         super().__init_subclass__(**kwargs)
-        _compile_class(cls, extras, dataset_owner=True)
+        # Store extras for lazy compilation; do not compile now.
+        if extras is not None:
+            type.__setattr__(cls, "__h5t_extras__", extras)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise TypeError(f"{type(self).__name__} objects are created by Group.from_file()")
@@ -548,7 +606,7 @@ class Dataset(_RecordRepr):
         return fields
 
 
-class Group(_RecordRepr):
+class Group(_RecordRepr, metaclass=SchemaMeta):
     """Base class for detached, typed HDF5 group records."""
 
     __h5spec__: ClassVar[ClassSpec]
@@ -562,7 +620,8 @@ class Group(_RecordRepr):
         **kwargs: Any,
     ) -> None:
         super().__init_subclass__(**kwargs)
-        _compile_class(cls, extras, dataset_owner=False)
+        if extras is not None:
+            type.__setattr__(cls, "__h5t_extras__", extras)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise TypeError(
@@ -577,6 +636,8 @@ class Group(_RecordRepr):
     @classmethod
     def from_file(cls, path: str | os.PathLike[str], root: str = "/") -> Self:
         """Load this group schema from ``root`` and close the HDF5 file."""
+        # Trigger lazy compilation before opening file so SchemaError is raised early
+        _ = cls.__h5spec__
         try:
             filesystem_path = os.fsdecode(os.fspath(path))
         except TypeError as exc:
@@ -596,7 +657,9 @@ class Group(_RecordRepr):
             return typing.cast(Self, _load_group(cls, node, filename, normalized_root))
 
 
-Dataset.__h5spec__ = ClassSpec()
-Dataset.__h5fields_own__ = {}
-Group.__h5spec__ = ClassSpec()
-Group.__h5fields_own__ = {}
+# Base specs for the abstract roots (visible via direct attribute access without lazy path)
+type.__setattr__(Group, "__h5spec__", ClassSpec())
+type.__setattr__(Group, "__h5fields_own__", {})
+type.__setattr__(Dataset, "__h5spec__", ClassSpec())
+type.__setattr__(Dataset, "__h5fields_own__", {})
+

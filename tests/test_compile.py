@@ -97,6 +97,7 @@ def test_invalid_declarations(declaration: str, match: str) -> None:
     }
     with pytest.raises(h5t.SchemaError, match=match):
         exec(f"class Invalid(h5t.Group):\n    {declaration}", namespace)
+        namespace["Invalid"].__h5spec__
 
 
 def test_dataset_only_accepts_attributes_and_extras_has_two_values() -> None:
@@ -105,10 +106,14 @@ def test_dataset_only_accepts_attributes_and_extras_has_two_values() -> None:
         class BadDataset(h5t.Dataset):
             payload: np.ndarray
 
+        BadDataset.__h5spec__  # type: ignore[attr-defined]
+
     with pytest.raises(h5t.SchemaError, match="ignore.*forbid"):
 
         class Warn(h5t.Group, extras="warn"):  # type: ignore[arg-type]
             pass
+
+        Warn.__h5spec__  # type: ignore[attr-defined]
 
 
 def test_reserved_api_names_and_duplicate_names_fail() -> None:
@@ -117,11 +122,15 @@ def test_reserved_api_names_and_duplicate_names_fail() -> None:
         class Reserved(h5t.Group):
             attrs: str
 
+        Reserved.__h5spec__  # type: ignore[attr-defined]
+
     with pytest.raises(h5t.SchemaError, match="duplicate HDF5"):
 
         class Duplicate(h5t.Group):
             first: Annotated[str, h5t.Name("same")]
             second: Annotated[int, h5t.Name("same")]
+
+        Duplicate.__h5spec__  # type: ignore[attr-defined]
 
 
 def test_removed_api_is_absent() -> None:
