@@ -60,41 +60,111 @@ class _UnresolvedAnnotation(Exception):
         self.name = name
 
 
-def _raised_by_annotation(exc: NameError) -> bool:
+def _raised_by_annotation(exc: NameError, cls: type) -> bool:
     """Report whether ``exc`` came from the annotation expression itself, not a callee.
 
     Only an unbound name in the expression is a forward reference worth deferring for.
     A ``NameError`` escaping a function the annotation calls is a bug in that function,
-    so it must take the ``SchemaError`` path instead. Annotations are compiled under
-    ``_ANNOTATION_FILE``, which identifies the frame that raised.
+    so it must take the ``SchemaError`` path instead. The frame that raised identifies
+    the two: a PEP 563 string annotation is compiled under ``_ANNOTATION_FILE``, and a
+    PEP 649 lazy annotation is evaluated by ``cls``'s own ``__annotate__`` function.
     """
     tb = exc.__traceback__
     while tb is not None and tb.tb_next is not None:
         tb = tb.tb_next
-    return tb is not None and tb.tb_frame.f_code.co_filename == _ANNOTATION_FILE
+    if tb is None:
+        return False
+    code = tb.tb_frame.f_code
+    if code.co_filename == _ANNOTATION_FILE:
+        return True
+    # A class with no annotations of its own has ``__annotate__ is None``.
+    return code is getattr(getattr(cls, "__annotate__", None), "__code__", None)
 
 
-def _referenced_names(annotations: Mapping[str, Any]) -> set[str]:
-    """Collect every name the string annotations in ``annotations`` could load.
+def _code_names(code: types.CodeType) -> set[str]:
+    """Collect every name ``code`` and the code objects nested in it could load.
 
     ``co_names`` over-approximates -- it also holds attribute names -- which is the
     safe direction, since a name the snapshot drops is one resolution cannot find.
     Nested code objects (a lambda inside an annotation) load their names the same way.
+
+    ``co_freevars`` is deliberately not collected. A class ``__annotate__`` has free
+    variables only when an enclosing function scope exists, which is exactly when its
+    closure keeps those cells reachable on its own -- so for that set the snapshot is
+    redundant, and adding it would only widen what ``_weak_scope`` holds strongly.
     """
     names: set[str] = set()
-    for annotation in annotations.values():
-        if not isinstance(annotation, str):
-            continue
-        try:
-            pending = [compile(annotation, _ANNOTATION_FILE, "eval")]
-        except SyntaxError:
-            # Unparseable: reading the spec raises SchemaError, so nothing is needed.
-            continue
-        while pending:
-            code = pending.pop()
-            names.update(code.co_names)
-            pending.extend(c for c in code.co_consts if isinstance(c, types.CodeType))
+    pending = [code]
+    while pending:
+        current = pending.pop()
+        names.update(current.co_names)
+        pending.extend(c for c in current.co_consts if isinstance(c, types.CodeType))
     return names
+
+
+def _names_in_source(source: str) -> set[str]:
+    """Collect every name the annotation expression ``source`` could load."""
+    try:
+        code = compile(source, _ANNOTATION_FILE, "eval")
+    except SyntaxError:
+        # Unparseable: reading the spec raises SchemaError, so nothing is needed.
+        return set()
+    return _code_names(code)
+
+
+def _referenced_names(annotations: Mapping[str, Any]) -> set[str]:
+    """Collect every name the string annotations in ``annotations`` could load."""
+    names: set[str] = set()
+    for annotation in annotations.values():
+        if isinstance(annotation, str):
+            names.update(_names_in_source(annotation))
+    return names
+
+
+def _quoted_names(code: types.CodeType) -> set[str]:
+    """Collect every name the string constants in ``code`` could load.
+
+    A quoted annotation is a plain string constant in ``__annotate__``: the names it
+    mentions never reach ``co_names``, and the compiler makes no closure cell for them
+    either, so unlike a bare annotation it has nothing else to resolve through.
+    Reading them back out of the constants is what keeps a quoted forward reference
+    resolvable in a class that some *other* annotation forced onto the deferred path.
+    """
+    names: set[str] = set()
+    pending = [code]
+    while pending:
+        current = pending.pop()
+        for const in current.co_consts:
+            if isinstance(const, types.CodeType):
+                pending.append(const)
+            elif isinstance(const, str):
+                names.update(_names_in_source(const))
+    return names
+
+
+def _annotation_names(cls: type) -> set[str]:
+    """Collect every name ``cls``'s own annotations could load, however they failed.
+
+    Reading the annotations yields PEP 563 strings, which name what they mention. On
+    3.14 the read is itself the evaluation (PEP 649), so an annotation that could not
+    resolve has no value left to inspect: the names come straight off the
+    ``__annotate__`` code object instead, without re-running an expression that
+    already raised. ``annotationlib``'s ``STRING`` and ``FORWARDREF`` formats look
+    like the obvious source here and are not: both re-execute the annotation with the
+    real globals first and swallow whatever it raises, which would run a user's
+    annotation helper -- and hide its bug -- from inside an exception handler.
+    """
+    try:
+        annotations = inspect.get_annotations(cls, eval_str=False)
+    except Exception:
+        annotate = getattr(cls, "__annotate__", None)
+        code = getattr(annotate, "__code__", None)
+        if code is None:
+            return set()
+        # _weak_scope keeps only names the scope holds, so the compiler's own
+        # __classdict__ freevar drops out.
+        return _code_names(code) | _quoted_names(code)
+    return _referenced_names(annotations)
 
 
 def _weak_scope(scope: Mapping[str, Any], names: Collection[str]) -> dict[str, Any]:
@@ -261,6 +331,13 @@ def _field_spec(
     )
 
 
+def _annotation_failure(cls: type, exc: Exception) -> Exception:
+    """Classify a failure to resolve ``cls``'s annotations."""
+    if isinstance(exc, NameError) and _raised_by_annotation(exc, cls):
+        return _UnresolvedAnnotation(cls, exc.name, str(exc))
+    return SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}")
+
+
 def _resolved_annotations(cls: type, scope: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return ``cls``'s own annotations, evaluating PEP 563 strings.
 
@@ -268,7 +345,12 @@ def _resolved_annotations(cls: type, scope: Mapping[str, Any] | None = None) -> 
     the defining frame while the class is being created, or the weak snapshot kept
     by the deferred path -- then the class body.
     """
-    annotations = inspect.get_annotations(cls, eval_str=False)
+    try:
+        annotations = inspect.get_annotations(cls, eval_str=False)
+    except Exception as exc:
+        # PEP 649 (3.14+): this call evaluates lazy annotations, so it fails here
+        # where older versions failed at the ``class`` statement itself.
+        raise _annotation_failure(cls, exc) from exc
     if not any(isinstance(annotation, str) for annotation in annotations.values()):
         return annotations
     if scope is None:
@@ -284,12 +366,8 @@ def _resolved_annotations(cls: type, scope: Mapping[str, Any] | None = None) -> 
             else annotation
             for name, annotation in annotations.items()
         }
-    except NameError as exc:
-        if _raised_by_annotation(exc):
-            raise _UnresolvedAnnotation(cls, exc.name, str(exc)) from exc
-        raise SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}") from exc
     except Exception as exc:
-        raise SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}") from exc
+        raise _annotation_failure(cls, exc) from exc
 
 
 def _own_fields(
@@ -607,7 +685,7 @@ class _Record(metaclass=SchemaMeta):
         try:
             _compile_class(cls, scope)
         except _UnresolvedAnnotation:
-            cls._h5t_scope = _weak_scope(scope, _referenced_names(inspect.get_annotations(cls)))
+            cls._h5t_scope = _weak_scope(scope, _annotation_names(cls))
 
     def _h5t_repr_fields(self) -> list[tuple[str, Any]]:
         spec = type(self).__h5spec__
