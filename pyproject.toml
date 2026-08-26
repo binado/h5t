@@ -3,6 +3,8 @@ name = "h5t"
 version = "0.2.0"
 description = "Load HDF5 groups as detached, typed Python records."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "binado", email = "bernardopveronese@gmail.com" }
 ]
