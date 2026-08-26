@@ -10,7 +10,7 @@ import sys
 import types
 import typing
 import weakref
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from enum import Enum
 from types import MappingProxyType
@@ -74,15 +74,43 @@ def _raised_by_annotation(exc: NameError) -> bool:
     return tb is not None and tb.tb_frame.f_code.co_filename == _ANNOTATION_FILE
 
 
-def _weak_scope(scope: Mapping[str, Any]) -> dict[str, Any]:
-    """Snapshot ``scope`` holding weak references wherever the value allows one.
+def _referenced_names(annotations: Mapping[str, Any]) -> set[str]:
+    """Collect every name the string annotations in ``annotations`` could load.
 
-    Scopes are only retained by the deferred path, where the snapshot may outlive
-    the frame it came from. Many useful annotation values (``int``, ``str``, tuples,
-    dicts) reject ``weakref.ref``, so those are stored directly.
+    ``co_names`` over-approximates -- it also holds attribute names -- which is the
+    safe direction, since a name the snapshot drops is one resolution cannot find.
+    Nested code objects (a lambda inside an annotation) load their names the same way.
+    """
+    names: set[str] = set()
+    for annotation in annotations.values():
+        if not isinstance(annotation, str):
+            continue
+        try:
+            pending = [compile(annotation, _ANNOTATION_FILE, "eval")]
+        except SyntaxError:
+            # Unparseable: reading the spec raises SchemaError, so nothing is needed.
+            continue
+        while pending:
+            code = pending.pop()
+            names.update(code.co_names)
+            pending.extend(c for c in code.co_consts if isinstance(c, types.CodeType))
+    return names
+
+
+def _weak_scope(scope: Mapping[str, Any], names: Collection[str]) -> dict[str, Any]:
+    """Snapshot the ``names`` entries of ``scope``, weakly wherever the value allows.
+
+    Scopes are only retained by the deferred path, where the snapshot may outlive the
+    frame it came from, so it keeps just the names the unresolved annotations mention.
+    Values that reject ``weakref.ref`` (``int``, ``str``, tuples, dicts) are stored
+    directly, and an unfiltered snapshot would let one of those containers pin an
+    unrelated local object graph for as long as the schema class lives.
     """
     snapshot: dict[str, Any] = {}
-    for name, value in scope.items():
+    for name in names:
+        if name not in scope:
+            continue
+        value = scope[name]
         try:
             snapshot[name] = weakref.ref(value)
         except TypeError:
@@ -579,7 +607,7 @@ class _Record(metaclass=SchemaMeta):
         try:
             _compile_class(cls, scope)
         except _UnresolvedAnnotation:
-            cls._h5t_scope = _weak_scope(scope)
+            cls._h5t_scope = _weak_scope(scope, _referenced_names(inspect.get_annotations(cls)))
 
     def _h5t_repr_fields(self) -> list[tuple[str, Any]]:
         spec = type(self).__h5spec__

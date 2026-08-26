@@ -135,17 +135,43 @@ def test_deferred_path_snapshots_the_scope_weakly() -> None:
     class Dependency(h5t.Group):
         value: int
 
-    label = "text"
-    count = 3
+    label = "on-disk"
 
     class Deferred(h5t.Group):
+        dependency: Dependency
+        renamed: Annotated[int, h5t.Name(label)]
         undefined: _NeverDefined  # noqa: F821 -- forces the deferred path
 
     snapshot = Deferred.__dict__["_h5t_scope"]
     assert isinstance(snapshot["Dependency"], weakref.ref)
     assert snapshot["Dependency"]() is Dependency
+    # A str rejects weakref.ref, so it is the one kind of entry held strongly.
     assert snapshot["label"] == label
-    assert snapshot["count"] == count
+
+
+def test_deferred_path_does_not_retain_locals_the_annotations_never_name() -> None:
+    # The snapshot must hold no more than annotation resolution can ask for: a
+    # container rejects weakref.ref, so an unfiltered snapshot would pin whatever it
+    # holds for as long as the deferred class lives.
+    class Tracked:  # object() cannot be weakly referenced; an instance can
+        pass
+
+    def declare() -> tuple[type[h5t.Group], weakref.ref[Tracked]]:
+        tracked = Tracked()
+        unrelated = [tracked]
+        assert unrelated[0] is tracked
+
+        class Local(h5t.Group):
+            undefined: _NeverDefined  # noqa: F821 -- forces the deferred path
+
+        return Local, weakref.ref(tracked)
+
+    schema, ref = declare()
+    gc.collect()
+    assert schema.__dict__["_h5t_scope"] == {}
+    assert ref() is None
+    with pytest.raises(h5t.SchemaError, match="_NeverDefined"):
+        schema.__h5spec__
 
 
 def test_a_broken_annotation_helper_is_not_a_forward_reference() -> None:
