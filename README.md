@@ -78,8 +78,10 @@ exits. Schema objects cannot be directly constructed, written, or serialized by 
 `Name("stored-name")` renames any field kind. `Attr` is valid only for attributes and
 `Eager` only for typed datasets. A parameterized alias such as
 `numpy.typing.NDArray[np.floating]` is accepted wherever `np.ndarray` is; the dtype
-parameter is not validated. Unsupported collection-shaped child annotations fail
-at class creation; dynamic collections are not yet supported.
+parameter is not validated. Unsupported collection-shaped child annotations raise
+`SchemaError`; dynamic collections are not yet supported. Declarations are compiled on
+first use rather than at class creation, so a schema class may name classes defined
+later in its module, and a `SchemaError` surfaces from the first `from_file()` call.
 
 Each `Group` and `Dataset` subclass accepts `extras="ignore"` (the default) or
 `extras="forbid"`. A group policy applies to its immediate child and attribute

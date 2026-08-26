@@ -62,6 +62,34 @@ def test_plain_and_aliased_ndarray_are_equivalent_in_diamonds() -> None:
     assert fields["values"].kind is MemberKind.ARRAY
 
 
+class _ForwardRef(h5t.Group):
+    later: _DefinedLater
+
+
+class _DefinedLater(h5t.Group):
+    value: int
+
+
+def test_annotations_may_name_classes_defined_later() -> None:
+    fields = {field.py_name: field for field in _ForwardRef.__h5spec__.fields}
+    assert fields["later"].kind is MemberKind.GROUP
+    assert fields["later"].member_type is _DefinedLater
+
+
+def test_schema_declared_in_a_function_compiles_after_it_returns() -> None:
+    def declare() -> type[h5t.Group]:
+        class Payload(h5t.Dataset):
+            unit: str
+
+        class Local(h5t.Group):
+            payload: Payload
+
+        return Local
+
+    fields = {field.py_name: field for field in declare().__h5spec__.fields}
+    assert fields["payload"].kind is MemberKind.DATASET
+
+
 def test_inheritance_defaults_and_extras() -> None:
     class Base(h5t.Group, extras="forbid"):
         inherited: int

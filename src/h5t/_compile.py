@@ -118,19 +118,8 @@ def _field_spec(
     if attr_marker is not None and eager_marker is not None:
         raise _schema_error(owner, py_name, "Attr and Eager cannot be combined")
 
-    # Forward-declared Dataset/Group may not be defined yet at function load time;
-    # we delay the issubclass checks until after annotations are resolved, but
-    # we also guard against string leftovers.
-    is_dataset = (
-        isinstance(core, type) and issubclass(core, Dataset)
-        if isinstance(core, type)
-        else False
-    )
-    is_group = (
-        isinstance(core, type) and issubclass(core, Group)
-        if isinstance(core, type)
-        else False
-    )
+    is_dataset = isinstance(core, type) and issubclass(core, Dataset)
+    is_group = isinstance(core, type) and issubclass(core, Group)
 
     if attr_marker is not None:
         if is_dataset or is_group:
@@ -144,6 +133,9 @@ def _field_spec(
         kind = MemberKind.GROUP
         member_type = core
     elif core is np.ndarray or typing.get_origin(core) is np.ndarray:
+        # Accept npt.NDArray[...] aliases. The dtype parameter is not validated
+        # (the adapter degrades to an isinstance check), so normalize to the
+        # plain type to keep declaration equivalence dtype-agnostic.
         kind = MemberKind.ARRAY
         member_type = None
         core = np.ndarray
@@ -180,34 +172,30 @@ def _field_spec(
     )
 
 
-def _own_fields(cls: type, *, dataset_owner: bool) -> dict[str, FieldSpec]:
+def _resolved_annotations(cls: type) -> dict[str, Any]:
+    """Return ``cls``'s own annotations, evaluating PEP 563 strings.
+
+    Names resolve against the defining module, then the local scope captured
+    when the class was created, then the class body.
+    """
+    annotations = inspect.get_annotations(cls, eval_str=False)
+    if not any(isinstance(annotation, str) for annotation in annotations.values()):
+        return annotations
+    module = sys.modules.get(cls.__module__)
+    scope: dict[str, Any] = dict(vars(module)) if module is not None else {}
+    scope.update(cls.__dict__.get("_h5t_scope", {}))
+    scope.update(vars(cls))
     try:
-        annotations = inspect.get_annotations(cls, eval_str=False)
-        if any(isinstance(annotation, str) for annotation in annotations.values()):
-            namespace: dict[str, Any] = {}
-            module = sys.modules.get(cls.__module__)
-            if module is not None:
-                namespace.update(vars(module))
-            frames: list[Any] = []
-            frame = inspect.currentframe()
-            try:
-                while frame is not None:
-                    frames.append(frame)
-                    frame = frame.f_back
-                for frame in reversed(frames):
-                    namespace.update(frame.f_locals)
-            finally:
-                del frame
-                del frames
-            namespace.update(vars(cls))
-            annotations = {
-                name: eval(annotation, namespace, namespace)
-                if isinstance(annotation, str)
-                else annotation
-                for name, annotation in annotations.items()
-            }
+        return {
+            name: eval(annotation, scope) if isinstance(annotation, str) else annotation
+            for name, annotation in annotations.items()
+        }
     except Exception as exc:
         raise SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}") from exc
+
+
+def _own_fields(cls: type, *, dataset_owner: bool) -> dict[str, FieldSpec]:
+    annotations = _resolved_annotations(cls)
     fields: dict[str, FieldSpec] = {}
     for py_name, annotation in annotations.items():
         if py_name.startswith("_") or typing.get_origin(annotation) is ClassVar:
@@ -226,7 +214,7 @@ def _own_fields(cls: type, *, dataset_owner: bool) -> dict[str, FieldSpec]:
 def _merged_fields(cls: type) -> dict[str, FieldSpec]:
     merged: dict[str, tuple[type, FieldSpec]] = {}
     for candidate in reversed(cls.__mro__):
-        own = candidate.__dict__.get("__h5fields_own__")
+        own = candidate.__dict__.get("_h5t_own")
         if not own:
             continue
         for name, field in own.items():
@@ -260,7 +248,8 @@ def _fields_equivalent(left: FieldSpec, right: FieldSpec) -> bool:
     )
 
 
-def _resolve_extras(cls: type, requested: str | None) -> Extras:
+def _resolve_extras(cls: type) -> Extras:
+    requested = cls.__dict__.get("_h5t_extras")
     if requested is not None:
         try:
             return Extras(requested)
@@ -269,8 +258,8 @@ def _resolve_extras(cls: type, requested: str | None) -> Extras:
                 f"{cls.__name__}: extras must be 'ignore' or 'forbid', got {requested!r}"
             ) from None
     for base in cls.__mro__[1:]:
-        spec = base.__dict__.get("__h5spec__")
-        if isinstance(spec, ClassSpec):
+        spec = base.__dict__.get("_h5t_spec")
+        if spec is not None:
             return spec.extras
     return Extras.IGNORE
 
@@ -302,62 +291,40 @@ def _check_fields(cls: type, own: Mapping[str, FieldSpec], fields: Mapping[str, 
         namespace[field.h5_name] = py_name
 
 
-def _compile_class(cls: type) -> None:
-    """Compile ``cls`` into ``__h5fields_own__`` and ``__h5spec__`` (lazy entry)."""
-    dataset_owner = issubclass(cls, Dataset)
-    requested: str | None = cls.__dict__.get("__h5t_extras__")
-    # Ensure bases are compiled first so _resolve_extras sees their specs.
+def _compile_class(cls: SchemaMeta) -> None:
+    """Compile ``cls`` into its own fields and its flattened schema."""
     for base in cls.__mro__[1:]:
-        if base in (Dataset, Group, object):
-            continue
-        # Only consider schema bases
-        try:
-            if issubclass(base, (Group, Dataset)):
-                if "__h5spec__" not in base.__dict__:
-                    _ensure_compiled(base)
-        except Exception:
-            pass
-    own = _own_fields(cls, dataset_owner=dataset_owner)
-    # Use type.__setattr__ to bypass metaclass getattribute side-effects
-    type.__setattr__(cls, "__h5fields_own__", own)
+        if isinstance(base, SchemaMeta):
+            # _merged_fields and _resolve_extras read compiled state off the bases.
+            _ensure_compiled(base)
+    own = _own_fields(cls, dataset_owner=issubclass(cls, Dataset))
+    cls._h5t_own = own
     fields = _merged_fields(cls)
     _check_fields(cls, own, fields)
-    spec = ClassSpec(tuple(fields.values()), _resolve_extras(cls, requested))
-    type.__setattr__(cls, "__h5spec__", spec)
+    cls._h5t_spec = ClassSpec(tuple(fields.values()), _resolve_extras(cls))
 
 
-def _ensure_compiled(cls: type) -> None:
-    if "__h5spec__" in cls.__dict__ and isinstance(cls.__dict__["__h5spec__"], ClassSpec):
-        return
-    # Avoid compiling the abstract bases themselves
-    if cls in (Dataset, Group):
-        return
-    _compile_class(cls)
+def _ensure_compiled(cls: SchemaMeta) -> None:
+    if "_h5t_spec" not in cls.__dict__:
+        _compile_class(cls)
 
 
 class SchemaMeta(type):
-    """Metaclass that compiles ``__h5spec__`` lazily on first access."""
+    """Metaclass that compiles a schema class the first time its spec is read.
 
-    def __getattribute__(cls, name: str) -> Any:
-        if name in ("__h5spec__", "__h5fields_own__"):
-            # Bypass for the abstract bases – they have empty specs without compilation.
-            if cls.__name__ in ("Group", "Dataset") and cls.__module__ == "h5t._compile":
-                # If already set, return it; otherwise return empty.
-                d = type.__getattribute__(cls, "__dict__")
-                if name in d:
-                    return d[name]
-                if name == "__h5spec__":
-                    return ClassSpec()
-                return {}
-            d = type.__getattribute__(cls, "__dict__")
-            if name not in d:
-                # Trigger lazy compilation; this may raise SchemaError.
-                _ensure_compiled(cls)
-                d = type.__getattribute__(cls, "__dict__")
-                if name in d:
-                    return d[name]
-                # Fall through to normal lookup (will raise AttributeError if truly missing)
-        return super().__getattribute__(name)
+    Deferring compilation keeps import cheap, lets annotations name classes
+    defined later in the module, and confines the cost to the first
+    ``from_file`` call.
+    """
+
+    _h5t_own: dict[str, FieldSpec]
+    _h5t_spec: ClassSpec
+
+    @property
+    def __h5spec__(cls) -> ClassSpec:
+        """The flattened schema of this class, compiled on first access."""
+        _ensure_compiled(cls)
+        return cls._h5t_spec
 
 
 def _short_pydantic_error(exc: PydanticValidationError) -> str:
@@ -506,32 +473,11 @@ def _load_group(group_type: type[Group], group: h5py.Group, filename: str, path:
     return instance
 
 
-class _RecordRepr:
-    """A concise repr shared by detached schema records."""
+class _Record(metaclass=SchemaMeta):
+    """Shared declaration handling and repr for detached schema records."""
 
-    __h5spec__: ClassVar[ClassSpec]
-
-    def _h5t_repr_fields(self) -> list[tuple[str, Any]]:
-        return [(field.py_name, getattr(self, field.py_name)) for field in self.__h5spec__.fields]
-
-    def __repr__(self) -> str:
-        fields = ", ".join(
-            f"{name}={reprlib.repr(value)}" for name, value in self._h5t_repr_fields()
-        )
-        return f"{type(self).__name__}({fields})"
-
-
-class Dataset(_RecordRepr, metaclass=SchemaMeta):
-    """A detached HDF5 dataset with snapshotted metadata and lazy payload data."""
-
-    __h5spec__: ClassVar[ClassSpec]
-    __h5fields_own__: ClassVar[dict[str, FieldSpec]]
-    _h5t_filename: str
-    _h5t_path: str
-    _h5t_shape: tuple[int, ...]
-    _h5t_dtype: np.dtype[Any]
-    _h5t_attrs: Mapping[str, Any]
-    _h5t_data: object
+    _h5t_extras: ClassVar[str | None] = None
+    _h5t_scope: ClassVar[Mapping[str, Any]] = {}
 
     def __init_subclass__(
         cls,
@@ -540,9 +486,35 @@ class Dataset(_RecordRepr, metaclass=SchemaMeta):
         **kwargs: Any,
     ) -> None:
         super().__init_subclass__(**kwargs)
-        # Store extras for lazy compilation; do not compile now.
-        if extras is not None:
-            type.__setattr__(cls, "__h5t_extras__", extras)
+        cls._h5t_extras = extras
+        # Annotations are resolved on first use, when the defining scope may be gone:
+        # capture it now so schemas declared inside a function still resolve. Module
+        # and class bodies expose their namespace dict directly; a function scope
+        # yields a snapshot (or, from 3.13, a proxy that must not outlive its frame).
+        frame = inspect.currentframe()
+        scope = frame.f_back.f_locals if frame is not None and frame.f_back else {}
+        cls._h5t_scope = scope if isinstance(scope, dict) else dict(scope)
+
+    def _h5t_repr_fields(self) -> list[tuple[str, Any]]:
+        spec = type(self).__h5spec__
+        return [(field.py_name, getattr(self, field.py_name)) for field in spec.fields]
+
+    def __repr__(self) -> str:
+        fields = ", ".join(
+            f"{name}={reprlib.repr(value)}" for name, value in self._h5t_repr_fields()
+        )
+        return f"{type(self).__name__}({fields})"
+
+
+class Dataset(_Record):
+    """A detached HDF5 dataset with snapshotted metadata and lazy payload data."""
+
+    _h5t_filename: str
+    _h5t_path: str
+    _h5t_shape: tuple[int, ...]
+    _h5t_dtype: np.dtype[Any]
+    _h5t_attrs: Mapping[str, Any]
+    _h5t_data: object
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise TypeError(f"{type(self).__name__} objects are created by Group.from_file()")
@@ -606,22 +578,10 @@ class Dataset(_RecordRepr, metaclass=SchemaMeta):
         return fields
 
 
-class Group(_RecordRepr, metaclass=SchemaMeta):
+class Group(_Record):
     """Base class for detached, typed HDF5 group records."""
 
-    __h5spec__: ClassVar[ClassSpec]
-    __h5fields_own__: ClassVar[dict[str, FieldSpec]]
     _h5t_attrs: Mapping[str, Any]
-
-    def __init_subclass__(
-        cls,
-        *,
-        extras: Literal["ignore", "forbid"] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init_subclass__(**kwargs)
-        if extras is not None:
-            type.__setattr__(cls, "__h5t_extras__", extras)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise TypeError(
@@ -636,8 +596,7 @@ class Group(_RecordRepr, metaclass=SchemaMeta):
     @classmethod
     def from_file(cls, path: str | os.PathLike[str], root: str = "/") -> Self:
         """Load this group schema from ``root`` and close the HDF5 file."""
-        # Trigger lazy compilation before opening file so SchemaError is raised early
-        _ = cls.__h5spec__
+        _ensure_compiled(cls)  # report a SchemaError before touching the filesystem
         try:
             filesystem_path = os.fsdecode(os.fspath(path))
         except TypeError as exc:
@@ -655,11 +614,3 @@ class Group(_RecordRepr, metaclass=SchemaMeta):
             if not isinstance(node, h5py.Group):
                 raise ValidationError(normalized_root, "expected a group, found a dataset")
             return typing.cast(Self, _load_group(cls, node, filename, normalized_root))
-
-
-# Base specs for the abstract roots (visible via direct attribute access without lazy path)
-type.__setattr__(Group, "__h5spec__", ClassSpec())
-type.__setattr__(Group, "__h5fields_own__", {})
-type.__setattr__(Dataset, "__h5spec__", ClassSpec())
-type.__setattr__(Dataset, "__h5fields_own__", {})
-

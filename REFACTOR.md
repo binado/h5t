@@ -17,7 +17,7 @@ group, then returns only after its HDF5 handle has closed.
 | `validate()`, `Invalid`, and `.check()` | field validation through Pydantic while loading |
 | aggregate `ValidationReport` | first path-aware `ValidationError` |
 | `extras="warn"` | choose `"ignore"` or `"forbid"` on each schema class |
-| `validate_schema()` | declarations compile and fail during class creation |
+| `validate_schema()` | declarations compile on first use and raise `SchemaError` |
 | `.close()` and closed-view errors | detached records need no close operation |
 
 There are intentionally no aliases for removed names. This keeps annotations, runtime
