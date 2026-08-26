@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import sys
+import typing
 import weakref
 from typing import Annotated, Any
 
@@ -48,6 +50,26 @@ def test_ndarray_typing_aliases_classify_as_arrays() -> None:
     assert fields["payload"].kind is MemberKind.ARRAY
     assert fields["optional_payload"].kind is MemberKind.ARRAY
     assert fields["optional_payload"].optional
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 aliases require Python 3.12")
+def test_pep695_aliases_of_ndarray_classify_as_arrays() -> None:
+    # A PEP 695 alias defers its right-hand side, so typing.get_origin stops at the
+    # alias rather than reaching np.ndarray. numpy >= 2.5 defines npt.NDArray this
+    # way itself; a user aliasing one -- or aliasing that alias -- must resolve too.
+    # Built through the runtime constructor so this file needs no 3.12-only syntax.
+    Coords = typing.TypeAliasType("Coords", npt.NDArray[np.float64])
+    Chained = typing.TypeAliasType("Chained", Coords)
+
+    class Aliased(h5t.Group):
+        direct: Coords
+        chained: Chained
+
+    fields = {field.py_name: field for field in Aliased.__h5spec__.fields}
+    assert fields["direct"].kind is MemberKind.ARRAY
+    assert fields["chained"].kind is MemberKind.ARRAY
+    # Normalized to the plain type, so an alias and a bare ndarray stay equivalent.
+    assert fields["direct"].annotation is np.ndarray
 
 
 def test_plain_and_aliased_ndarray_are_equivalent_in_diamonds() -> None:

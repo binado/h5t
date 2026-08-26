@@ -249,6 +249,39 @@ def _marker(metadata: list[Any], marker_type: type, owner: type, py_name: str) -
     return found[0] if found else None
 
 
+# PEP 695 aliases are 3.12+; on 3.11 the empty tuple makes every isinstance False.
+_alias_type = getattr(typing, "TypeAliasType", None)
+_TYPE_ALIAS_TYPES: tuple[type, ...] = (_alias_type,) if isinstance(_alias_type, type) else ()
+_MAX_ALIAS_DEPTH = 16
+
+
+def _is_ndarray_annotation(core: Any) -> bool:
+    """Report whether ``core`` denotes ``np.ndarray``, however many aliases deep.
+
+    numpy >= 2.5 defines ``npt.NDArray`` as a PEP 695 ``TypeAliasType``, which defers
+    its right-hand side -- deferring is what lets an alias recurse -- so
+    ``typing.get_origin`` stops at the alias itself. numpy <= 2.4 built the same name
+    out of eager substitution, leaving ``np.ndarray`` directly visible as the origin.
+    Expanding ``__value__`` sees through either shape, and through a user's own alias
+    of one. The walk is depth-bounded because a PEP 695 alias may be self-referential.
+    """
+    for _ in range(_MAX_ALIAS_DEPTH):
+        if core is np.ndarray:
+            return True
+        origin = typing.get_origin(core)
+        if origin is np.ndarray:
+            return True
+        if isinstance(core, _TYPE_ALIAS_TYPES):
+            core = core.__value__
+        elif isinstance(origin, _TYPE_ALIAS_TYPES):
+            # A subscripted alias: __value__ carries the parameter, which is dropped
+            # here along with the dtype the classification already ignores.
+            core = origin.__value__
+        else:
+            return False
+    return False
+
+
 def _is_scalar_annotation(core: Any) -> bool:
     if core in _SCALAR_TYPES or typing.get_origin(core) is Literal:
         return True
@@ -291,7 +324,7 @@ def _field_spec(
     elif is_group:
         kind = MemberKind.GROUP
         member_type = core
-    elif core is np.ndarray or typing.get_origin(core) is np.ndarray:
+    elif _is_ndarray_annotation(core):
         # Accept npt.NDArray[...] aliases. The dtype parameter is not validated
         # (the adapter degrades to an isinstance check), so normalize to the
         # plain type to keep declaration equivalence dtype-agnostic.
