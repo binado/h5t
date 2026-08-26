@@ -9,6 +9,7 @@ import reprlib
 import sys
 import types
 import typing
+import weakref
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from enum import Enum
@@ -40,6 +41,49 @@ _DATA_NOT_LOADED = object()
 
 def _schema_error(owner: type, field: str, message: str) -> SchemaError:
     return SchemaError(f"{owner.__name__}.{field}: {message}")
+
+
+class _UnresolvedAnnotation(Exception):
+    """An annotation names something not defined yet, so compilation must defer.
+
+    Private to this module: raised while resolving annotations and turned into the
+    user-visible ``SchemaError`` by ``_ensure_compiled`` if the name is still missing
+    when the spec is finally read.
+    """
+
+    def __init__(self, owner: type, name: str | None, message: str) -> None:
+        super().__init__(message)
+        self.owner = owner
+        self.name = name
+
+
+def _weak_scope(scope: Mapping[str, Any]) -> dict[str, Any]:
+    """Snapshot ``scope`` holding weak references wherever the value allows one.
+
+    Scopes are only retained by the deferred path, where the snapshot may outlive
+    the frame it came from. Many useful annotation values (``int``, ``str``, tuples,
+    dicts) reject ``weakref.ref``, so those are stored directly.
+    """
+    snapshot: dict[str, Any] = {}
+    for name, value in scope.items():
+        try:
+            snapshot[name] = weakref.ref(value)
+        except TypeError:
+            snapshot[name] = value
+    return snapshot
+
+
+def _unpack_scope(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Reverse ``_weak_scope``, dropping entries whose referent was collected."""
+    scope: dict[str, Any] = {}
+    for name, value in snapshot.items():
+        if isinstance(value, weakref.ref):
+            referent = value()
+            if referent is not None:
+                scope[name] = referent
+        else:
+            scope[name] = value
+    return scope
 
 
 def _split_annotation(owner: type, py_name: str, annotation: Any) -> tuple[Any, list[Any], bool]:
@@ -172,30 +216,37 @@ def _field_spec(
     )
 
 
-def _resolved_annotations(cls: type) -> dict[str, Any]:
+def _resolved_annotations(cls: type, scope: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return ``cls``'s own annotations, evaluating PEP 563 strings.
 
-    Names resolve against the defining module, then the local scope captured
-    when the class was created, then the class body.
+    Names resolve against the defining module, then ``scope`` -- the live locals of
+    the defining frame while the class is being created, or the weak snapshot kept
+    by the deferred path -- then the class body.
     """
     annotations = inspect.get_annotations(cls, eval_str=False)
     if not any(isinstance(annotation, str) for annotation in annotations.values()):
         return annotations
+    if scope is None:
+        scope = _unpack_scope(cls.__dict__.get("_h5t_scope", {}))
     module = sys.modules.get(cls.__module__)
-    scope: dict[str, Any] = dict(vars(module)) if module is not None else {}
-    scope.update(cls.__dict__.get("_h5t_scope", {}))
-    scope.update(vars(cls))
+    namespace: dict[str, Any] = dict(vars(module)) if module is not None else {}
+    namespace.update(scope)
+    namespace.update(vars(cls))
     try:
         return {
-            name: eval(annotation, scope) if isinstance(annotation, str) else annotation
+            name: eval(annotation, namespace) if isinstance(annotation, str) else annotation
             for name, annotation in annotations.items()
         }
+    except NameError as exc:
+        raise _UnresolvedAnnotation(cls, exc.name, str(exc)) from exc
     except Exception as exc:
         raise SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}") from exc
 
 
-def _own_fields(cls: type, *, dataset_owner: bool) -> dict[str, FieldSpec]:
-    annotations = _resolved_annotations(cls)
+def _own_fields(
+    cls: type, *, dataset_owner: bool, scope: Mapping[str, Any] | None = None
+) -> dict[str, FieldSpec]:
+    annotations = _resolved_annotations(cls, scope)
     fields: dict[str, FieldSpec] = {}
     for py_name, annotation in annotations.items():
         if py_name.startswith("_") or typing.get_origin(annotation) is ClassVar:
@@ -291,13 +342,14 @@ def _check_fields(cls: type, own: Mapping[str, FieldSpec], fields: Mapping[str, 
         namespace[field.h5_name] = py_name
 
 
-def _compile_class(cls: SchemaMeta) -> None:
+def _compile_class(cls: SchemaMeta, scope: Mapping[str, Any] | None = None) -> None:
     """Compile ``cls`` into its own fields and its flattened schema."""
     for base in cls.__mro__[1:]:
-        if isinstance(base, SchemaMeta):
+        if isinstance(base, SchemaMeta) and "_h5t_spec" not in base.__dict__:
             # _merged_fields and _resolve_extras read compiled state off the bases.
-            _ensure_compiled(base)
-    own = _own_fields(cls, dataset_owner=issubclass(cls, Dataset))
+            # A base that is still waiting on a forward reference defers ``cls`` too.
+            _compile_class(base)
+    own = _own_fields(cls, dataset_owner=issubclass(cls, Dataset), scope=scope)
     cls._h5t_own = own
     fields = _merged_fields(cls)
     _check_fields(cls, own, fields)
@@ -305,16 +357,20 @@ def _compile_class(cls: SchemaMeta) -> None:
 
 
 def _ensure_compiled(cls: SchemaMeta) -> None:
-    if "_h5t_spec" not in cls.__dict__:
+    if "_h5t_spec" in cls.__dict__:
+        return
+    try:
         _compile_class(cls)
+    except _UnresolvedAnnotation as exc:
+        raise SchemaError(f"{exc.owner.__name__}: could not resolve annotations: {exc}") from exc
 
 
 class SchemaMeta(type):
-    """Metaclass that compiles a schema class the first time its spec is read.
+    """Metaclass exposing a schema class's compiled spec.
 
-    Deferring compilation keeps import cheap, lets annotations name classes
-    defined later in the module, and confines the cost to the first
-    ``from_file`` call.
+    Schemas compile at the ``class`` statement, so a bad declaration raises there.
+    This property is the fallback route for the classes that could not: one whose
+    annotations name something defined later compiles on the first read instead.
     """
 
     _h5t_own: dict[str, FieldSpec]
@@ -488,13 +544,21 @@ class _Record(metaclass=SchemaMeta):
     ) -> None:
         super().__init_subclass__(**kwargs)
         cls._h5t_extras = extras
-        # Annotations are resolved on first use, when the defining scope may be gone:
-        # capture it now so schemas declared inside a function still resolve. Module
-        # and class bodies expose their namespace dict directly; a function scope
-        # yields a snapshot (or, from 3.13, a proxy that must not outlive its frame).
+        if cls.__module__ == __name__:
+            # Group and Dataset themselves: the module globals _compile_class reads
+            # (issubclass(cls, Dataset)) are not bound yet. They compile on first use.
+            return
+        # The defining frame is still live, so its locals resolve annotations naming
+        # function-local classes without retaining anything. Only a genuine forward
+        # reference defers, and only that path keeps a (weak) snapshot of the scope.
         frame = inspect.currentframe()
-        scope = frame.f_back.f_locals if frame is not None and frame.f_back else {}
-        cls._h5t_scope = scope if isinstance(scope, dict) else dict(scope)
+        scope: Mapping[str, Any] = (
+            frame.f_back.f_locals if frame is not None and frame.f_back else {}
+        )
+        try:
+            _compile_class(cls, scope)
+        except _UnresolvedAnnotation:
+            cls._h5t_scope = _weak_scope(scope)
 
     def _h5t_repr_fields(self) -> list[tuple[str, Any]]:
         spec = type(self).__h5spec__
@@ -597,7 +661,7 @@ class Group(_Record):
     @classmethod
     def from_file(cls, path: str | os.PathLike[str], root: str = "/") -> Self:
         """Load this group schema from ``root`` and close the HDF5 file."""
-        _ensure_compiled(cls)  # report a SchemaError before touching the filesystem
+        _ensure_compiled(cls)  # compile a deferred schema before touching the filesystem
         try:
             filesystem_path = os.fsdecode(os.fspath(path))
         except TypeError as exc:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
 from typing import Annotated, Any
 
 import numpy as np
@@ -71,12 +73,24 @@ class _DefinedLater(h5t.Group):
 
 
 def test_annotations_may_name_classes_defined_later() -> None:
+    # _DefinedLater was undefined at the class statement, so _ForwardRef took the
+    # deferred path and is still uncompiled until its spec is read.
+    assert "_h5t_spec" not in _ForwardRef.__dict__
     fields = {field.py_name: field for field in _ForwardRef.__h5spec__.fields}
     assert fields["later"].kind is MemberKind.GROUP
     assert fields["later"].member_type is _DefinedLater
 
 
-def test_schema_declared_in_a_function_compiles_after_it_returns() -> None:
+def test_valid_schema_compiles_at_the_class_statement() -> None:
+    class Eagerly(h5t.Group):
+        value: int
+
+    assert "_h5t_spec" in Eagerly.__dict__
+    assert "_h5t_scope" not in Eagerly.__dict__
+    assert [field.py_name for field in Eagerly.__h5spec__.fields] == ["value"]
+
+
+def test_schema_declared_in_a_function_compiles_before_it_returns() -> None:
     def declare() -> type[h5t.Group]:
         class Payload(h5t.Dataset):
             unit: str
@@ -84,10 +98,54 @@ def test_schema_declared_in_a_function_compiles_after_it_returns() -> None:
         class Local(h5t.Group):
             payload: Payload
 
+        # The defining frame is still live, so a function-local dependency resolves
+        # without the scope being retained for later.
+        assert "_h5t_spec" in Local.__dict__
+        assert "_h5t_scope" not in Local.__dict__
         return Local
 
     fields = {field.py_name: field for field in declare().__h5spec__.fields}
     assert fields["payload"].kind is MemberKind.DATASET
+
+
+def test_eager_compilation_does_not_retain_the_defining_scope() -> None:
+    class Tracked:  # object() cannot be weakly referenced; an instance can
+        pass
+
+    def declare() -> tuple[type[h5t.Group], weakref.ref[Tracked]]:
+        unrelated = Tracked()
+
+        class Local(h5t.Group):
+            value: int
+
+        return Local, weakref.ref(unrelated)
+
+    schema, ref = declare()
+    gc.collect()
+    assert ref() is None
+    assert schema.__h5spec__.fields[0].py_name == "value"
+
+
+def test_deferred_path_snapshots_the_scope_weakly() -> None:
+    # Accepted limitation: a schema that both lives in a function scope *and* forward-
+    # references a class defined later in that same function may find the referent
+    # collected before first use. That is the intersection of two rare cases, and the
+    # same tradeoff pydantic ships. Eager compilation makes it rarer than a lazy
+    # default would, since ordinary function-local schemas never defer.
+    class Dependency(h5t.Group):
+        value: int
+
+    label = "text"
+    count = 3
+
+    class Deferred(h5t.Group):
+        undefined: _NeverDefined  # noqa: F821 -- forces the deferred path
+
+    snapshot = Deferred.__dict__["_h5t_scope"]
+    assert isinstance(snapshot["Dependency"], weakref.ref)
+    assert snapshot["Dependency"]() is Dependency
+    assert snapshot["label"] == label
+    assert snapshot["count"] == count
 
 
 def test_inheritance_defaults_and_extras() -> None:
@@ -125,7 +183,7 @@ def test_invalid_declarations(declaration: str, match: str) -> None:
     }
     with pytest.raises(h5t.SchemaError, match=match):
         exec(f"class Invalid(h5t.Group):\n    {declaration}", namespace)
-        namespace["Invalid"].__h5spec__
+    assert "Invalid" not in namespace  # the class statement itself raised
 
 
 def test_dataset_only_accepts_attributes_and_extras_has_two_values() -> None:
@@ -134,14 +192,10 @@ def test_dataset_only_accepts_attributes_and_extras_has_two_values() -> None:
         class BadDataset(h5t.Dataset):
             payload: np.ndarray
 
-        BadDataset.__h5spec__  # type: ignore[attr-defined]
-
     with pytest.raises(h5t.SchemaError, match="ignore.*forbid"):
 
         class Warn(h5t.Group, extras="warn"):  # type: ignore[arg-type]
             pass
-
-        Warn.__h5spec__  # type: ignore[attr-defined]
 
 
 def test_reserved_api_names_and_duplicate_names_fail() -> None:
@@ -150,15 +204,11 @@ def test_reserved_api_names_and_duplicate_names_fail() -> None:
         class Reserved(h5t.Group):
             attrs: str
 
-        Reserved.__h5spec__  # type: ignore[attr-defined]
-
     with pytest.raises(h5t.SchemaError, match="duplicate HDF5"):
 
         class Duplicate(h5t.Group):
             first: Annotated[str, h5t.Name("same")]
             second: Annotated[int, h5t.Name("same")]
-
-        Duplicate.__h5spec__  # type: ignore[attr-defined]
 
 
 def test_removed_api_is_absent() -> None:
