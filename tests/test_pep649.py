@@ -110,7 +110,8 @@ def test_a_lazy_forward_reference_in_a_function_scope_resolves_via_the_closure()
 def test_a_mixed_schema_snapshots_the_scope_for_its_quoted_annotations() -> None:
     # A quoted annotation still resolves through the namespace h5t builds, so the
     # deferred path must snapshot its dependency. The sources it reads them from are
-    # version-dependent: strings on <=3.13, Format.STRING on 3.14+.
+    # version-dependent: strings on Python versions through 3.13, and __annotate__
+    # code-object names via _code_names(code) and _quoted_names(code) on Python 3.14+.
     class Dependency(h5t.Group):
         value: int
 
