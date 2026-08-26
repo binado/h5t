@@ -148,6 +148,19 @@ def test_deferred_path_snapshots_the_scope_weakly() -> None:
     assert snapshot["count"] == count
 
 
+def test_a_broken_annotation_helper_is_not_a_forward_reference() -> None:
+    # A NameError escaping a function the annotation calls is a bug in that function,
+    # not a name bound later, so it must raise at the class statement instead of
+    # silently deferring until the spec is read.
+    def alias():
+        return _typo_inside_the_helper  # noqa: F821
+
+    with pytest.raises(h5t.SchemaError, match="_typo_inside_the_helper"):
+
+        class Broken(h5t.Group):
+            value: alias()
+
+
 def test_inheritance_defaults_and_extras() -> None:
     class Base(h5t.Group, extras="forbid"):
         inherited: int

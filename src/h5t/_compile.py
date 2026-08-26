@@ -43,6 +43,9 @@ def _schema_error(owner: type, field: str, message: str) -> SchemaError:
     return SchemaError(f"{owner.__name__}.{field}: {message}")
 
 
+_ANNOTATION_FILE = "<h5t annotation>"
+
+
 class _UnresolvedAnnotation(Exception):
     """An annotation names something not defined yet, so compilation must defer.
 
@@ -55,6 +58,20 @@ class _UnresolvedAnnotation(Exception):
         super().__init__(message)
         self.owner = owner
         self.name = name
+
+
+def _raised_by_annotation(exc: NameError) -> bool:
+    """Report whether ``exc`` came from the annotation expression itself, not a callee.
+
+    Only an unbound name in the expression is a forward reference worth deferring for.
+    A ``NameError`` escaping a function the annotation calls is a bug in that function,
+    so it must take the ``SchemaError`` path instead. Annotations are compiled under
+    ``_ANNOTATION_FILE``, which identifies the frame that raised.
+    """
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    return tb is not None and tb.tb_frame.f_code.co_filename == _ANNOTATION_FILE
 
 
 def _weak_scope(scope: Mapping[str, Any]) -> dict[str, Any]:
@@ -234,11 +251,15 @@ def _resolved_annotations(cls: type, scope: Mapping[str, Any] | None = None) -> 
     namespace.update(vars(cls))
     try:
         return {
-            name: eval(annotation, namespace) if isinstance(annotation, str) else annotation
+            name: eval(compile(annotation, _ANNOTATION_FILE, "eval"), namespace)
+            if isinstance(annotation, str)
+            else annotation
             for name, annotation in annotations.items()
         }
     except NameError as exc:
-        raise _UnresolvedAnnotation(cls, exc.name, str(exc)) from exc
+        if _raised_by_annotation(exc):
+            raise _UnresolvedAnnotation(cls, exc.name, str(exc)) from exc
+        raise SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}") from exc
     except Exception as exc:
         raise SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}") from exc
 
