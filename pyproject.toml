@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "h5py>=3.10",
     "numpy>=1.26",
-    "pydantic>=2,<3",
+    "pydantic>=2.4,<3",
 ]
 
 [project.scripts]
