@@ -302,6 +302,9 @@ def _compile_class(cls: SchemaMeta) -> None:
     fields = _merged_fields(cls)
     _check_fields(cls, own, fields)
     cls._h5t_spec = ClassSpec(tuple(fields.values()), _resolve_extras(cls))
+    # Annotations are resolved into the spec; the scope snapshot has served its
+    # purpose and would otherwise pin the declaring function's locals alive.
+    cls._h5t_scope = {}
 
 
 def _ensure_compiled(cls: SchemaMeta) -> None:
@@ -319,6 +322,7 @@ class SchemaMeta(type):
 
     _h5t_own: dict[str, FieldSpec]
     _h5t_spec: ClassSpec
+    _h5t_scope: Mapping[str, Any]
 
     @property
     def __h5spec__(cls) -> ClassSpec:
@@ -489,12 +493,30 @@ class _Record(metaclass=SchemaMeta):
         super().__init_subclass__(**kwargs)
         cls._h5t_extras = extras
         # Annotations are resolved on first use, when the defining scope may be gone:
-        # capture it now so schemas declared inside a function still resolve. Module
-        # and class bodies expose their namespace dict directly; a function scope
-        # yields a snapshot (or, from 3.13, a proxy that must not outlive its frame).
-        frame = inspect.currentframe()
-        scope = frame.f_back.f_locals if frame is not None and frame.f_back else {}
-        cls._h5t_scope = scope if isinstance(scope, dict) else dict(scope)
+        # capture it now so schemas declared inside a function still resolve, and drop
+        # it in _compile_class once resolution has happened. The defining scope is
+        # captured unless it is the registered module namespace, which
+        # _resolved_annotations re-reads at compile time; an exec namespace that
+        # merely looks module-level is still captured. A function scope yields a
+        # snapshot (or, from 3.13, a proxy that must not outlive its frame); module
+        # and class bodies expose their namespace dict directly.
+        scope: Mapping[str, Any] = {}
+        declaring = inspect.currentframe()
+        declaring = declaring.f_back if declaring is not None else None
+        if declaring is not None:
+            frame_locals = declaring.f_locals
+            module = sys.modules.get(declaring.f_globals.get("__name__", ""))
+            is_module_namespace = (
+                frame_locals is declaring.f_globals
+                and module is not None
+                and module.__dict__ is declaring.f_globals
+            )
+            if not is_module_namespace:
+                if isinstance(frame_locals, dict):
+                    scope = frame_locals
+                else:
+                    scope = dict(frame_locals)
+        cls._h5t_scope = scope
 
     def _h5t_repr_fields(self) -> list[tuple[str, Any]]:
         spec = type(self).__h5spec__

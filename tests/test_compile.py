@@ -90,6 +90,26 @@ def test_schema_declared_in_a_function_compiles_after_it_returns() -> None:
     assert fields["payload"].kind is MemberKind.DATASET
 
 
+def test_scope_snapshot_released_after_compilation() -> None:
+    def declare() -> type[h5t.Group]:
+        class Payload(h5t.Dataset):
+            unit: str
+
+        class Local(h5t.Group):
+            payload: Payload
+
+        return Local
+
+    local = declare()
+    assert "Payload" in local.__dict__["_h5t_scope"]
+    local.__h5spec__
+    assert local.__dict__["_h5t_scope"] == {}
+
+
+def test_module_level_schemas_do_not_capture_scope() -> None:
+    assert _ForwardRef.__dict__.get("_h5t_scope") == {}
+
+
 def test_inheritance_defaults_and_extras() -> None:
     class Base(h5t.Group, extras="forbid"):
         inherited: int
