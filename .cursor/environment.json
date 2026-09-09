@@ -1,0 +1,4 @@
+{
+  "name": "h5t",
+  "install": "bash .cursor/install.sh"
+}
