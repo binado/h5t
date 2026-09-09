@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import os
 import posixpath
@@ -10,7 +11,7 @@ import sys
 import types
 import typing
 import weakref
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from enum import Enum
 from types import MappingProxyType
@@ -21,6 +22,7 @@ import numpy as np
 from pydantic import ConfigDict, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from h5t._array import LazyArray
 from h5t._errors import ConversionError, SchemaError, ValidationError
 from h5t._spec import (
     _NO_DEFAULT,
@@ -29,14 +31,15 @@ from h5t._spec import (
     Eager,
     Extras,
     FieldSpec,
+    ForeignSpec,
     MemberKind,
     Name,
+    Payload,
     attr_path,
     child_path,
 )
 
 _SCALAR_TYPES = (str, int, float, bool, bytes, complex)
-_DATA_NOT_LOADED = object()
 
 
 def _schema_error(owner: type, field: str, message: str) -> SchemaError:
@@ -295,11 +298,13 @@ def _field_spec(
     default: Any,
     *,
     dataset_owner: bool,
+    default_factory: Callable[[], Any] | None = None,
 ) -> FieldSpec:
     core, metadata, optional = _split_annotation(owner, py_name, annotation)
     name_marker = _marker(metadata, Name, owner, py_name)
     attr_marker = _marker(metadata, Attr, owner, py_name)
     eager_marker = _marker(metadata, Eager, owner, py_name)
+    payload_marker = _marker(metadata, Payload, owner, py_name)
 
     h5_name = name_marker.name if name_marker is not None else py_name
     if not isinstance(h5_name, str) or not h5_name:
@@ -309,15 +314,29 @@ def _field_spec(
             raise _schema_error(owner, py_name, "Attr.converter must be callable")
     if attr_marker is not None and eager_marker is not None:
         raise _schema_error(owner, py_name, "Attr and Eager cannot be combined")
+    if payload_marker is not None and attr_marker is not None:
+        raise _schema_error(owner, py_name, "Attr and Payload cannot be combined")
+    if payload_marker is not None and eager_marker is not None:
+        raise _schema_error(owner, py_name, "Eager and Payload cannot be combined")
 
     is_dataset = isinstance(core, type) and issubclass(core, Dataset)
     is_group = isinstance(core, type) and issubclass(core, Group)
 
+    if payload_marker is not None and (is_dataset or is_group):
+        raise _schema_error(owner, py_name, "Payload cannot annotate a Group or Dataset field")
+
+    foreign: ForeignSpec | None = None
     if attr_marker is not None:
         if is_dataset or is_group:
             raise _schema_error(owner, py_name, "Attr cannot annotate a Group or Dataset field")
         kind = MemberKind.ATTRIBUTE
         member_type = None
+    elif payload_marker is not None:
+        if not isinstance(core, type):
+            raise _schema_error(owner, py_name, "Payload requires a class annotation")
+        kind = MemberKind.DATASET
+        member_type = core
+        foreign = _foreign_spec(core, payload_marker, owner, py_name)
     elif is_dataset:
         kind = MemberKind.DATASET
         member_type = core
@@ -345,23 +364,138 @@ def _field_spec(
     if eager_marker is not None and kind is not MemberKind.DATASET:
         raise _schema_error(owner, py_name, "Eager applies only to Dataset fields")
     if dataset_owner and kind is not MemberKind.ATTRIBUTE:
-        raise _schema_error(owner, py_name, "a Dataset subclass may declare only attributes")
+        raise _schema_error(owner, py_name, "a dataset record may declare only attributes")
     if kind is not MemberKind.ATTRIBUTE and "/" in h5_name:
         raise _schema_error(owner, py_name, "a child Name cannot contain '/'")
 
-    adapter_ann = _adapter_annotation(core, metadata, optional)
+    if foreign is not None:
+        # A member-level TypeAdapter cannot validate a foreign record: pydantic
+        # rejects `config=` alongside a dataclass/BaseModel/TypedDict type, and
+        # revalidating an already-built instance without one is a no-op anyway
+        # (see AGENTS.md). Any accepts the constructed instance unchanged; keep
+        # the record type itself as `annotation` for repr/equivalence purposes.
+        adapter_ann = core
+        adapter = _build_adapter(owner, py_name, Any)
+    else:
+        adapter_ann = _adapter_annotation(core, metadata, optional)
+        adapter = _build_adapter(owner, py_name, adapter_ann)
+
     return FieldSpec(
         py_name=py_name,
         h5_name=h5_name,
         kind=kind,
         annotation=adapter_ann,
-        adapter=_build_adapter(owner, py_name, adapter_ann),
+        adapter=adapter,
         optional=optional,
         default=default,
         converter=attr_marker.converter if attr_marker is not None else None,
         eager=eager_marker is not None,
         member_type=member_type,
+        foreign=foreign,
+        default_factory=default_factory,
     )
+
+
+_FOREIGN_CACHE: weakref.WeakKeyDictionary[type, dict[tuple[str, Extras], ForeignSpec]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _foreign_spec(record_type: type, marker: Payload, owner: type, py_name: str) -> ForeignSpec:
+    """Compile a plain ``record_type`` into a dataset record's fields and payload.
+
+    Cached per ``(record_type, data_attr, extras)``, since the same foreign class may
+    be reused as a ``Payload`` target from more than one field or schema. Foreign
+    annotations resolve against ``record_type``'s module globals and class dict only
+    (see ``_resolved_annotations``'s ``scope=None`` default): there is no
+    ``__init_subclass__`` hook here to capture a defining frame, so an unresolved
+    annotation is a ``SchemaError`` rather than something the deferred-compilation
+    machinery can retry later.
+    """
+    try:
+        extras = Extras(marker.extras)
+    except ValueError:
+        raise _schema_error(
+            owner, py_name, f"extras must be 'ignore' or 'forbid', got {marker.extras!r}"
+        ) from None
+
+    cache = _FOREIGN_CACHE.setdefault(record_type, {})
+    cache_key = (marker.data_attr, extras)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    is_dataclass_type = dataclasses.is_dataclass(record_type)
+    dc_fields = {f.name: f for f in dataclasses.fields(record_type)} if is_dataclass_type else {}
+
+    annotations: dict[str, Any] = {}
+    for base in reversed(record_type.__mro__):
+        if base is object:
+            continue
+        try:
+            base_annotations = _resolved_annotations(base)
+        except _UnresolvedAnnotation as exc:
+            raise _schema_error(
+                owner, py_name, f"{record_type.__name__} has unresolved annotations: {exc}"
+            ) from exc
+        for field_name, field_annotation in base_annotations.items():
+            if field_name.startswith("_") or typing.get_origin(field_annotation) is ClassVar:
+                continue
+            if is_dataclass_type:
+                dc_field = dc_fields.get(field_name)
+                if dc_field is not None and not dc_field.init:
+                    continue  # derived; cannot be passed to the constructor
+            annotations[field_name] = field_annotation
+
+    if marker.data_attr not in annotations:
+        raise _schema_error(
+            owner,
+            py_name,
+            f"Payload data_attr {marker.data_attr!r} is not a field of {record_type.__name__}",
+        )
+    payload_annotation = annotations.pop(marker.data_attr)
+    payload_core, _, _ = _split_annotation(record_type, marker.data_attr, payload_annotation)
+    if _is_ndarray_annotation(payload_core):
+        lazy = False
+    elif isinstance(payload_core, type) and issubclass(payload_core, LazyArray):
+        lazy = True
+    else:
+        raise _schema_error(
+            owner,
+            py_name,
+            f"Payload field {marker.data_attr!r} must be annotated np.ndarray or LazyArray",
+        )
+
+    fields: dict[str, FieldSpec] = {}
+    for field_name, field_annotation in annotations.items():
+        default: Any = _NO_DEFAULT
+        default_factory: Callable[[], Any] | None = None
+        if is_dataclass_type:
+            dc_field = dc_fields[field_name]
+            if dc_field.default is not dataclasses.MISSING:
+                default = dc_field.default
+            elif dc_field.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+                default_factory = dc_field.default_factory
+        else:
+            default = record_type.__dict__.get(field_name, _NO_DEFAULT)
+        fields[field_name] = _field_spec(
+            record_type,
+            field_name,
+            field_annotation,
+            default,
+            dataset_owner=True,
+            default_factory=default_factory,
+        )
+
+    _check_duplicate_names(record_type.__name__, fields)
+    foreign = ForeignSpec(
+        record_type=record_type,
+        spec=ClassSpec(tuple(fields.values()), extras),
+        data_attr=marker.data_attr,
+        lazy=lazy,
+    )
+    cache[cache_key] = foreign
+    return foreign
 
 
 def _annotation_failure(cls: type, exc: Exception) -> Exception:
@@ -444,6 +578,17 @@ def _merged_fields(cls: type) -> dict[str, FieldSpec]:
     return {name: field for name, (_, field) in merged.items()}
 
 
+def _foreign_equivalent(left: ForeignSpec | None, right: ForeignSpec | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return (
+        left.record_type is right.record_type
+        and left.data_attr == right.data_attr
+        and left.lazy == right.lazy
+        and left.spec.extras is right.spec.extras
+    )
+
+
 def _fields_equivalent(left: FieldSpec, right: FieldSpec) -> bool:
     """Compare declarations without adapter identity or array-valued equality."""
     return (
@@ -456,6 +601,7 @@ def _fields_equivalent(left: FieldSpec, right: FieldSpec) -> bool:
         and left.converter is right.converter
         and left.eager == right.eager
         and left.member_type is right.member_type
+        and _foreign_equivalent(left.foreign, right.foreign)
     )
 
 
@@ -479,6 +625,19 @@ def _reserved_names(base: type) -> frozenset[str]:
     return frozenset(name for name in dir(base) if not name.startswith("_"))
 
 
+def _check_duplicate_names(label: str, fields: Mapping[str, FieldSpec]) -> None:
+    attr_names: dict[str, str] = {}
+    child_names: dict[str, str] = {}
+    for py_name, field in fields.items():
+        namespace = attr_names if field.kind is MemberKind.ATTRIBUTE else child_names
+        if field.h5_name in namespace:
+            raise SchemaError(
+                f"{label}: duplicate HDF5 name {field.h5_name!r} for fields "
+                f"{namespace[field.h5_name]!r} and {py_name!r}"
+            )
+        namespace[field.h5_name] = py_name
+
+
 def _check_fields(cls: type, own: Mapping[str, FieldSpec], fields: Mapping[str, FieldSpec]) -> None:
     base = Dataset if issubclass(cls, Dataset) else Group
     reserved = _reserved_names(base)
@@ -489,17 +648,7 @@ def _check_fields(cls: type, own: Mapping[str, FieldSpec], fields: Mapping[str, 
                 name,
                 f"field shadows the h5t API; rename it and use Name({name!r})",
             )
-
-    attr_names: dict[str, str] = {}
-    child_names: dict[str, str] = {}
-    for py_name, field in fields.items():
-        namespace = attr_names if field.kind is MemberKind.ATTRIBUTE else child_names
-        if field.h5_name in namespace:
-            raise SchemaError(
-                f"{cls.__name__}: duplicate HDF5 name {field.h5_name!r} for fields "
-                f"{namespace[field.h5_name]!r} and {py_name!r}"
-            )
-        namespace[field.h5_name] = py_name
+    _check_duplicate_names(cls.__name__, fields)
 
 
 def _compile_class(cls: SchemaMeta, scope: Mapping[str, Any] | None = None) -> None:
@@ -563,6 +712,8 @@ def _validate_value(field: FieldSpec, value: Any, path: str) -> Any:
 def _missing_value(field: FieldSpec, path: str) -> Any:
     if field.has_default:
         return _validate_value(field, field.default, path)
+    if field.default_factory is not None:
+        return _validate_value(field, field.default_factory(), path)
     if field.optional:
         return None
     kind = field.kind.value
@@ -624,6 +775,8 @@ def _load_dataset(
     dataset: h5py.Dataset,
     filename: str,
     path: str,
+    *,
+    eager: bool = False,
 ) -> Dataset:
     spec = dataset_type.__h5spec__
     _check_dataset_extras(spec, dataset, path)
@@ -633,16 +786,52 @@ def _load_dataset(
     for field in spec.fields:
         values[field.py_name] = _load_attribute(field, raw, attrs, path)
 
+    array = LazyArray(
+        filename,
+        path,
+        tuple(dataset.shape),
+        np.dtype(dataset.dtype),
+        data=np.asarray(dataset[()]) if eager else None,
+    )
     instance = object.__new__(dataset_type)
-    object.__setattr__(instance, "_h5t_filename", filename)
-    object.__setattr__(instance, "_h5t_path", path)
-    object.__setattr__(instance, "_h5t_shape", tuple(dataset.shape))
-    object.__setattr__(instance, "_h5t_dtype", np.dtype(dataset.dtype))
+    object.__setattr__(instance, "_h5t_array", array)
     object.__setattr__(instance, "_h5t_attrs", MappingProxyType(attrs))
-    object.__setattr__(instance, "_h5t_data", _DATA_NOT_LOADED)
     for name, value in values.items():
         object.__setattr__(instance, name, value)
     return instance
+
+
+def _load_foreign_dataset(
+    foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str
+) -> Any:
+    """Load ``node`` into an instance of ``foreign.record_type`` via its constructor."""
+    spec = foreign.spec
+    _check_dataset_extras(spec, node, path)
+    raw = _raw_attrs(node)
+    attrs = dict(raw)
+    values: dict[str, Any] = {}
+    for field in spec.fields:
+        values[field.py_name] = _load_attribute(field, raw, attrs, path)
+
+    if foreign.lazy:
+        values[foreign.data_attr] = LazyArray(
+            filename, path, tuple(node.shape), np.dtype(node.dtype)
+        )
+    else:
+        values[foreign.data_attr] = np.asarray(node[()])
+
+    try:
+        return foreign.record_type(**values)
+    except TypeError as exc:
+        raise SchemaError(
+            f"{foreign.record_type.__name__}: cannot construct from loaded fields: {exc}"
+        ) from exc
+    except (ValidationError, SchemaError):
+        raise
+    except Exception as exc:
+        raise ValidationError(
+            path, f"{foreign.record_type.__name__} constructor failed: {exc}"
+        ) from exc
 
 
 def _load_group(group_type: type[Group], group: h5py.Group, filename: str, path: str) -> Group:
@@ -671,11 +860,12 @@ def _load_group(group_type: type[Group], group: h5py.Group, filename: str, path:
         elif field.kind is MemberKind.DATASET:
             if not isinstance(node, h5py.Dataset):
                 raise ValidationError(member_path, "expected a dataset, found a group")
-            assert field.member_type is not None
-            dataset_type = typing.cast(type[Dataset], field.member_type)
-            value = _load_dataset(dataset_type, node, filename, member_path)
-            if field.eager:
-                object.__setattr__(value, "_h5t_data", np.asarray(node[()]))
+            if field.foreign is not None:
+                value = _load_foreign_dataset(field.foreign, node, filename, member_path)
+            else:
+                assert field.member_type is not None
+                dataset_type = typing.cast(type[Dataset], field.member_type)
+                value = _load_dataset(dataset_type, node, filename, member_path, eager=field.eager)
         else:
             if not isinstance(node, h5py.Dataset):
                 raise ValidationError(member_path, "expected a dataset, found a group")
@@ -733,12 +923,8 @@ class _Record(metaclass=SchemaMeta):
 class Dataset(_Record):
     """A detached HDF5 dataset with snapshotted metadata and lazy payload data."""
 
-    _h5t_filename: str
-    _h5t_path: str
-    _h5t_shape: tuple[int, ...]
-    _h5t_dtype: np.dtype[Any]
+    _h5t_array: LazyArray
     _h5t_attrs: Mapping[str, Any]
-    _h5t_data: object
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise TypeError(f"{type(self).__name__} objects are created by Group.from_file()")
@@ -751,45 +937,36 @@ class Dataset(_Record):
     @property
     def path(self) -> str:
         """Absolute HDF5 path of this dataset."""
-        return self._h5t_path
+        return self._h5t_array.path
 
     @property
     def shape(self) -> tuple[int, ...]:
         """Dataset shape captured while the model was loaded."""
-        return self._h5t_shape
+        return self._h5t_array.shape
 
     @property
     def dtype(self) -> np.dtype[Any]:
         """Dataset dtype captured while the model was loaded."""
-        return self._h5t_dtype
+        return self._h5t_array.dtype
 
     @property
     def ndim(self) -> int:
         """Number of dimensions in the captured shape."""
-        return len(self._h5t_shape)
+        return self._h5t_array.ndim
 
     @property
     def data(self) -> np.ndarray:
         """Read and cache the complete current payload as a NumPy array."""
-        if self._h5t_data is _DATA_NOT_LOADED:
-            with self.open() as dataset:
-                value = np.asarray(dataset[()])
-            object.__setattr__(self, "_h5t_data", value)
-        return typing.cast(np.ndarray, self._h5t_data)
+        return self._h5t_array.data
 
     def read(self) -> np.ndarray:
         """Return the same cached complete payload as ``data``."""
-        return self.data
+        return self._h5t_array.read()
 
     @contextmanager
     def open(self) -> Iterator[h5py.Dataset]:
         """Open the current source file and yield this dataset for live access."""
-        with h5py.File(self._h5t_filename, mode="r") as h5file:
-            node = h5file.get(self._h5t_path)
-            if node is None:
-                raise ValidationError(self._h5t_path, "dataset no longer exists")
-            if not isinstance(node, h5py.Dataset):
-                raise ValidationError(self._h5t_path, "expected a dataset, found a group")
+        with self._h5t_array.open() as node:
             yield node
 
     def _h5t_repr_fields(self) -> list[tuple[str, Any]]:

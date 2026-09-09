@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Annotated
 
@@ -18,6 +19,12 @@ class Nested(h5t.Group):
     label: str
 
 
+@dataclasses.dataclass
+class Recording:
+    unit: str
+    payload: np.ndarray
+
+
 class Result(h5t.Group):
     version: int
     values: np.ndarray
@@ -26,6 +33,7 @@ class Result(h5t.Group):
     nested: Nested
     optional: str | None
     defaulted: int = 3
+    recording: Annotated[Recording, h5t.Payload("payload")]
 
 
 result: Result = Result.from_file(Path("result.h5"))
@@ -36,3 +44,5 @@ unit: str = result.samples.unit
 nested: Nested = result.nested
 optional: str | None = result.optional
 defaulted: int = result.defaulted
+recording: Recording = result.recording
+recording_payload: np.ndarray = result.recording.payload

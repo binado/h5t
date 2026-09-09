@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import TypeAdapter
 
@@ -33,6 +33,21 @@ class Eager:
     """Load a detached dataset's complete payload during ``from_file``."""
 
 
+@dataclass(frozen=True)
+class Payload:
+    """Load a child dataset into a plain record type, not an ``h5t.Dataset`` subclass.
+
+    ``data_attr`` names the field of the record type holding the payload; it must be
+    annotated ``np.ndarray`` (materialized eagerly) or ``LazyArray`` (read on first
+    access). ``extras`` lives here rather than on the record type itself, since a
+    plain class cannot take h5t's ``extras=`` class keyword -- it applies to the
+    dataset's attributes exactly as ``Dataset``'s ``extras=`` does.
+    """
+
+    data_attr: str
+    extras: Literal["ignore", "forbid"] = "ignore"
+
+
 class Extras(Enum):
     """Policy for undeclared immediate HDF5 members."""
 
@@ -53,6 +68,24 @@ _NO_DEFAULT = object()
 
 
 @dataclass(frozen=True)
+class ClassSpec:
+    """The flattened schema compiled for a ``Group`` or ``Dataset`` class."""
+
+    fields: tuple[FieldSpec, ...] = ()
+    extras: Extras = Extras.IGNORE
+
+
+@dataclass(frozen=True)
+class ForeignSpec:
+    """Compiled loading instructions for a plain record type used as a ``Payload``."""
+
+    record_type: type
+    spec: ClassSpec
+    data_attr: str
+    lazy: bool
+
+
+@dataclass(frozen=True)
 class FieldSpec:
     """The compiled loading instructions for one annotated field."""
 
@@ -66,19 +99,13 @@ class FieldSpec:
     converter: Callable[[Any], Any] | None = None
     eager: bool = False
     member_type: type | None = None
+    foreign: ForeignSpec | None = None
+    default_factory: Callable[[], Any] | None = None
 
     @property
     def has_default(self) -> bool:
         """Whether the class body supplied a default."""
         return self.default is not _NO_DEFAULT
-
-
-@dataclass(frozen=True)
-class ClassSpec:
-    """The flattened schema compiled for a ``Group`` or ``Dataset`` class."""
-
-    fields: tuple[FieldSpec, ...] = ()
-    extras: Extras = Extras.IGNORE
 
 
 def child_path(parent: str, name: str) -> str:

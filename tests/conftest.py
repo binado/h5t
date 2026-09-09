@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,28 @@ class Measurement(h5t.Dataset, extras="ignore"):
     """Dataset carrying typed attrs."""
 
     unit: Literal["m"]
+    scale: float = 1.0
+
+
+@dataclasses.dataclass
+class PlainMeasurement:
+    """Foreign record over the same dataset as ``Measurement``, eager payload.
+
+    ``data`` is reserved on ``h5t.Dataset`` but legal here -- a plain class has
+    nothing in ``dir()`` for h5t's reserved-name check to forbid.
+    """
+
+    unit: Literal["m"]
+    data: np.ndarray
+    scale: float = 1.0
+
+
+@dataclasses.dataclass
+class LazyMeasurement:
+    """Foreign record over the same dataset as ``Measurement``, lazily read payload."""
+
+    unit: Literal["m"]
+    data: h5t.LazyArray
     scale: float = 1.0
 
 
