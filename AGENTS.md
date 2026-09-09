@@ -22,8 +22,10 @@ as pre-commit hooks (run via `prek`). Commits follow Conventional Commits (`feat
 ## Architecture
 
 `h5t` turns annotated Python classes into read-only loaders for HDF5 groups. The load produces
-**detached** records: `Group.from_file()` closes every handle before returning, and only a
-`Dataset`'s filename/path survive so its payload can be read later.
+**detached** records: `h5t.load()` closes every handle before returning, and only a `Dataset`'s
+(or a `LazyArray` payload's) filename/path survive so its payload can be read later. Plain classes
+decorated with `@h5t.dataset`/`@h5t.group` are the primary API; `Group`/`Dataset` inheritance is
+legacy (see `README.md`) and exists mainly so the two styles can freely mix within one schema.
 
 Four modules, one direction of dependency (`_cli` → `_compile` → `_array`/`_spec`/`_errors`):
 
