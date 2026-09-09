@@ -9,17 +9,32 @@ authors = [
     { name = "binado", email = "bernardopveronese@gmail.com" }
 ]
 requires-python = ">=3.11"
+keywords = ["hdf5", "h5py", "schema", "pydantic", "typing", "validation"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
 ]
 dependencies = [
     "h5py>=3.10",
     "numpy>=1.26",
     "pydantic>=2.4,<3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/binado/h5t"
+Repository = "https://github.com/binado/h5t"
+Issues = "https://github.com/binado/h5t/issues"
+Changelog = "https://github.com/binado/h5t/blob/main/CHANGELOG.md"
 
 [project.scripts]
 h5t = "h5t._cli:main"

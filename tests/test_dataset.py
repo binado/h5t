@@ -38,6 +38,23 @@ def test_metadata_and_all_attributes_are_snapshots(result_file: Path) -> None:
     assert dataset.attrs["unit"] == "m"
 
 
+def test_forbidden_dataset_extra_attribute_fails_with_path(tmp_path: Path) -> None:
+    class Strict(h5t.Dataset, extras="forbid"):
+        unit: str
+
+    class Owner(h5t.Group):
+        payload: Strict
+
+    path = tmp_path / "strict-dataset.h5"
+    with h5py.File(path, "w") as file:
+        dataset = file.create_dataset("payload", data=np.arange(3))
+        dataset.attrs["unit"] = "m"
+        dataset.attrs["surprise"] = 1
+    with pytest.raises(h5t.ValidationError) as caught:
+        Owner.from_file(path)
+    assert caught.value.path == "/payload@surprise"
+
+
 def test_lazy_data_observes_current_file_once_and_preserves_identity(result_file: Path) -> None:
     dataset = Result.from_file(result_file).measurement
     with h5py.File(result_file, "a") as file:
