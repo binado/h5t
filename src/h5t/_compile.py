@@ -297,6 +297,14 @@ def _is_scalar_annotation(core: Any) -> bool:
     return isinstance(core, type) and (issubclass(core, Enum) or issubclass(core, np.generic))
 
 
+def _reject_eager_on_eager_payload(
+    owner: type, py_name: str, eager_marker: Eager | None, foreign: ForeignSpec
+) -> None:
+    """Eager is only a prefetch hint for a LazyArray payload; an np.ndarray one already is."""
+    if eager_marker is not None and not foreign.lazy:
+        raise _schema_error(owner, py_name, "Eager and Payload cannot be combined")
+
+
 def _field_spec(
     owner: type,
     py_name: str,
@@ -325,14 +333,17 @@ def _field_spec(
 
     is_dataset = isinstance(core, type) and issubclass(core, Dataset)
     is_group = isinstance(core, type) and issubclass(core, Group)
+    is_record = isinstance(core, type) and "__h5t_record__" in core.__dict__
 
     if payload_marker is not None and (is_dataset or is_group):
         raise _schema_error(owner, py_name, "Payload cannot annotate a Group or Dataset field")
 
     foreign: ForeignSpec | None = None
     if attr_marker is not None:
-        if is_dataset or is_group:
-            raise _schema_error(owner, py_name, "Attr cannot annotate a Group or Dataset field")
+        if is_dataset or is_group or is_record:
+            raise _schema_error(
+                owner, py_name, "Attr cannot annotate a Group, Dataset, or dataset-record field"
+            )
         kind = MemberKind.ATTRIBUTE
         member_type = None
     elif payload_marker is not None:
@@ -341,10 +352,15 @@ def _field_spec(
         kind = MemberKind.DATASET
         member_type = core
         foreign = _foreign_spec(core, payload_marker, owner, py_name)
-        if eager_marker is not None and not foreign.lazy:
-            # A plain np.ndarray payload is already eager; Eager is only a prefetch
-            # hint for a LazyArray payload (see _load_foreign_dataset).
-            raise _schema_error(owner, py_name, "Eager and Payload cannot be combined")
+        _reject_eager_on_eager_payload(owner, py_name, eager_marker, foreign)
+    elif is_record:
+        # An owner field naming a class decorated with @h5t.dataset, with no explicit
+        # Payload(...) override at this use site: reuse the ForeignSpec the decorator
+        # already compiled and validated against the class's own definition.
+        kind = MemberKind.DATASET
+        member_type = core
+        foreign = typing.cast(ForeignSpec, core.__dict__["__h5t_record__"])
+        _reject_eager_on_eager_payload(owner, py_name, eager_marker, foreign)
     elif is_dataset:
         kind = MemberKind.DATASET
         member_type = core
@@ -410,16 +426,26 @@ _FOREIGN_CACHE: weakref.WeakKeyDictionary[type, dict[_ForeignCacheKey, ForeignSp
 )
 
 
-def _foreign_spec(record_type: type, marker: Payload, owner: type, py_name: str) -> ForeignSpec:
+def _foreign_spec(
+    record_type: type,
+    marker: Payload,
+    owner: type,
+    py_name: str,
+    *,
+    scope: Mapping[str, Any] | None = None,
+) -> ForeignSpec:
     """Compile a plain ``record_type`` into a dataset record's fields and payload.
 
     Cached per ``(record_type, data, attrs, extras)``, since the same foreign class may
-    be reused as a ``Payload`` target from more than one field or schema. Foreign
-    annotations resolve against ``record_type``'s module globals and class dict only
-    (see ``_resolved_annotations``'s ``scope=None`` default): there is no
-    ``__init_subclass__`` hook here to capture a defining frame, so an unresolved
-    annotation is a ``SchemaError`` rather than something the deferred-compilation
-    machinery can retry later.
+    be reused as a ``Payload`` target from more than one field or schema. An
+    ``Annotated[T, Payload(...)]`` use site resolves ``record_type``'s annotations
+    against its module globals and class dict only (``scope=None``): there is no
+    ``__init_subclass__`` hook there to capture a defining frame, so an unresolved
+    annotation is always a ``SchemaError``. The ``@h5t.dataset`` decorator (``dataset``,
+    below) does have such a frame -- its own -- and passes it as ``scope`` so a
+    function-local record's annotations resolve the same way ``_Record``'s do; compiling
+    here regardless (rather than deferring) is safe because a dataset record's own
+    fields can only be attributes, never a forward reference to another record.
     """
     try:
         extras = Extras(marker.extras)
@@ -442,7 +468,7 @@ def _foreign_spec(record_type: type, marker: Payload, owner: type, py_name: str)
         if base is object:
             continue
         try:
-            base_annotations = _resolved_annotations(base)
+            base_annotations = _resolved_annotations(base, scope)
         except _UnresolvedAnnotation as exc:
             raise _schema_error(
                 owner, py_name, f"{record_type.__name__} has unresolved annotations: {exc}"
@@ -522,6 +548,30 @@ def _foreign_spec(record_type: type, marker: Payload, owner: type, py_name: str)
     )
     cache[cache_key] = foreign
     return foreign
+
+
+def dataset(
+    data: str, attrs: str | None = None, extras: Literal["ignore", "forbid"] = "ignore"
+) -> Callable[[type], type]:
+    """Mark a plain class as an h5t dataset record, in place of ``Annotated[T, Payload(...)]``.
+
+    Compiles and validates immediately, against the class's own definition: a bad
+    ``data=`` name raises right here rather than at a distant owner field that happens
+    to use this type. An explicit ``Payload(...)`` at a particular use site still
+    overrides these defaults there, same as if this decorator had never run.
+    """
+    marker = Payload(data=data, attrs=attrs, extras=extras)
+
+    def decorator(cls: type) -> type:
+        frame = inspect.currentframe()
+        scope: Mapping[str, Any] = (
+            frame.f_back.f_locals if frame is not None and frame.f_back else {}
+        )
+        foreign = _foreign_spec(cls, marker, cls, data, scope=scope)
+        setattr(cls, "__h5t_record__", foreign)  # noqa: B010 -- cls is an arbitrary user class
+        return cls
+
+    return decorator
 
 
 def _annotation_failure(cls: type, exc: Exception) -> Exception:

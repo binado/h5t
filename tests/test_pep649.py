@@ -6,6 +6,7 @@ inside the test functions because a module-level bare forward reference would ra
 collection time on the versions ``pytestmark`` skips.
 """
 
+import dataclasses
 import gc
 import inspect
 import sys
@@ -146,6 +147,29 @@ def test_a_lazy_subclass_of_a_deferred_base_defers_too() -> None:
         value: int
 
     assert [field.py_name for field in Sub.__h5spec__.fields] == ["later", "also"]
+
+
+def test_the_dataset_decorator_does_not_defer_even_under_pep_649() -> None:
+    # A Group/Dataset field defers via __h5spec__'s lazy metaclass property, so a bare
+    # annotation naming a not-yet-bound local resolves once the enclosing function
+    # continues past its binding (see test_a_lazy_forward_reference_in_a_function_
+    # scope_resolves_via_the_closure above). @h5t.dataset has no such hook and stays
+    # eager by design -- an attributes-only record can never forward-reference another
+    # schema type, so nothing is gained by deferring, and the decorator forces
+    # __annotate__ to evaluate right here, before Later is ever bound.
+    def declare() -> None:
+        with pytest.raises(h5t.SchemaError, match="Later"):
+
+            @h5t.dataset(data="data")
+            @dataclasses.dataclass
+            class Recording:
+                unit: Later  # noqa: F821 -- bound below; never resolves for this decorator
+                data: np.ndarray
+
+        class Later:
+            pass
+
+    declare()
 
 
 def test_a_lazy_schema_loads_from_a_file(tmp_path: Path) -> None:

@@ -199,11 +199,31 @@ pydantic and dataclasses actually behave, verified against the pinned versions i
    becomes `SchemaError`, any other failure (including a `__post_init__` invariant) becomes
    `ValidationError` at the dataset's path.
 
-Foreign annotations resolve only against the record type's module globals and class dict —
-`_resolved_annotations(base)` is called with no `scope`, since there is no `__init_subclass__` hook
-on a plain class to capture a defining frame's locals the way `_Record`'s deferred path does. An
-unresolved annotation there is therefore always a `SchemaError`, never something the
-`_h5t_scope`/`_weak_scope` deferral machinery retries later.
+Foreign annotations resolve only against the record type's module globals and class dict by
+default — `_resolved_annotations(base)` is called with no `scope`. The `@h5t.dataset` decorator
+(below) is the one caller that passes one, since it does have a defining frame to capture.
+
+### The `@h5t.dataset` decorator
+
+`h5t.dataset(data=..., attrs=..., extras=...)` is sugar for `Annotated[T, Payload(...)]` that
+validates against the record type's own definition instead of a distant owner field's. It builds
+a `Payload` marker from its arguments and calls `_foreign_spec(cls, marker, cls, data, scope=...)`
+immediately — `cls` is both the record type being compiled and the `owner` a `SchemaError` names,
+so a bad `data=` surfaces at the decorator's own call site. The frame it captures
+(`inspect.currentframe().f_back.f_locals`) is the same one `_Record.__init_subclass__` would
+capture were `cls` a `Group`/`Dataset` subclass instead; passing it as `_foreign_spec`'s new
+`scope` parameter lets a function-local record's annotations resolve against function locals, not
+just module globals. Unlike `_Record`, this scope is never retained as a weak snapshot for a later
+retry — it does not need to be, since `_foreign_spec` already converts any `_UnresolvedAnnotation`
+straight into a `SchemaError` (see the `except _UnresolvedAnnotation` clause it has always had).
+That is also why dataset-record compilation stays eager rather than gaining `Group`/`Dataset`'s
+deferral machinery: a record built with `dataset_owner=True` can only declare attributes, so it
+can never forward-reference another schema type the way a deferred `Group` field can, and forcing
+resolution immediately only ever *improves* error locality. `_field_spec` dispatches to this path
+by checking `"__h5t_record__" in core.__dict__` (a per-class marker set by the decorator's
+`setattr`, deliberately not inherited, so a subclass of a decorated record is not accidentally one
+itself) rather than `getattr`, and only when no explicit `Payload(...)` is present at the use
+site — an explicit marker there still overrides the decorator's own `data=`/`attrs=`/`extras=`.
 
 ## Testing conventions
 
@@ -211,7 +231,9 @@ unresolved annotation there is therefore always a `SchemaError`, never something
 every field kind, plus `PlainMeasurement` / `LazyMeasurement` (foreign records over the same
 `measurement` dataset, eager and `LazyArray` payloads respectively) and `write_result()` which
 writes a matching file (including undeclared members, to exercise `extras`). Prefer extending
-those over new ad-hoc fixtures. `tests/test_foreign.py` covers `Payload`/`LazyArray` specifically.
+those over new ad-hoc fixtures. `tests/test_foreign.py` covers the `Payload` marker and
+`LazyArray` specifically; `tests/test_records.py` covers the `@h5t.dataset`/`@h5t.group` decorator
+API that compiles through the same `_foreign_spec`/`ForeignSpec`.
 
 `tests/test_pep649.py` is the one module deliberately *without* `from __future__ import
 annotations` — it exists to exercise the lazy-annotation paths every other module opts out of, and
