@@ -22,12 +22,17 @@ class Measurement(h5t.Dataset, extras="ignore"):
     scale: float = 1.0
 
 
+@h5t.dataset(data="data")
 @dataclasses.dataclass
 class PlainMeasurement:
     """Foreign record over the same dataset as ``Measurement``, eager payload.
 
     ``data`` is reserved on ``h5t.Dataset`` but legal here -- a plain class has
-    nothing in ``dir()`` for h5t's reserved-name check to forbid.
+    nothing in ``dir()`` for h5t's reserved-name check to forbid. Decorated (rather
+    than used only via ``Annotated[..., h5t.Payload(...)]``) so it doubles as a
+    ``h5t check``/``h5t.load`` fixture for a dataset-kind record: every existing
+    marker-based test below still overrides these bindings explicitly, since an
+    explicit ``Payload(...)`` at a use site always wins over the decorator's own.
     """
 
     unit: Literal["m"]
@@ -50,6 +55,14 @@ class Nested(h5t.Group, extras="forbid"):
     answer: int
 
 
+@h5t.group(extras="forbid")
+@dataclasses.dataclass
+class PlainNested:
+    """Foreign group record over the same group as ``Nested``."""
+
+    answer: int
+
+
 class Result(h5t.Group, extras="ignore"):
     """Representative schema containing every supported field kind."""
 
@@ -61,6 +74,23 @@ class Result(h5t.Group, extras="ignore"):
     measurement: Measurement
     eager_measurement: Annotated[Measurement, h5t.Eager()]
     nested: Nested
+    optional_note: str | None
+    defaulted: int = "42"  # type: ignore[assignment]
+
+
+@h5t.group(extras="ignore")
+@dataclasses.dataclass
+class PlainResult:
+    """Foreign group record mirroring ``Result`` field-for-field, over the same file."""
+
+    version: int
+    renamed: Annotated[str, h5t.Name("stored-name")]
+    config: Annotated[dict[str, Any], h5t.Attr(converter=json.loads)]
+    array_attr: Annotated[np.ndarray, h5t.Attr()]
+    values: np.ndarray
+    measurement: Annotated[LazyMeasurement, h5t.Payload("data")]
+    eager_measurement: Annotated[LazyMeasurement, h5t.Payload("data"), h5t.Eager()]
+    nested: PlainNested
     optional_note: str | None
     defaulted: int = "42"  # type: ignore[assignment]
 

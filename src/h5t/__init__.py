@@ -1,7 +1,7 @@
 """Detached, typed records for read-only HDF5 access."""
 
 from h5t._array import LazyArray
-from h5t._compile import Dataset, Group, dataset
+from h5t._compile import Dataset, Group, dataset, group, load
 from h5t._errors import ConversionError, H5TError, SchemaError, ValidationError
 from h5t._spec import Attr, Eager, Name, Payload
 
@@ -21,4 +21,6 @@ __all__ = [
     "ValidationError",
     "__version__",
     "dataset",
+    "group",
+    "load",
 ]

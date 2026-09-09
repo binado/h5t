@@ -35,6 +35,7 @@ from h5t._spec import (
     MemberKind,
     Name,
     Payload,
+    RecordKind,
     attr_path,
     child_path,
 )
@@ -351,16 +352,30 @@ def _field_spec(
             raise _schema_error(owner, py_name, "Payload requires a class annotation")
         kind = MemberKind.DATASET
         member_type = core
-        foreign = _foreign_spec(core, payload_marker, owner, py_name)
+        foreign = _foreign_spec(
+            core,
+            owner,
+            py_name,
+            kind=RecordKind.DATASET,
+            data=payload_marker.data,
+            attrs=payload_marker.attrs,
+            extras_raw=payload_marker.extras,
+        )
         _reject_eager_on_eager_payload(owner, py_name, eager_marker, foreign)
     elif is_record:
-        # An owner field naming a class decorated with @h5t.dataset, with no explicit
-        # Payload(...) override at this use site: reuse the ForeignSpec the decorator
-        # already compiled and validated against the class's own definition.
-        kind = MemberKind.DATASET
+        # An owner field naming a class decorated with @h5t.dataset or @h5t.group, with
+        # no explicit Payload(...) override at this use site.
         member_type = core
-        foreign = typing.cast(ForeignSpec, core.__dict__["__h5t_record__"])
-        _reject_eager_on_eager_payload(owner, py_name, eager_marker, foreign)
+        if _record_kind(core) is RecordKind.GROUP:
+            kind = MemberKind.GROUP
+            # foreign stays None: resolved at load time, exactly as a Group subclass
+            # member's __h5spec__ is (see _load_group_values's GROUP branch). This is
+            # what lets a self-referential record (`child: Node | None`) compile.
+        else:
+            kind = MemberKind.DATASET
+            # Attributes-only, so this can never be pending and never cyclic.
+            foreign = _ensure_record_compiled(core)
+            _reject_eager_on_eager_payload(owner, py_name, eager_marker, foreign)
     elif is_dataset:
         kind = MemberKind.DATASET
         member_type = core
@@ -392,12 +407,15 @@ def _field_spec(
     if kind is not MemberKind.ATTRIBUTE and "/" in h5_name:
         raise _schema_error(owner, py_name, "a child Name cannot contain '/'")
 
-    if foreign is not None:
+    if foreign is not None or is_record:
         # A member-level TypeAdapter cannot validate a foreign record: pydantic
         # rejects `config=` alongside a dataclass/BaseModel/TypedDict type, and
         # revalidating an already-built instance without one is a no-op anyway
         # (see AGENTS.md). Any accepts the constructed instance unchanged; keep
         # the record type itself as `annotation` for repr/equivalence purposes.
+        # `is_record` also covers a GROUP-kind record field, whose `foreign` local
+        # stays None (resolved lazily at load time) but is just as much a dataclass
+        # pydantic would otherwise choke on.
         adapter_ann = core
         adapter = _build_adapter(owner, py_name, Any)
     else:
@@ -420,46 +438,95 @@ def _field_spec(
     )
 
 
-_ForeignCacheKey = tuple[str, str | None, Extras]
+_ForeignCacheKey = tuple[RecordKind, str | None, str | None, Extras]
 _FOREIGN_CACHE: weakref.WeakKeyDictionary[type, dict[_ForeignCacheKey, ForeignSpec]] = (
     weakref.WeakKeyDictionary()
 )
 
 
-def _foreign_spec(
+@dataclasses.dataclass(frozen=True)
+class _PendingRecord:
+    """A ``@h5t.group`` record whose annotations could not resolve yet.
+
+    Only a ``GROUP``-kind record can end up here: a ``DATASET``-kind record may declare
+    only attributes, so it can never forward-reference another schema type and always
+    resolves eagerly (see ``_foreign_spec``). ``kind`` is duplicated from the eventual
+    ``ForeignSpec`` deliberately -- it lets ``_record_kind`` answer GROUP-vs-DATASET
+    without compiling anything, which is what keeps a self-referential group record
+    (``child: Node | None``) from recursing at compile time.
+    """
+
+    kind: RecordKind
+    data: str | None
+    attrs: str | None
+    extras_raw: str
+    py_name: str
+    scope: Mapping[str, Any]
+
+
+def _record_kind(cls: type) -> RecordKind:
+    """Return the kind of a decorated record, compiled or still pending."""
+    return cls.__dict__["__h5t_record__"].kind
+
+
+def _record_annotation_names(cls: type) -> set[str]:
+    """Union ``_annotation_names`` across ``cls``'s MRO.
+
+    ``_Record`` gets away with the single-class version because every base compiles and
+    snapshots its own scope. A foreign record's bases never do, so the snapshot taken
+    here must cover them too, mirroring the MRO walk ``_compile_foreign_fields`` does
+    when it actually resolves the annotations.
+    """
+    names: set[str] = set()
+    for base in cls.__mro__:
+        if base is object:
+            continue
+        names |= _annotation_names(base)
+    return names
+
+
+def _ensure_record_compiled(cls: type) -> ForeignSpec:
+    """Return ``cls``'s ``ForeignSpec``, retrying a pending one against its scope.
+
+    Caches the result back onto ``cls.__h5t_record__``. A renewed ``_UnresolvedAnnotation``
+    propagates uncaught, so an owner referencing this record defers too, via the
+    existing ``_compile_class``/``__init_subclass__`` machinery.
+    """
+    marker = cls.__dict__["__h5t_record__"]
+    if isinstance(marker, ForeignSpec):
+        return marker
+    pending = typing.cast(_PendingRecord, marker)
+    foreign = _foreign_spec(
+        cls,
+        cls,
+        pending.py_name,
+        kind=pending.kind,
+        data=pending.data,
+        attrs=pending.attrs,
+        extras_raw=pending.extras_raw,
+        scope=_unpack_scope(pending.scope),
+    )
+    setattr(cls, "__h5t_record__", foreign)  # noqa: B010 -- cls is an arbitrary user class
+    return foreign
+
+
+def _compile_foreign_fields(
     record_type: type,
-    marker: Payload,
     owner: type,
     py_name: str,
     *,
-    scope: Mapping[str, Any] | None = None,
+    kind: RecordKind,
+    data: str | None,
+    attrs: str | None,
+    extras: Extras,
+    scope: Mapping[str, Any] | None,
 ) -> ForeignSpec:
-    """Compile a plain ``record_type`` into a dataset record's fields and payload.
+    """Compile ``record_type``'s own fields (and payload, for a ``DATASET`` record).
 
-    Cached per ``(record_type, data, attrs, extras)``, since the same foreign class may
-    be reused as a ``Payload`` target from more than one field or schema. An
-    ``Annotated[T, Payload(...)]`` use site resolves ``record_type``'s annotations
-    against its module globals and class dict only (``scope=None``): there is no
-    ``__init_subclass__`` hook there to capture a defining frame, so an unresolved
-    annotation is always a ``SchemaError``. The ``@h5t.dataset`` decorator (``dataset``,
-    below) does have such a frame -- its own -- and passes it as ``scope`` so a
-    function-local record's annotations resolve the same way ``_Record``'s do; compiling
-    here regardless (rather than deferring) is safe because a dataset record's own
-    fields can only be attributes, never a forward reference to another record.
+    Left for ``_foreign_spec`` to catch: an ``_UnresolvedAnnotation`` raised while
+    resolving a base's annotations. Nothing here converts it, so the policy of
+    "eager SchemaError for DATASET, defer for GROUP" lives in exactly one place.
     """
-    try:
-        extras = Extras(marker.extras)
-    except ValueError:
-        raise _schema_error(
-            owner, py_name, f"extras must be 'ignore' or 'forbid', got {marker.extras!r}"
-        ) from None
-
-    cache = _FOREIGN_CACHE.setdefault(record_type, {})
-    cache_key: _ForeignCacheKey = (marker.data, marker.attrs, extras)
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
     is_dataclass_type = dataclasses.is_dataclass(record_type)
     dc_fields = {f.name: f for f in dataclasses.fields(record_type)} if is_dataclass_type else {}
 
@@ -467,12 +534,7 @@ def _foreign_spec(
     for base in reversed(record_type.__mro__):
         if base is object:
             continue
-        try:
-            base_annotations = _resolved_annotations(base, scope)
-        except _UnresolvedAnnotation as exc:
-            raise _schema_error(
-                owner, py_name, f"{record_type.__name__} has unresolved annotations: {exc}"
-            ) from exc
+        base_annotations = _resolved_annotations(base, scope)
         for field_name, field_annotation in base_annotations.items():
             if field_name.startswith("_") or typing.get_origin(field_annotation) is ClassVar:
                 continue
@@ -482,39 +544,34 @@ def _foreign_spec(
                     continue  # derived; cannot be passed to the constructor
             annotations[field_name] = field_annotation
 
-    if marker.data not in annotations:
-        raise _schema_error(
-            owner,
-            py_name,
-            f"Payload data {marker.data!r} is not a field of {record_type.__name__}",
-        )
-    payload_annotation = annotations.pop(marker.data)
-    payload_core, _, _ = _split_annotation(record_type, marker.data, payload_annotation)
-    if _is_ndarray_annotation(payload_core):
-        lazy = False
-    elif isinstance(payload_core, type) and issubclass(payload_core, LazyArray):
-        lazy = True
-    else:
-        raise _schema_error(
-            owner,
-            py_name,
-            f"Payload field {marker.data!r} must be annotated np.ndarray or LazyArray",
-        )
-
-    if marker.attrs is not None:
-        if marker.attrs not in annotations:
+    lazy = False
+    if kind is RecordKind.DATASET:
+        assert data is not None
+        if data not in annotations:
             raise _schema_error(
-                owner,
-                py_name,
-                f"Payload attrs {marker.attrs!r} is not a field of {record_type.__name__}",
+                owner, py_name, f"Payload data {data!r} is not a field of {record_type.__name__}"
             )
-        attrs_annotation = annotations.pop(marker.attrs)
-        attrs_core, _, _ = _split_annotation(record_type, marker.attrs, attrs_annotation)
+        payload_annotation = annotations.pop(data)
+        payload_core, _, _ = _split_annotation(record_type, data, payload_annotation)
+        if _is_ndarray_annotation(payload_core):
+            lazy = False
+        elif isinstance(payload_core, type) and issubclass(payload_core, LazyArray):
+            lazy = True
+        else:
+            raise _schema_error(
+                owner, py_name, f"Payload field {data!r} must be annotated np.ndarray or LazyArray"
+            )
+
+    if attrs is not None:
+        if attrs not in annotations:
+            raise _schema_error(
+                owner, py_name, f"Payload attrs {attrs!r} is not a field of {record_type.__name__}"
+            )
+        attrs_annotation = annotations.pop(attrs)
+        attrs_core, _, _ = _split_annotation(record_type, attrs, attrs_annotation)
         if not _is_mapping_annotation(attrs_core):
             raise _schema_error(
-                owner,
-                py_name,
-                f"Payload attrs field {marker.attrs!r} must be annotated Mapping",
+                owner, py_name, f"Payload attrs field {attrs!r} must be annotated Mapping"
             )
 
     fields: dict[str, FieldSpec] = {}
@@ -534,41 +591,166 @@ def _foreign_spec(
             field_name,
             field_annotation,
             default,
-            dataset_owner=True,
+            dataset_owner=(kind is RecordKind.DATASET),
             default_factory=default_factory,
         )
 
     _check_duplicate_names(record_type.__name__, fields)
-    foreign = ForeignSpec(
+    return ForeignSpec(
         record_type=record_type,
         spec=ClassSpec(tuple(fields.values()), extras),
-        data=marker.data,
-        attrs=marker.attrs,
+        kind=kind,
+        data=data if kind is RecordKind.DATASET else None,
+        attrs=attrs,
         lazy=lazy,
     )
+
+
+def _foreign_spec(
+    record_type: type,
+    owner: type,
+    py_name: str,
+    *,
+    kind: RecordKind,
+    data: str | None,
+    attrs: str | None,
+    extras_raw: str,
+    scope: Mapping[str, Any] | None = None,
+) -> ForeignSpec:
+    """Compile a plain ``record_type`` into a ``Payload``/``group`` record's fields.
+
+    Cached per ``(kind, data, attrs, extras)``, since the same foreign class may be
+    reused as a target from more than one field or schema. An
+    ``Annotated[T, Payload(...)]`` use site resolves ``record_type``'s annotations
+    against its module globals and class dict only (``scope=None``): there is no
+    ``__init_subclass__`` hook there to capture a defining frame, so an unresolved
+    annotation is always a ``SchemaError``. The ``@h5t.dataset``/``@h5t.group``
+    decorators do have such a frame -- their own -- and pass it as ``scope`` so a
+    function-local record's annotations resolve the same way ``_Record``'s do.
+
+    A ``DATASET``-kind record's own fields can only be attributes, so it can never
+    forward-reference another schema type: compiling it here regardless of deferral is
+    safe, and an unresolved name is always a genuine ``SchemaError``. A ``GROUP``-kind
+    record has no such restriction, so an ``_UnresolvedAnnotation`` there must propagate
+    uncaught instead -- the caller (the ``group()`` decorator, or a retry from
+    ``_ensure_record_compiled``) is the one that knows how to defer.
+    """
+    try:
+        extras = Extras(extras_raw)
+    except ValueError:
+        raise _schema_error(
+            owner, py_name, f"extras must be 'ignore' or 'forbid', got {extras_raw!r}"
+        ) from None
+
+    cache = _FOREIGN_CACHE.setdefault(record_type, {})
+    cache_key: _ForeignCacheKey = (kind, data, attrs, extras)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        foreign = _compile_foreign_fields(
+            record_type,
+            owner,
+            py_name,
+            kind=kind,
+            data=data,
+            attrs=attrs,
+            extras=extras,
+            scope=scope,
+        )
+    except _UnresolvedAnnotation as exc:
+        if kind is RecordKind.GROUP:
+            raise
+        raise _schema_error(
+            owner, py_name, f"{record_type.__name__} has unresolved annotations: {exc}"
+        ) from exc
+
     cache[cache_key] = foreign
     return foreign
 
 
+_C = typing.TypeVar("_C", bound=type)
+
+
 def dataset(
     data: str, attrs: str | None = None, extras: Literal["ignore", "forbid"] = "ignore"
-) -> Callable[[type], type]:
+) -> Callable[[_C], _C]:
     """Mark a plain class as an h5t dataset record, in place of ``Annotated[T, Payload(...)]``.
 
     Compiles and validates immediately, against the class's own definition: a bad
     ``data=`` name raises right here rather than at a distant owner field that happens
     to use this type. An explicit ``Payload(...)`` at a particular use site still
     overrides these defaults there, same as if this decorator had never run.
-    """
-    marker = Payload(data=data, attrs=attrs, extras=extras)
 
-    def decorator(cls: type) -> type:
+    Typed to preserve ``cls``'s own identity through the decorator (``Callable[[_C], _C]``
+    rather than ``Callable[[type], type]``), so a decorated class keeps its precise type
+    for a static checker -- e.g. through ``h5t.load``'s own ``TypeVar`` return.
+    """
+
+    def decorator(cls: _C) -> _C:
         frame = inspect.currentframe()
         scope: Mapping[str, Any] = (
             frame.f_back.f_locals if frame is not None and frame.f_back else {}
         )
-        foreign = _foreign_spec(cls, marker, cls, data, scope=scope)
+        foreign = _foreign_spec(
+            cls,
+            cls,
+            data,
+            kind=RecordKind.DATASET,
+            data=data,
+            attrs=attrs,
+            extras_raw=extras,
+            scope=scope,
+        )
         setattr(cls, "__h5t_record__", foreign)  # noqa: B010 -- cls is an arbitrary user class
+        return cls
+
+    return decorator
+
+
+def group(
+    attrs: str | None = None, extras: Literal["ignore", "forbid"] = "ignore"
+) -> Callable[[_C], _C]:
+    """Mark a plain class as an h5t group record, loadable via ``h5t.load``.
+
+    Unlike ``dataset()``, a group record's fields are not restricted to attributes, so
+    it may forward-reference another schema type -- including itself
+    (``child: Node | None``). An unresolved annotation therefore defers compilation
+    instead of raising immediately, the same tolerance ``_Record.__init_subclass__``
+    gives a ``Group``/``Dataset`` subclass, and it is retried lazily by
+    ``_ensure_record_compiled`` the first time this record is actually used as a field
+    or loaded directly via ``h5t.load``.
+    """
+
+    def decorator(cls: _C) -> _C:
+        frame = inspect.currentframe()
+        scope: Mapping[str, Any] = (
+            frame.f_back.f_locals if frame is not None and frame.f_back else {}
+        )
+        try:
+            foreign = _foreign_spec(
+                cls,
+                cls,
+                cls.__name__,
+                kind=RecordKind.GROUP,
+                data=None,
+                attrs=attrs,
+                extras_raw=extras,
+                scope=scope,
+            )
+        except _UnresolvedAnnotation:
+            pending = _PendingRecord(
+                kind=RecordKind.GROUP,
+                data=None,
+                attrs=attrs,
+                extras_raw=extras,
+                py_name=cls.__name__,
+                scope=_weak_scope(scope, _record_annotation_names(cls)),
+            )
+            setattr(cls, "__h5t_record__", pending)  # noqa: B010
+            return cls
+        setattr(cls, "__h5t_record__", foreign)  # noqa: B010
         return cls
 
     return decorator
@@ -659,6 +841,7 @@ def _foreign_equivalent(left: ForeignSpec | None, right: ForeignSpec | None) -> 
         return left is right
     return (
         left.record_type is right.record_type
+        and left.kind is right.kind
         and left.data == right.data
         and left.attrs == right.attrs
         and left.lazy == right.lazy
@@ -878,31 +1061,14 @@ def _load_dataset(
     return instance
 
 
-def _load_foreign_dataset(
-    foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str, *, eager: bool = False
-) -> Any:
-    """Load ``node`` into an instance of ``foreign.record_type`` via its constructor."""
-    spec = foreign.spec
-    _check_dataset_extras(spec, node, path)
-    raw = _raw_attrs(node)
-    attrs = dict(raw)
-    values: dict[str, Any] = {}
-    for field in spec.fields:
-        values[field.py_name] = _load_attribute(field, raw, attrs, path)
+def _construct_record(foreign: ForeignSpec, values: dict[str, Any], path: str) -> Any:
+    """Build ``foreign.record_type(**values)``, mapping constructor failures to h5t errors.
 
-    if foreign.lazy:
-        values[foreign.data] = LazyArray(
-            filename,
-            path,
-            tuple(node.shape),
-            np.dtype(node.dtype),
-            data=np.asarray(node[()]) if eager else None,
-        )
-    else:
-        values[foreign.data] = np.asarray(node[()])
-    if foreign.attrs is not None:
-        values[foreign.attrs] = MappingProxyType(attrs)
-
+    ``TypeError`` means the loaded fields do not match the constructor's signature: a
+    schema/record mismatch, not a data problem, so it becomes ``SchemaError``. Anything
+    else -- typically a ``__post_init__`` invariant -- is a data problem at this node's
+    path, so it becomes ``ValidationError``.
+    """
     try:
         return foreign.record_type(**values)
     except TypeError as exc:
@@ -917,8 +1083,45 @@ def _load_foreign_dataset(
         ) from exc
 
 
-def _load_group(group_type: type[Group], group: h5py.Group, filename: str, path: str) -> Group:
-    spec = group_type.__h5spec__
+def _load_foreign_dataset(
+    foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str, *, eager: bool = False
+) -> Any:
+    """Load ``node`` into an instance of ``foreign.record_type`` via its constructor."""
+    spec = foreign.spec
+    _check_dataset_extras(spec, node, path)
+    raw = _raw_attrs(node)
+    attrs = dict(raw)
+    values: dict[str, Any] = {}
+    for field in spec.fields:
+        values[field.py_name] = _load_attribute(field, raw, attrs, path)
+
+    assert foreign.data is not None
+    if foreign.lazy:
+        values[foreign.data] = LazyArray(
+            filename,
+            path,
+            tuple(node.shape),
+            np.dtype(node.dtype),
+            data=np.asarray(node[()]) if eager else None,
+        )
+    else:
+        values[foreign.data] = np.asarray(node[()])
+    if foreign.attrs is not None:
+        values[foreign.attrs] = MappingProxyType(attrs)
+
+    return _construct_record(foreign, values, path)
+
+
+def _load_group_values(
+    spec: ClassSpec, group: h5py.Group, filename: str, path: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load ``spec``'s fields from ``group``, returning ``(values, attrs snapshot)``.
+
+    Shared by ``_load_group`` (an ``h5t.Group`` subclass, constructed via
+    ``object.__new__``) and ``_load_foreign_group`` (a ``@h5t.group`` record,
+    constructed via its own ``__init__``) -- they differ only in how the loaded
+    ``values``/``attrs`` become an instance.
+    """
     _check_group_extras(spec, group, path)
     raw = _raw_attrs(group)
     attrs = dict(raw)
@@ -938,8 +1141,13 @@ def _load_group(group_type: type[Group], group: h5py.Group, filename: str, path:
             if not isinstance(node, h5py.Group):
                 raise ValidationError(member_path, "expected a group, found a dataset")
             assert field.member_type is not None
-            nested_group_type = typing.cast(type[Group], field.member_type)
-            value = _load_group(nested_group_type, node, filename, member_path)
+            if "__h5t_record__" in field.member_type.__dict__:
+                value = _load_foreign_group(
+                    _ensure_record_compiled(field.member_type), node, filename, member_path
+                )
+            else:
+                nested_group_type = typing.cast(type[Group], field.member_type)
+                value = _load_group(nested_group_type, node, filename, member_path)
         elif field.kind is MemberKind.DATASET:
             if not isinstance(node, h5py.Dataset):
                 raise ValidationError(member_path, "expected a dataset, found a group")
@@ -957,11 +1165,77 @@ def _load_group(group_type: type[Group], group: h5py.Group, filename: str, path:
             value = np.asarray(node[()])
         values[field.py_name] = _validate_value(field, value, member_path)
 
+    return values, attrs
+
+
+def _load_group(group_type: type[Group], group: h5py.Group, filename: str, path: str) -> Group:
+    values, attrs = _load_group_values(group_type.__h5spec__, group, filename, path)
     instance = object.__new__(group_type)
     object.__setattr__(instance, "_h5t_attrs", MappingProxyType(attrs))
     for name, value in values.items():
         object.__setattr__(instance, name, value)
     return instance
+
+
+def _load_foreign_group(foreign: ForeignSpec, group: h5py.Group, filename: str, path: str) -> Any:
+    """Load ``group`` into an instance of ``foreign.record_type`` via its constructor."""
+    values, attrs = _load_group_values(foreign.spec, group, filename, path)
+    if foreign.attrs is not None:
+        values[foreign.attrs] = MappingProxyType(attrs)
+    return _construct_record(foreign, values, path)
+
+
+_T = typing.TypeVar("_T")
+
+
+def load(schema: type[_T], path: str | os.PathLike[str], root: str = "/") -> _T:
+    """Load ``schema`` from ``root`` in the file at ``path`` and close the file.
+
+    ``schema`` is an ``h5t.Group`` subclass or a ``@h5t.group``-decorated record; a
+    ``@h5t.dataset`` record or a bare ``h5t.Dataset`` subclass names a dataset, not a
+    group-shaped root, and is rejected with ``SchemaError``.
+    """
+    foreign: ForeignSpec | None = None
+    if isinstance(schema, SchemaMeta) and issubclass(schema, Group):
+        _ensure_compiled(schema)  # compile a deferred schema before touching the filesystem
+    elif isinstance(schema, type) and "__h5t_record__" in schema.__dict__:
+        try:
+            foreign = _ensure_record_compiled(schema)
+        except _UnresolvedAnnotation as exc:
+            raise SchemaError(
+                f"{exc.owner.__name__}: could not resolve annotations: {exc}"
+            ) from exc
+        if foreign.kind is not RecordKind.GROUP:
+            raise SchemaError(
+                f"{schema.__name__} is a dataset record (@h5t.dataset); h5t.load needs an "
+                "h5t.Group subclass or a @h5t.group record"
+            )
+    else:
+        raise SchemaError(
+            f"{schema!r} is not an h5t.Group subclass or a decorated record "
+            "(@h5t.dataset/@h5t.group)"
+        )
+
+    try:
+        filesystem_path = os.fsdecode(os.fspath(path))
+    except TypeError as exc:
+        raise TypeError("path must be a filesystem path") from exc
+    if not isinstance(root, str) or not posixpath.isabs(root):
+        raise ValueError("root must be an absolute HDF5 group path")
+    normalized_root = posixpath.normpath(root)
+    if normalized_root.startswith("//"):
+        normalized_root = "/" + normalized_root.lstrip("/")
+    filename = os.path.abspath(filesystem_path)
+    with h5py.File(filename, mode="r") as h5file:
+        node = h5file.get(normalized_root)
+        if node is None:
+            raise ValidationError(normalized_root, "root group does not exist")
+        if not isinstance(node, h5py.Group):
+            raise ValidationError(normalized_root, "expected a group, found a dataset")
+        if foreign is not None:
+            return typing.cast(_T, _load_foreign_group(foreign, node, filename, normalized_root))
+        group_type = typing.cast(type[Group], schema)
+        return typing.cast(_T, _load_group(group_type, node, filename, normalized_root))
 
 
 class _Record(metaclass=SchemaMeta):
@@ -1082,21 +1356,4 @@ class Group(_Record):
     @classmethod
     def from_file(cls, path: str | os.PathLike[str], root: str = "/") -> Self:
         """Load this group schema from ``root`` and close the HDF5 file."""
-        _ensure_compiled(cls)  # compile a deferred schema before touching the filesystem
-        try:
-            filesystem_path = os.fsdecode(os.fspath(path))
-        except TypeError as exc:
-            raise TypeError("path must be a filesystem path") from exc
-        if not isinstance(root, str) or not posixpath.isabs(root):
-            raise ValueError("root must be an absolute HDF5 group path")
-        normalized_root = posixpath.normpath(root)
-        if normalized_root.startswith("//"):
-            normalized_root = "/" + normalized_root.lstrip("/")
-        filename = os.path.abspath(filesystem_path)
-        with h5py.File(filename, mode="r") as h5file:
-            node = h5file.get(normalized_root)
-            if node is None:
-                raise ValidationError(normalized_root, "root group does not exist")
-            if not isinstance(node, h5py.Group):
-                raise ValidationError(normalized_root, "expected a group, found a dataset")
-            return typing.cast(Self, _load_group(cls, node, filename, normalized_root))
+        return load(cls, path, root)

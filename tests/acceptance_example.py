@@ -38,6 +38,22 @@ class Result(h5t.Group):
     recording: Annotated[Recording, h5t.Payload("payload", attrs="attrs")]
 
 
+@h5t.dataset(data="payload", attrs="attrs")
+@dataclasses.dataclass
+class DecoratedRecording:
+    unit: str
+    payload: np.ndarray
+    attrs: Mapping[str, Any]
+
+
+@h5t.group()
+@dataclasses.dataclass
+class DecoratedResult:
+    version: int
+    values: np.ndarray
+    recording: DecoratedRecording
+
+
 result: Result = Result.from_file(Path("result.h5"))
 version: int = result.version
 values: np.ndarray = result.values
@@ -49,3 +65,9 @@ defaulted: int = result.defaulted
 recording: Recording = result.recording
 recording_payload: np.ndarray = result.recording.payload
 attrs: Mapping[str, Any] = result.recording.attrs
+
+loaded_via_group: Result = h5t.load(Result, Path("result.h5"))
+loaded_via_record: DecoratedResult = h5t.load(DecoratedResult, Path("result.h5"))
+decorated_version: int = loaded_via_record.version
+decorated_recording: DecoratedRecording = loaded_via_record.recording
+decorated_payload: np.ndarray = loaded_via_record.recording.payload

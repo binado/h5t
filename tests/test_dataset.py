@@ -12,7 +12,7 @@ import pytest
 
 import h5t
 
-from .conftest import LazyMeasurement, Result, open_fd_count, write_result
+from .conftest import LazyMeasurement, PlainResult, Result, open_fd_count, write_result
 
 
 def test_metadata_and_all_attributes_are_snapshots(result_file: Path) -> None:
@@ -123,12 +123,18 @@ def test_no_descriptors_leak_on_success_or_failure(tmp_path: Path) -> None:
         pass
     Result.from_file(good)
     Owner.from_file(good).measurement.data.read()
+    h5t.load(PlainResult, good)
     with pytest.raises(h5t.ValidationError):
         Result.from_file(bad)
+    with pytest.raises(h5t.ValidationError):
+        h5t.load(PlainResult, bad)
     baseline = open_fd_count()
     for _ in range(20):
         Result.from_file(good)
         Owner.from_file(good).measurement.data.read()
+        h5t.load(PlainResult, good)
         with pytest.raises(h5t.ValidationError):
             Result.from_file(bad)
+        with pytest.raises(h5t.ValidationError):
+            h5t.load(PlainResult, bad)
     assert open_fd_count() == baseline

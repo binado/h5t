@@ -62,6 +62,18 @@ def test_import_failures_exit_two(
     assert capsys.readouterr().err.startswith("error:")
 
 
+def test_group_record_schema_succeeds(result_file: Path, capsys: pytest.CaptureFixture) -> None:
+    assert main(["check", str(result_file), "--schema", "tests.conftest:PlainResult"]) == 0
+    assert capsys.readouterr().out.startswith("ok:")
+
+
+def test_dataset_record_schema_exits_two(result_file: Path, capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["check", str(result_file), "--schema", "tests.conftest:PlainMeasurement"])
+    assert caught.value.code == 2
+    assert "dataset record" in capsys.readouterr().err
+
+
 def test_io_and_invalid_root_exit_two(
     tmp_path: Path, schema_ref: str, capsys: pytest.CaptureFixture
 ) -> None:

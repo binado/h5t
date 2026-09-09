@@ -172,6 +172,33 @@ def test_the_dataset_decorator_does_not_defer_even_under_pep_649() -> None:
     declare()
 
 
+def test_the_group_decorator_defers_under_pep_649() -> None:
+    # Contrast with test_the_dataset_decorator_does_not_defer_even_under_pep_649 above:
+    # a GROUP-kind record's fields are not restricted to attributes, so it can
+    # forward-reference another schema type (including itself), and the
+    # attributes-only premise that keeps @h5t.dataset eager no longer holds. @h5t.group
+    # therefore gets the same tolerance _Record.__init_subclass__ gives Group/Dataset --
+    # here demonstrated via the PEP 649 closure win, exactly like the Group case above.
+    def declare() -> type:
+        @h5t.group()
+        @dataclasses.dataclass
+        class Local:
+            later: Later  # noqa: F821 -- bound below; reached via __annotate__'s closure
+
+        @h5t.group()
+        @dataclasses.dataclass
+        class Later:
+            value: int
+
+        return Local
+
+    schema = declare()
+    gc.collect()
+    foreign = h5t._compile._ensure_record_compiled(schema)
+    fields = {field.py_name: field for field in foreign.spec.fields}
+    assert fields["later"].member_type.__name__ == "Later"
+
+
 def test_a_lazy_schema_loads_from_a_file(tmp_path: Path) -> None:
     path = tmp_path / "result.h5"
     write_result(path)

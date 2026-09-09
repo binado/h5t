@@ -67,6 +67,13 @@ class MemberKind(Enum):
     GROUP = "group"
 
 
+class RecordKind(Enum):
+    """Whether a decorated record describes an HDF5 dataset or a group."""
+
+    DATASET = "dataset"
+    GROUP = "group"
+
+
 _NO_DEFAULT = object()
 
 
@@ -80,11 +87,12 @@ class ClassSpec:
 
 @dataclass(frozen=True)
 class ForeignSpec:
-    """Compiled loading instructions for a plain record type used as a ``Payload``."""
+    """Compiled loading instructions for a plain record type used as ``Payload``/``group``."""
 
     record_type: type
     spec: ClassSpec
-    data: str
+    kind: RecordKind
+    data: str | None
     attrs: str | None
     lazy: bool
 
