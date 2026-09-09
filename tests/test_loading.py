@@ -81,6 +81,33 @@ def test_missing_wrong_kind_and_forbidden_extra_fail_with_paths(tmp_path: Path) 
     assert caught.value.path == "/value"
 
 
+def test_group_and_dataset_kind_mismatches_fail_with_paths(tmp_path: Path) -> None:
+    class Child(h5t.Group):
+        value: int
+
+    class Typed(h5t.Dataset):
+        unit: str
+
+    class Owner(h5t.Group):
+        child: Child
+        typed: Typed
+
+    path = tmp_path / "kind-mismatch.h5"
+    with h5py.File(path, "w") as file:
+        file.create_dataset("child", data=1)  # a group field finds a dataset
+    with pytest.raises(h5t.ValidationError, match="expected a group") as caught:
+        Owner.from_file(path)
+    assert caught.value.path == "/child"
+
+    with h5py.File(path, "w") as file:
+        group = file.create_group("child")
+        group.attrs["value"] = 1
+        file.create_group("typed")  # a dataset field finds a group
+    with pytest.raises(h5t.ValidationError, match="expected a dataset") as caught:
+        Owner.from_file(path)
+    assert caught.value.path == "/typed"
+
+
 def test_nested_class_controls_its_own_extras(tmp_path: Path) -> None:
     path = tmp_path / "nested-extra.h5"
     write_result(path)
@@ -94,6 +121,8 @@ def test_nested_class_controls_its_own_extras(tmp_path: Path) -> None:
 def test_direct_construction_and_generated_equality_are_unsupported(result_file: Path) -> None:
     with pytest.raises(TypeError):
         Result()
+    with pytest.raises(TypeError):
+        Measurement()
     first = Result.from_file(result_file)
     second = Result.from_file(result_file)
     assert first != second
