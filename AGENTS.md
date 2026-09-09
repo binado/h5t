@@ -31,9 +31,9 @@ Four modules, one direction of dependency (`_cli` → `_compile` → `_array`/`_
   compiled IR: `FieldSpec` (one field: HDF5 name, `MemberKind`, cached Pydantic `TypeAdapter`,
   default, default factory, converter, an optional `ForeignSpec`) and `ClassSpec` (a class's
   flattened fields + `Extras` policy). `ForeignSpec` is the compiled IR for a `Payload` field: the
-  foreign record type, its own `ClassSpec`, which of its fields holds the payload, and whether that
-  payload is eager or a `LazyArray`. Also the path formatters `child_path` / `attr_path`
-  (`/group/child`, `/group@attr`) used in every error.
+  foreign record type, its own `ClassSpec`, which of its fields holds the payload, whether that
+  payload is a `LazyArray`, and which field (if any) receives the attrs snapshot. Also the path
+  formatters `child_path` / `attr_path` (`/group/child`, `/group@attr`) used in every error.
 - **`_array.py`** — `LazyArray`, the detached, lazily-read dataset payload (filename/path/shape/
   dtype snapshot, `.data`/`.read()`/`.open()`). `Dataset` delegates to an internal `_h5t_array:
   LazyArray` rather than duplicating this state; a `Payload` field with a `LazyArray`-typed member
@@ -161,17 +161,23 @@ value in the `attrs` snapshot, so `attrs` always contains every declared attribu
 a base's field; two unrelated bases declaring the same name must be *equivalent* per
 `_fields_equivalent`, which compares `repr()` of annotation and default rather than `==` to avoid
 ndarray-truthiness ambiguity and adapter identity, plus `_foreign_equivalent` (record type,
-`data_attr`, `lazy`, extras policy) for a `Payload` field. `extras` is inherited from the nearest
-compiled base unless the subclass passes it explicitly.
+`data`, `attrs`, `lazy`, extras policy) for a `Payload` field. `extras` is inherited from the
+nearest compiled base unless the subclass passes it explicitly.
 
 ### Foreign record types (`Payload`)
 
 A `Payload` field loads a child dataset into a plain record type (typically a stdlib `dataclass`)
 instead of an `h5t.Dataset` subclass, so the record does not have to inherit from h5t and is not
 subject to `Dataset`'s reserved-name check. `_foreign_spec` compiles the foreign type once per
-`(record_type, data_attr, extras)` (cached in a `WeakKeyDictionary`), reusing `_field_spec` with
-`dataset_owner=True` for every field but the payload. Four things fall out of how pydantic and
-dataclasses actually behave, verified against the pinned versions in `.venv`:
+`(record_type, data, attrs, extras)` (cached in a `WeakKeyDictionary`), reusing `_field_spec` with
+`dataset_owner=True` for every field but the payload (and the `attrs` field, if named). `Payload`
+is thus a strict superset of `Dataset`'s capabilities: `data=` is the payload field (`np.ndarray`
+eager, or `LazyArray` lazy); `attrs=`, if given, names a `Mapping`-annotated field that receives
+the same validated-plus-raw attrs snapshot `Dataset.attrs` does; and `Eager` may combine with
+`Payload` when the payload is `LazyArray` (`_load_foreign_dataset` forwards `data=` into the
+`LazyArray` construction as a prefetch, exactly like `Dataset`'s own `Eager`) — combining `Eager`
+with an already-eager `np.ndarray` payload stays a `SchemaError`. Four more things fall out of how
+pydantic and dataclasses actually behave, verified against the pinned versions in `.venv`:
 
 1. `TypeAdapter(SomeDataclass, config=ConfigDict(...))` raises `PydanticUserError` — pydantic
    rejects `config=` alongside a dataclass/BaseModel/TypedDict type — and dropping `config=` buys

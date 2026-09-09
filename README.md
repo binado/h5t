@@ -89,8 +89,10 @@ exits. Schema objects cannot be directly constructed, written, or serialized by 
 | `Annotated[T, Attr(...)]` | attribute | converter, then Pydantic validation |
 | scalar or `Literal[...]` | attribute | Pydantic validation |
 
-`Name("stored-name")` renames any field kind. `Attr` is valid only for attributes,
-`Eager` and `Payload` only for datasets, and `Payload` may not combine with either.
+`Name("stored-name")` renames any field kind. `Attr` is valid only for attributes and
+never combines with `Payload`. `Eager` is valid only for datasets; combined with
+`Payload` it is allowed only when the payload field is `LazyArray` (it prefetches the
+array), since an `np.ndarray` payload is already eager.
 A parameterized alias such as `numpy.typing.NDArray[np.floating]` is accepted wherever
 `np.ndarray` is; the dtype parameter is not validated. Unsupported collection-shaped
 child annotations raise `SchemaError`; dynamic collections are not yet supported.
@@ -144,8 +146,26 @@ governs the dataset's attributes, since a plain class cannot take h5t's `extras=
 keyword. Unlike `Dataset`, a plain record type has no reserved field names -- `data`,
 `path`, `shape`, and so on are all free -- because there is no `Dataset` API for a name
 to shadow. h5t calls the record type's real constructor (`__post_init__` runs; an
-invariant it raises surfaces as `ValidationError`), so a foreign record has no `attrs`
-snapshot of its own and no `path`/`shape`/`dtype` unless its `Payload` field is a
+invariant it raises surfaces as `ValidationError`).
+
+Pass `attrs="field"` to bind a `Mapping`-annotated field to the same attrs snapshot
+`Dataset.attrs` provides -- validated values for declared names, raw for undeclared:
+
+```python
+from collections.abc import Mapping
+from typing import Any
+
+@dataclass
+class Measurement:
+    unit: str
+    data: np.ndarray
+    attrs: Mapping[str, Any]
+
+class Result(h5t.Group):
+    measurement: Annotated[Measurement, h5t.Payload("data", attrs="attrs")]
+```
+
+A foreign record has no `path`/`shape`/`dtype` unless its `Payload` field is a
 `LazyArray`. Foreign annotations resolve only against the record type's module globals
 and class dict -- there is no `__init_subclass__` hook to capture a defining frame, so
 a function-local foreign dataclass with quoted annotations naming other function

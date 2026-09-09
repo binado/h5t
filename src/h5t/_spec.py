@@ -37,14 +37,17 @@ class Eager:
 class Payload:
     """Load a child dataset into a plain record type, not an ``h5t.Dataset`` subclass.
 
-    ``data_attr`` names the field of the record type holding the payload; it must be
+    ``data`` names the field of the record type holding the payload; it must be
     annotated ``np.ndarray`` (materialized eagerly) or ``LazyArray`` (read on first
-    access). ``extras`` lives here rather than on the record type itself, since a
-    plain class cannot take h5t's ``extras=`` class keyword -- it applies to the
-    dataset's attributes exactly as ``Dataset``'s ``extras=`` does.
+    access). ``attrs``, if given, names a ``Mapping``-annotated field that receives the
+    dataset's attrs snapshot -- validated values for declared names, raw for undeclared,
+    exactly like ``Dataset.attrs``. ``extras`` lives here rather than on the record type
+    itself, since a plain class cannot take h5t's ``extras=`` class keyword -- it
+    applies to the dataset's attributes exactly as ``Dataset``'s ``extras=`` does.
     """
 
-    data_attr: str
+    data: str
+    attrs: str | None = None
     extras: Literal["ignore", "forbid"] = "ignore"
 
 
@@ -81,7 +84,8 @@ class ForeignSpec:
 
     record_type: type
     spec: ClassSpec
-    data_attr: str
+    data: str
+    attrs: str | None
     lazy: bool
 
 

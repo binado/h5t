@@ -285,6 +285,12 @@ def _is_ndarray_annotation(core: Any) -> bool:
     return False
 
 
+def _is_mapping_annotation(core: Any) -> bool:
+    """Report whether ``core`` denotes a ``Mapping`` (bare, subscripted, or ``dict``)."""
+    origin = typing.get_origin(core) or core
+    return isinstance(origin, type) and issubclass(origin, Mapping)
+
+
 def _is_scalar_annotation(core: Any) -> bool:
     if core in _SCALAR_TYPES or typing.get_origin(core) is Literal:
         return True
@@ -316,8 +322,6 @@ def _field_spec(
         raise _schema_error(owner, py_name, "Attr and Eager cannot be combined")
     if payload_marker is not None and attr_marker is not None:
         raise _schema_error(owner, py_name, "Attr and Payload cannot be combined")
-    if payload_marker is not None and eager_marker is not None:
-        raise _schema_error(owner, py_name, "Eager and Payload cannot be combined")
 
     is_dataset = isinstance(core, type) and issubclass(core, Dataset)
     is_group = isinstance(core, type) and issubclass(core, Group)
@@ -337,6 +341,10 @@ def _field_spec(
         kind = MemberKind.DATASET
         member_type = core
         foreign = _foreign_spec(core, payload_marker, owner, py_name)
+        if eager_marker is not None and not foreign.lazy:
+            # A plain np.ndarray payload is already eager; Eager is only a prefetch
+            # hint for a LazyArray payload (see _load_foreign_dataset).
+            raise _schema_error(owner, py_name, "Eager and Payload cannot be combined")
     elif is_dataset:
         kind = MemberKind.DATASET
         member_type = core
@@ -396,7 +404,8 @@ def _field_spec(
     )
 
 
-_FOREIGN_CACHE: weakref.WeakKeyDictionary[type, dict[tuple[str, Extras], ForeignSpec]] = (
+_ForeignCacheKey = tuple[str, str | None, Extras]
+_FOREIGN_CACHE: weakref.WeakKeyDictionary[type, dict[_ForeignCacheKey, ForeignSpec]] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -404,7 +413,7 @@ _FOREIGN_CACHE: weakref.WeakKeyDictionary[type, dict[tuple[str, Extras], Foreign
 def _foreign_spec(record_type: type, marker: Payload, owner: type, py_name: str) -> ForeignSpec:
     """Compile a plain ``record_type`` into a dataset record's fields and payload.
 
-    Cached per ``(record_type, data_attr, extras)``, since the same foreign class may
+    Cached per ``(record_type, data, attrs, extras)``, since the same foreign class may
     be reused as a ``Payload`` target from more than one field or schema. Foreign
     annotations resolve against ``record_type``'s module globals and class dict only
     (see ``_resolved_annotations``'s ``scope=None`` default): there is no
@@ -420,7 +429,7 @@ def _foreign_spec(record_type: type, marker: Payload, owner: type, py_name: str)
         ) from None
 
     cache = _FOREIGN_CACHE.setdefault(record_type, {})
-    cache_key = (marker.data_attr, extras)
+    cache_key: _ForeignCacheKey = (marker.data, marker.attrs, extras)
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
@@ -447,14 +456,14 @@ def _foreign_spec(record_type: type, marker: Payload, owner: type, py_name: str)
                     continue  # derived; cannot be passed to the constructor
             annotations[field_name] = field_annotation
 
-    if marker.data_attr not in annotations:
+    if marker.data not in annotations:
         raise _schema_error(
             owner,
             py_name,
-            f"Payload data_attr {marker.data_attr!r} is not a field of {record_type.__name__}",
+            f"Payload data {marker.data!r} is not a field of {record_type.__name__}",
         )
-    payload_annotation = annotations.pop(marker.data_attr)
-    payload_core, _, _ = _split_annotation(record_type, marker.data_attr, payload_annotation)
+    payload_annotation = annotations.pop(marker.data)
+    payload_core, _, _ = _split_annotation(record_type, marker.data, payload_annotation)
     if _is_ndarray_annotation(payload_core):
         lazy = False
     elif isinstance(payload_core, type) and issubclass(payload_core, LazyArray):
@@ -463,8 +472,24 @@ def _foreign_spec(record_type: type, marker: Payload, owner: type, py_name: str)
         raise _schema_error(
             owner,
             py_name,
-            f"Payload field {marker.data_attr!r} must be annotated np.ndarray or LazyArray",
+            f"Payload field {marker.data!r} must be annotated np.ndarray or LazyArray",
         )
+
+    if marker.attrs is not None:
+        if marker.attrs not in annotations:
+            raise _schema_error(
+                owner,
+                py_name,
+                f"Payload attrs {marker.attrs!r} is not a field of {record_type.__name__}",
+            )
+        attrs_annotation = annotations.pop(marker.attrs)
+        attrs_core, _, _ = _split_annotation(record_type, marker.attrs, attrs_annotation)
+        if not _is_mapping_annotation(attrs_core):
+            raise _schema_error(
+                owner,
+                py_name,
+                f"Payload attrs field {marker.attrs!r} must be annotated Mapping",
+            )
 
     fields: dict[str, FieldSpec] = {}
     for field_name, field_annotation in annotations.items():
@@ -491,7 +516,8 @@ def _foreign_spec(record_type: type, marker: Payload, owner: type, py_name: str)
     foreign = ForeignSpec(
         record_type=record_type,
         spec=ClassSpec(tuple(fields.values()), extras),
-        data_attr=marker.data_attr,
+        data=marker.data,
+        attrs=marker.attrs,
         lazy=lazy,
     )
     cache[cache_key] = foreign
@@ -583,7 +609,8 @@ def _foreign_equivalent(left: ForeignSpec | None, right: ForeignSpec | None) -> 
         return left is right
     return (
         left.record_type is right.record_type
-        and left.data_attr == right.data_attr
+        and left.data == right.data
+        and left.attrs == right.attrs
         and left.lazy == right.lazy
         and left.spec.extras is right.spec.extras
     )
@@ -802,7 +829,7 @@ def _load_dataset(
 
 
 def _load_foreign_dataset(
-    foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str
+    foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str, *, eager: bool = False
 ) -> Any:
     """Load ``node`` into an instance of ``foreign.record_type`` via its constructor."""
     spec = foreign.spec
@@ -814,11 +841,17 @@ def _load_foreign_dataset(
         values[field.py_name] = _load_attribute(field, raw, attrs, path)
 
     if foreign.lazy:
-        values[foreign.data_attr] = LazyArray(
-            filename, path, tuple(node.shape), np.dtype(node.dtype)
+        values[foreign.data] = LazyArray(
+            filename,
+            path,
+            tuple(node.shape),
+            np.dtype(node.dtype),
+            data=np.asarray(node[()]) if eager else None,
         )
     else:
-        values[foreign.data_attr] = np.asarray(node[()])
+        values[foreign.data] = np.asarray(node[()])
+    if foreign.attrs is not None:
+        values[foreign.attrs] = MappingProxyType(attrs)
 
     try:
         return foreign.record_type(**values)
@@ -861,7 +894,9 @@ def _load_group(group_type: type[Group], group: h5py.Group, filename: str, path:
             if not isinstance(node, h5py.Dataset):
                 raise ValidationError(member_path, "expected a dataset, found a group")
             if field.foreign is not None:
-                value = _load_foreign_dataset(field.foreign, node, filename, member_path)
+                value = _load_foreign_dataset(
+                    field.foreign, node, filename, member_path, eager=field.eager
+                )
             else:
                 assert field.member_type is not None
                 dataset_type = typing.cast(type[Dataset], field.member_type)

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import numpy as np
 
@@ -23,6 +24,7 @@ class Nested(h5t.Group):
 class Recording:
     unit: str
     payload: np.ndarray
+    attrs: Mapping[str, Any]
 
 
 class Result(h5t.Group):
@@ -33,7 +35,7 @@ class Result(h5t.Group):
     nested: Nested
     optional: str | None
     defaulted: int = 3
-    recording: Annotated[Recording, h5t.Payload("payload")]
+    recording: Annotated[Recording, h5t.Payload("payload", attrs="attrs")]
 
 
 result: Result = Result.from_file(Path("result.h5"))
@@ -46,3 +48,4 @@ optional: str | None = result.optional
 defaulted: int = result.defaulted
 recording: Recording = result.recording
 recording_payload: np.ndarray = result.recording.payload
+attrs: Mapping[str, Any] = result.recording.attrs

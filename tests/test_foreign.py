@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import h5py
 import numpy as np
@@ -44,7 +45,7 @@ def test_payload_field_named_data_compiles(result_file: Path) -> None:
 
     fields = {field.py_name: field for field in Owner.__h5spec__.fields}
     assert fields["measurement"].foreign is not None
-    assert fields["measurement"].foreign.data_attr == "data"
+    assert fields["measurement"].foreign.data == "data"
     Owner.from_file(result_file)  # does not raise
 
 
@@ -55,6 +56,37 @@ def test_defaults_and_optional_attrs_match_dataset_semantics(result_file: Path) 
     result = Owner.from_file(result_file)
     assert result.measurement.note is None
     assert result.measurement.revision == 9  # from default_factory, absent from file
+
+
+def test_attrs_binding_snapshots_validated_and_raw_values(result_file: Path) -> None:
+    @dataclasses.dataclass
+    class WithAttrs:
+        unit: str
+        data: np.ndarray
+        attrs: Mapping[str, Any]
+
+    class Owner(h5t.Group):
+        measurement: Annotated[WithAttrs, h5t.Payload("data", attrs="attrs")]
+
+    result = Owner.from_file(result_file)
+    snapshot = result.measurement.attrs
+    assert snapshot["unit"] == "m"  # declared: validated value
+    assert snapshot["extra"] == "measurement"  # undeclared: reachable raw
+
+
+def test_eager_on_lazy_payload_prefills_without_a_second_read(result_file: Path) -> None:
+    class Owner(h5t.Group):
+        measurement: Annotated[LazyMeasurement, h5t.Payload("data"), h5t.Eager()]
+
+    result = Owner.from_file(result_file)
+    measurement = result.measurement
+    assert isinstance(measurement.data, h5t.LazyArray)
+
+    with h5py.File(result_file, "a") as file:
+        file["measurement"][...] = np.arange(5) + 10
+
+    # Prefilled during from_file: the post-load mutation above must not be seen.
+    assert np.array_equal(measurement.data.data, np.arange(5))
 
 
 def test_lazy_payload_snapshot_reads_once_and_caches(result_file: Path) -> None:
