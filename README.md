@@ -1,9 +1,22 @@
 # h5t
 
+[![PyPI](https://img.shields.io/pypi/v/h5t.svg)](https://pypi.org/project/h5t/)
+[![Python versions](https://img.shields.io/pypi/pyversions/h5t.svg)](https://pypi.org/project/h5t/)
+[![CI](https://github.com/binado/h5t/actions/workflows/ci.yml/badge.svg)](https://github.com/binado/h5t/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/binado/h5t/blob/main/LICENSE)
+
 `h5t` loads HDF5 groups into detached, typed Python records. Group attributes and
 ordinary NumPy-array fields are materialized while the file is open. Typed datasets
 keep snapshot metadata and can read their payload lazily without retaining an open
 file descriptor.
+
+## Installation
+
+```bash
+pip install h5t     # or: uv add h5t
+```
+
+Requires Python 3.11+. `h5py`, `numpy`, and Pydantic v2 are installed automatically.
 
 ## Example
 
