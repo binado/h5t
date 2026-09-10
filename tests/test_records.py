@@ -176,6 +176,27 @@ def test_eager_marker_prefills_a_decorated_lazy_payload(result_file: Path) -> No
     assert np.array_equal(result.measurement.data.data, np.arange(5))
 
 
+def test_decorated_record_preserves_custom_lazyarray_subclass(result_file: Path) -> None:
+    class CustomLazyArray(h5t.LazyArray):
+        pass
+
+    @h5t.dataset(data="data")
+    @dataclasses.dataclass
+    class Recording:
+        unit: str
+        data: CustomLazyArray
+
+    class Owner(h5t.Group):
+        measurement: Annotated[Recording, h5t.Eager()]
+
+    measurement = Owner.from_file(result_file).measurement
+    assert type(measurement.data) is CustomLazyArray
+
+    with h5py.File(result_file, "a") as file:
+        file["measurement"][...] = np.arange(5) + 10
+    assert np.array_equal(measurement.data.data, np.arange(5))
+
+
 def test_eager_marker_on_an_ndarray_decorated_payload_is_schema_error() -> None:
     @h5t.dataset(data="data")
     @dataclasses.dataclass

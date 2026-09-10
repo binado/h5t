@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import TypeAdapter
 
+from h5t._array import LazyArray
+
 
 @dataclass(frozen=True)
 class Name:
@@ -95,7 +97,7 @@ class ForeignSpec:
     kind: RecordKind
     data: str | None
     attrs: str | None
-    lazy: bool
+    lazy_type: type[LazyArray] | None
     signature: inspect.Signature | None
 
 

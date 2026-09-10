@@ -318,7 +318,7 @@ def _reject_eager_on_eager_payload(
     owner: type, py_name: str, eager_marker: Eager | None, foreign: ForeignSpec
 ) -> None:
     """Eager is only a prefetch hint for a LazyArray payload; an np.ndarray one already is."""
-    if eager_marker is not None and not foreign.lazy:
+    if eager_marker is not None and foreign.lazy_type is None:
         raise _schema_error(owner, py_name, "Eager and Payload cannot be combined")
 
 
@@ -565,7 +565,7 @@ def _compile_foreign_fields(
     except Exception as exc:
         raise _schema_error(owner, py_name, f"cannot inspect constructor: {exc}") from exc
 
-    lazy = False
+    lazy_type: type[LazyArray] | None = None
     if kind is RecordKind.DATASET:
         assert data is not None
         if data not in annotations:
@@ -575,9 +575,9 @@ def _compile_foreign_fields(
         payload_annotation = annotations.pop(data)
         payload_core, _, _ = _split_annotation(record_type, data, payload_annotation)
         if _is_ndarray_annotation(payload_core):
-            lazy = False
+            lazy_type = None
         elif isinstance(payload_core, type) and issubclass(payload_core, LazyArray):
-            lazy = True
+            lazy_type = payload_core
         else:
             raise _schema_error(
                 owner, py_name, f"Payload field {data!r} must be annotated np.ndarray or LazyArray"
@@ -628,7 +628,7 @@ def _compile_foreign_fields(
         kind=kind,
         data=data if kind is RecordKind.DATASET else None,
         attrs=attrs,
-        lazy=lazy,
+        lazy_type=lazy_type,
         signature=signature,
     )
 
@@ -874,7 +874,7 @@ def _foreign_equivalent(left: ForeignSpec | None, right: ForeignSpec | None) -> 
         and left.kind is right.kind
         and left.data == right.data
         and left.attrs == right.attrs
-        and left.lazy == right.lazy
+        and left.lazy_type is right.lazy_type
         and left.spec.extras is right.spec.extras
     )
 
@@ -1139,8 +1139,8 @@ def _load_foreign_dataset(
         values[field.py_name] = _load_attribute(field, raw, attrs, path)
 
     assert foreign.data is not None
-    if foreign.lazy:
-        values[foreign.data] = LazyArray(
+    if foreign.lazy_type is not None:
+        values[foreign.data] = foreign.lazy_type(
             filename,
             path,
             tuple(node.shape),

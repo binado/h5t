@@ -25,6 +25,10 @@ class _WithDefaults:
     revision: int = dataclasses.field(default_factory=lambda: 9)
 
 
+class _CustomLazyArray(h5t.LazyArray):
+    pass
+
+
 def test_eager_payload_is_materialized_and_attrs_validate(result_file: Path) -> None:
     class Owner(h5t.Group):
         measurement: Annotated[PlainMeasurement, h5t.Payload("data")]
@@ -130,6 +134,23 @@ def test_eager_on_lazy_payload_prefills_without_a_second_read(result_file: Path)
 
     # Prefilled during from_file: the post-load mutation above must not be seen.
     assert np.array_equal(measurement.data.data, np.arange(5))
+
+
+def test_payload_preserves_custom_lazyarray_subclass(result_file: Path) -> None:
+    @dataclasses.dataclass
+    class Recording:
+        unit: str
+        data: _CustomLazyArray
+
+    class Owner(h5t.Group):
+        measurement: Annotated[Recording, h5t.Payload("data")]
+
+    measurement = Owner.from_file(result_file).measurement
+    assert type(measurement.data) is _CustomLazyArray
+
+    with h5py.File(result_file, "a") as file:
+        file["measurement"][...] = np.arange(5) + 10
+    assert np.array_equal(measurement.data.data, np.arange(5) + 10)
 
 
 def test_lazy_payload_snapshot_reads_once_and_caches(result_file: Path) -> None:

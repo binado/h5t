@@ -33,8 +33,8 @@ Four modules, one direction of dependency (`_cli` → `_compile` → `_array`/`_
   compiled IR: `FieldSpec` (one field: HDF5 name, `MemberKind`, cached Pydantic `TypeAdapter`,
   default, default factory, converter, an optional `ForeignSpec`) and `ClassSpec` (a class's
   flattened fields + `Extras` policy). `ForeignSpec` is the compiled IR for a `Payload` field: the
-  foreign record type, its own `ClassSpec`, which of its fields holds the payload, whether that
-  payload is a `LazyArray`, which field (if any) receives the attrs snapshot, and the inspected
+  foreign record type, its own `ClassSpec`, which of its fields holds the payload, the declared
+  `LazyArray` type when the payload is lazy, which field (if any) receives the attrs snapshot, and
   constructor signature when one is available. Also the path formatters `child_path` / `attr_path`
   (`/group/child`, `/group@attr`) used in every error.
 - **`_array.py`** — `LazyArray`, the detached, lazily-read dataset payload (filename/path/shape/
@@ -171,7 +171,7 @@ value in the `attrs` snapshot, so `attrs` always contains every declared attribu
 a base's field; two unrelated bases declaring the same name must be *equivalent* per
 `_fields_equivalent`, which compares `repr()` of annotation and default rather than `==` to avoid
 ndarray-truthiness ambiguity and adapter identity, plus `_foreign_equivalent` (record type,
-`data`, `attrs`, `lazy`, extras policy) for a `Payload` field. `extras` is inherited from the
+`data`, `attrs`, `lazy_type`, extras policy) for a `Payload` field. `extras` is inherited from the
 nearest compiled base unless the subclass passes it explicitly.
 
 ### Foreign record types (`Payload`, `@h5t.dataset`, `@h5t.group`)
