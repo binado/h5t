@@ -34,8 +34,9 @@ Four modules, one direction of dependency (`_cli` → `_compile` → `_array`/`_
   default, default factory, converter, an optional `ForeignSpec`) and `ClassSpec` (a class's
   flattened fields + `Extras` policy). `ForeignSpec` is the compiled IR for a `Payload` field: the
   foreign record type, its own `ClassSpec`, which of its fields holds the payload, whether that
-  payload is a `LazyArray`, and which field (if any) receives the attrs snapshot. Also the path
-  formatters `child_path` / `attr_path` (`/group/child`, `/group@attr`) used in every error.
+  payload is a `LazyArray`, which field (if any) receives the attrs snapshot, and the inspected
+  constructor signature when one is available. Also the path formatters `child_path` / `attr_path`
+  (`/group/child`, `/group@attr`) used in every error.
 - **`_array.py`** — `LazyArray`, the detached, lazily-read dataset payload (filename/path/shape/
   dtype snapshot, `.data`/`.read()`/`.open()`). `Dataset` delegates to an internal `_h5t_array:
   LazyArray` rather than duplicating this state; a `Payload` field with a `LazyArray`-typed member
@@ -184,13 +185,16 @@ shapes apart: `DATASET` (a `Payload` field or `@h5t.dataset`) names one field as
 like a `Group` subclass does. `ForeignSpec.data` is `str | None` because only a `DATASET`-kind
 record has one.
 
-`_foreign_spec` compiles a foreign type once per `(kind, data, attrs, extras)` (cached in a
-`WeakKeyDictionary` keyed on the record type) by delegating to `_compile_foreign_fields`, which
-walks the type's MRO collecting annotations, resolves the payload (`DATASET` only) and `attrs=`
-fields, then builds every remaining field via `_field_spec(..., dataset_owner=(kind is
-RecordKind.DATASET))`. `dataset_owner=True` is what still forces a `DATASET`-kind record to declare
-only attributes (`_field_spec`'s `"a dataset record may declare only attributes"` check); a
-`GROUP`-kind record skips it, since — like `Group` — it may reference other schema types.
+`_foreign_spec` compiles a foreign type once per `(kind, data, attrs, extras)` by delegating to
+`_compile_foreign_fields`. The outer cache has weak record-type keys and each per-type cache has
+weak `ForeignSpec` values: a live decorated marker or owner `FieldSpec` keeps a spec reusable,
+without the cached spec's `record_type` back-reference pinning an otherwise transient class. The
+compiler walks the type's MRO collecting annotations and their declaring classes, resolves the
+payload (`DATASET` only) and `attrs=` fields, then builds every remaining field via
+`_field_spec(..., dataset_owner=(kind is RecordKind.DATASET))`. `dataset_owner=True` is what still
+forces a `DATASET`-kind record to declare only attributes (`_field_spec`'s `"a dataset record may
+declare only attributes"` check); a `GROUP`-kind record skips it, since — like `Group` — it may
+reference other schema types.
 
 **Why `DATASET` stays eager and `GROUP` defers.** A `DATASET`-kind record can only declare
 attributes, so it can never forward-reference another schema type; compiling it immediately is
@@ -220,26 +224,30 @@ Four more things fall out of how pydantic and dataclasses actually behave, verif
 pinned versions in `.venv`:
 
 1. `TypeAdapter(SomeDataclass, config=ConfigDict(...))` raises `PydanticUserError` — pydantic
-   rejects `config=` alongside a dataclass/BaseModel/TypedDict type — and dropping `config=` buys
-   nothing either, since `validate_python(instance)` on an already-built instance is a no-op. A
-   record field therefore gets no member-level adapter for the record type itself: `_field_spec`
-   builds it from `Any` (which accepts the constructed instance unchanged) whenever `foreign is not
-   None or is_record` — the `is_record` half covers a `GROUP`-kind member, whose `foreign` stays
-   `None` but is just as much a dataclass pydantic would otherwise choke on — while keeping the
-   record type as `FieldSpec.annotation` for repr/equivalence purposes only.
+   rejects `config=` alongside a dataclass/BaseModel/TypedDict type — and a full unconfigured
+   adapter would revalidate the record's fields. `_build_record_adapter` instead uses an
+   unconfigured `InstanceOf` adapter (or `dict` for a TypedDict runtime value), preserving
+   optionality. It accepts constructed records unchanged while still rejecting a wrong-typed
+   class-body default or default-factory result. The record type itself remains
+   `FieldSpec.annotation` for repr/equivalence purposes.
 2. `dataclasses.field(default_factory=...)` leaves **no** class attribute, so reading defaults off
    `cls.__dict__` (as `_own_fields` does for h5t's own classes) would silently report such a field
    as required. `_compile_foreign_fields` reads defaults from `dataclasses.fields()` instead when
    the record type is a dataclass, carrying a `default_factory` separately on `FieldSpec` and
-   calling it from `_missing_value` before validation.
+   calling it from `_missing_value` before validation. For a non-dataclass it reads a default from
+   the class that declared the final annotation, then falls back to a concrete default exposed by
+   the inspected constructor signature; the latter covers model frameworks that remove field
+   defaults from the class dictionary.
 3. `dir()` on a plain dataclass yields only its own field names, so `_check_fields`'s reserved-name
    half has nothing to forbid there — only `_check_duplicate_names` (the half checking for repeated
    HDF5 names, extracted out for reuse) applies to a foreign record's fields.
 4. `object.__new__` + `object.__setattr__` works even on a `frozen=True, slots=True` dataclass, but
    skips `__init__`/`__post_init__` — wrong for a type that is the user's own. `_load_foreign_dataset`
    and `_load_foreign_group` both call the real constructor through the shared `_construct_record`
-   (`record_type(**values)`): a `TypeError` (signature mismatch) becomes `SchemaError`, any other
-   failure (including a `__post_init__` invariant) becomes `ValidationError` at the node's path.
+   (`record_type(**values)`). It pre-binds the cached signature, making only an argument-binding
+   `TypeError` a `SchemaError`; failures raised after user code starts, including a `TypeError` from
+   `__post_init__`, become `ValidationError` at the node's path. For an uninspectable callable, the
+   traceback's presence or absence of a constructor frame is the fallback distinction.
 
 Foreign annotations resolve only against the record type's module globals and class dict by
 default — `_resolved_annotations(base)` is called with no `scope`. An `Annotated[T, Payload(...)]`

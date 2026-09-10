@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -95,6 +96,7 @@ class ForeignSpec:
     data: str | None
     attrs: str | None
     lazy: bool
+    signature: inspect.Signature | None
 
 
 @dataclass(frozen=True)

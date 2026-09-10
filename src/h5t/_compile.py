@@ -19,7 +19,7 @@ from typing import Annotated, Any, ClassVar, Literal, Self
 
 import h5py
 import numpy as np
-from pydantic import ConfigDict, TypeAdapter
+from pydantic import ConfigDict, InstanceOf, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from h5t._array import LazyArray
@@ -246,6 +246,22 @@ def _build_adapter(owner: type, py_name: str, annotation: Any) -> TypeAdapter[An
         raise _schema_error(owner, py_name, f"cannot construct a validator: {exc}") from exc
 
 
+def _build_record_adapter(
+    owner: type, py_name: str, record_type: type, optional: bool
+) -> TypeAdapter[Any]:
+    """Build an instance-only adapter without inspecting a record's own fields."""
+    runtime_type = dict if typing.is_typeddict(record_type) else record_type
+    annotation: Any = InstanceOf.__class_getitem__(runtime_type)
+    if optional:
+        annotation = annotation | None
+    try:
+        # Passing config for a dataclass/BaseModel/TypedDict is rejected by pydantic.
+        # InstanceOf needs no arbitrary-types config and does not revalidate fields.
+        return TypeAdapter(annotation)
+    except Exception as exc:
+        raise _schema_error(owner, py_name, f"cannot construct a validator: {exc}") from exc
+
+
 def _marker(metadata: list[Any], marker_type: type, owner: type, py_name: str) -> Any | None:
     found = [item for item in metadata if isinstance(item, marker_type)]
     if len(found) > 1:
@@ -408,16 +424,12 @@ def _field_spec(
         raise _schema_error(owner, py_name, "a child Name cannot contain '/'")
 
     if foreign is not None or is_record:
-        # A member-level TypeAdapter cannot validate a foreign record: pydantic
-        # rejects `config=` alongside a dataclass/BaseModel/TypedDict type, and
-        # revalidating an already-built instance without one is a no-op anyway
-        # (see AGENTS.md). Any accepts the constructed instance unchanged; keep
-        # the record type itself as `annotation` for repr/equivalence purposes.
-        # `is_record` also covers a GROUP-kind record field, whose `foreign` local
-        # stays None (resolved lazily at load time) but is just as much a dataclass
-        # pydantic would otherwise choke on.
+        # Validate only the constructed/default value's runtime type. A normal
+        # configured TypeAdapter is rejected for dataclasses/BaseModels/TypedDicts,
+        # while an unconfigured full adapter would revalidate the record's fields.
+        # `is_record` also covers GROUP-kind records resolved lazily at load time.
         adapter_ann = core
-        adapter = _build_adapter(owner, py_name, Any)
+        adapter = _build_record_adapter(owner, py_name, core, optional)
     else:
         adapter_ann = _adapter_annotation(core, metadata, optional)
         adapter = _build_adapter(owner, py_name, adapter_ann)
@@ -439,9 +451,9 @@ def _field_spec(
 
 
 _ForeignCacheKey = tuple[RecordKind, str | None, str | None, Extras]
-_FOREIGN_CACHE: weakref.WeakKeyDictionary[type, dict[_ForeignCacheKey, ForeignSpec]] = (
-    weakref.WeakKeyDictionary()
-)
+_FOREIGN_CACHE: weakref.WeakKeyDictionary[
+    type, weakref.WeakValueDictionary[_ForeignCacheKey, ForeignSpec]
+] = weakref.WeakKeyDictionary()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -531,6 +543,7 @@ def _compile_foreign_fields(
     dc_fields = {f.name: f for f in dataclasses.fields(record_type)} if is_dataclass_type else {}
 
     annotations: dict[str, Any] = {}
+    annotation_owners: dict[str, type] = {}
     for base in reversed(record_type.__mro__):
         if base is object:
             continue
@@ -543,6 +556,14 @@ def _compile_foreign_fields(
                 if dc_field is not None and not dc_field.init:
                     continue  # derived; cannot be passed to the constructor
             annotations[field_name] = field_annotation
+            annotation_owners[field_name] = base
+
+    try:
+        signature = inspect.signature(record_type)
+    except (TypeError, ValueError):
+        signature = None
+    except Exception as exc:
+        raise _schema_error(owner, py_name, f"cannot inspect constructor: {exc}") from exc
 
     lazy = False
     if kind is RecordKind.DATASET:
@@ -578,14 +599,19 @@ def _compile_foreign_fields(
     for field_name, field_annotation in annotations.items():
         default: Any = _NO_DEFAULT
         default_factory: Callable[[], Any] | None = None
-        if is_dataclass_type:
-            dc_field = dc_fields[field_name]
+        dc_field = dc_fields.get(field_name) if is_dataclass_type else None
+        if dc_field is not None:
             if dc_field.default is not dataclasses.MISSING:
                 default = dc_field.default
             elif dc_field.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
                 default_factory = dc_field.default_factory
         else:
-            default = record_type.__dict__.get(field_name, _NO_DEFAULT)
+            declaring_type = annotation_owners[field_name]
+            default = declaring_type.__dict__.get(field_name, _NO_DEFAULT)
+            if default is _NO_DEFAULT and signature is not None:
+                parameter = signature.parameters.get(field_name)
+                if parameter is not None and parameter.default is not inspect.Parameter.empty:
+                    default = parameter.default
         fields[field_name] = _field_spec(
             record_type,
             field_name,
@@ -603,6 +629,7 @@ def _compile_foreign_fields(
         data=data if kind is RecordKind.DATASET else None,
         attrs=attrs,
         lazy=lazy,
+        signature=signature,
     )
 
 
@@ -642,7 +669,10 @@ def _foreign_spec(
             owner, py_name, f"extras must be 'ignore' or 'forbid', got {extras_raw!r}"
         ) from None
 
-    cache = _FOREIGN_CACHE.setdefault(record_type, {})
+    cache = _FOREIGN_CACHE.get(record_type)
+    if cache is None:
+        cache = weakref.WeakValueDictionary()
+        _FOREIGN_CACHE[record_type] = cache
     cache_key: _ForeignCacheKey = (kind, data, attrs, extras)
     cached = cache.get(cache_key)
     if cached is not None:
@@ -1064,19 +1094,32 @@ def _load_dataset(
 def _construct_record(foreign: ForeignSpec, values: dict[str, Any], path: str) -> Any:
     """Build ``foreign.record_type(**values)``, mapping constructor failures to h5t errors.
 
-    ``TypeError`` means the loaded fields do not match the constructor's signature: a
-    schema/record mismatch, not a data problem, so it becomes ``SchemaError``. Anything
-    else -- typically a ``__post_init__`` invariant -- is a data problem at this node's
-    path, so it becomes ``ValidationError``.
+    Argument-binding failures are schema/record mismatches and become ``SchemaError``.
+    Failures raised after entering user code are data problems at this node's path and
+    become ``ValidationError``.
     """
+    if foreign.signature is not None:
+        try:
+            foreign.signature.bind(**values)
+        except TypeError as exc:
+            raise SchemaError(
+                f"{foreign.record_type.__name__}: cannot construct from loaded fields: {exc}"
+            ) from exc
     try:
         return foreign.record_type(**values)
-    except TypeError as exc:
-        raise SchemaError(
-            f"{foreign.record_type.__name__}: cannot construct from loaded fields: {exc}"
-        ) from exc
     except (ValidationError, SchemaError):
         raise
+    except TypeError as exc:
+        # Without an inspectable signature, a Python binding error has no constructor
+        # frame. If user code was entered, the traceback continues beyond this frame.
+        if foreign.signature is None and exc.__traceback__ is not None:
+            if exc.__traceback__.tb_next is None:
+                raise SchemaError(
+                    f"{foreign.record_type.__name__}: cannot construct from loaded fields: {exc}"
+                ) from exc
+        raise ValidationError(
+            path, f"{foreign.record_type.__name__} constructor failed: {exc}"
+        ) from exc
     except Exception as exc:
         raise ValidationError(
             path, f"{foreign.record_type.__name__} constructor failed: {exc}"

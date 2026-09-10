@@ -10,6 +10,7 @@ from typing import Annotated, Any
 import h5py
 import numpy as np
 import pytest
+from pydantic import BaseModel, ConfigDict
 
 import h5t
 
@@ -56,6 +57,48 @@ def test_defaults_and_optional_attrs_match_dataset_semantics(result_file: Path) 
     result = Owner.from_file(result_file)
     assert result.measurement.note is None
     assert result.measurement.revision == 9  # from default_factory, absent from file
+
+
+def test_inherited_plain_class_default_is_loaded_and_snapshotted(result_file: Path) -> None:
+    class Base:
+        revision: int = 9
+
+    class Recording(Base):
+        unit: str
+        data: np.ndarray
+        attrs: Mapping[str, Any]
+
+        def __init__(
+            self, *, revision: int, unit: str, data: np.ndarray, attrs: Mapping[str, Any]
+        ) -> None:
+            self.revision = revision
+            self.unit = unit
+            self.data = data
+            self.attrs = attrs
+
+    class Owner(h5t.Group):
+        measurement: Annotated[Recording, h5t.Payload("data", attrs="attrs")]
+
+    result = Owner.from_file(result_file).measurement
+    assert result.revision == 9
+    assert result.attrs["revision"] == 9
+
+
+def test_constructor_signature_default_is_loaded_for_pydantic_model(result_file: Path) -> None:
+    class Recording(BaseModel):
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+
+        unit: str
+        data: np.ndarray
+        attrs: Mapping[str, Any]
+        scale: float = 1.0
+
+    class Owner(h5t.Group):
+        measurement: Annotated[Recording, h5t.Payload("data", attrs="attrs")]
+
+    result = Owner.from_file(result_file).measurement
+    assert result.scale == 1.0
+    assert result.attrs["scale"] == 1.0
 
 
 def test_attrs_binding_snapshots_validated_and_raw_values(result_file: Path) -> None:
@@ -147,6 +190,38 @@ def test_post_init_invariant_surfaces_as_validation_error_with_path(result_file:
     with pytest.raises(h5t.ValidationError, match="expected seconds") as caught:
         Owner.from_file(result_file)
     assert caught.value.path == "/measurement"
+
+
+def test_type_error_from_post_init_is_a_validation_error(result_file: Path) -> None:
+    @dataclasses.dataclass
+    class Strict:
+        unit: str
+        data: np.ndarray
+
+        def __post_init__(self) -> None:
+            raise TypeError("invalid measurement invariant")
+
+    class Owner(h5t.Group):
+        measurement: Annotated[Strict, h5t.Payload("data")]
+
+    with pytest.raises(h5t.ValidationError, match="invalid measurement invariant") as caught:
+        Owner.from_file(result_file)
+    assert caught.value.path == "/measurement"
+
+
+def test_constructor_signature_mismatch_is_a_schema_error(result_file: Path) -> None:
+    class Mismatched:
+        unit: str
+        data: np.ndarray
+
+        def __init__(self, *, unit: str) -> None:
+            self.unit = unit
+
+    class Owner(h5t.Group):
+        measurement: Annotated[Mismatched, h5t.Payload("data")]
+
+    with pytest.raises(h5t.SchemaError, match="cannot construct from loaded fields"):
+        Owner.from_file(result_file)
 
 
 def test_missing_data_attr_field_is_schema_error() -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import gc
+import weakref
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any
@@ -50,6 +52,79 @@ def test_decorator_validates_eagerly_at_the_records_own_definition() -> None:
         class Bad:
             unit: str
             data: np.ndarray
+
+
+def test_foreign_cache_reuses_live_specs_without_retaining_record_classes() -> None:
+    @dataclasses.dataclass
+    class Recording:
+        unit: str
+        data: np.ndarray
+
+    class First(h5t.Group):
+        measurement: Annotated[Recording, h5t.Payload("data")]
+
+    class Second(h5t.Group):
+        measurement: Annotated[Recording, h5t.Payload("data")]
+
+    first = {field.py_name: field for field in First.__h5spec__.fields}["measurement"]
+    second = {field.py_name: field for field in Second.__h5spec__.fields}["measurement"]
+    assert first.foreign is second.foreign
+
+    def make_transient() -> weakref.ReferenceType[type]:
+        @h5t.dataset(data="data")
+        @dataclasses.dataclass
+        class Transient:
+            unit: str
+            data: np.ndarray
+
+        return weakref.ref(Transient)
+
+    transient = make_transient()
+    gc.collect()
+    assert transient() is None
+
+    def make_payload_transient() -> weakref.ReferenceType[type]:
+        @dataclasses.dataclass
+        class TransientRecord:
+            unit: str
+            data: np.ndarray
+
+        h5t._compile._foreign_spec(
+            TransientRecord,
+            TransientRecord,
+            "measurement",
+            kind=h5t._spec.RecordKind.DATASET,
+            data="data",
+            attrs=None,
+            extras_raw="ignore",
+        )
+        return weakref.ref(TransientRecord)
+
+    record_ref = make_payload_transient()
+    gc.collect()
+    assert record_ref() is None
+
+
+def test_decorated_record_defaults_are_instance_checked(result_file: Path) -> None:
+    @h5t.group()
+    @dataclasses.dataclass
+    class Child:
+        answer: int
+
+    @h5t.group()
+    @dataclasses.dataclass
+    class WithInvalidDefault:
+        child: Child = 123  # type: ignore[assignment]
+
+    @h5t.group()
+    @dataclasses.dataclass
+    class WithInvalidFactory:
+        child: Child = dataclasses.field(default_factory=lambda: 123)  # type: ignore[arg-type]
+
+    for schema in (WithInvalidDefault, WithInvalidFactory):
+        with pytest.raises(h5t.ValidationError) as caught:
+            h5t.load(schema, result_file)
+        assert caught.value.path == "/child"
 
 
 def test_decorated_class_is_usable_directly_with_no_annotated_or_payload(
