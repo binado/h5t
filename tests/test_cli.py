@@ -62,6 +62,54 @@ def test_import_failures_exit_two(
     assert capsys.readouterr().err.startswith("error:")
 
 
+def test_group_record_schema_succeeds(result_file: Path, capsys: pytest.CaptureFixture) -> None:
+    assert main(["check", str(result_file), "--schema", "tests.conftest:PlainResult"]) == 0
+    assert capsys.readouterr().out.startswith("ok:")
+
+
+def test_dataset_record_schema_exits_two(result_file: Path, capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["check", str(result_file), "--schema", "tests.conftest:PlainMeasurement"])
+    assert caught.value.code == 2
+    assert "dataset record" in capsys.readouterr().err
+
+
+def test_unresolved_nested_group_record_exits_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    module_name = f"schema_{tmp_path.name.replace('-', '_')}_nested"
+    (tmp_path / f"{module_name}.py").write_text(
+        """\
+from __future__ import annotations
+
+import dataclasses
+
+import h5t
+
+
+@h5t.group()
+@dataclasses.dataclass
+class Inner:
+    later: Later
+
+
+class Owner(h5t.Group):
+    nested: Inner
+"""
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    path = tmp_path / "file.h5"
+    with h5py.File(path, "w") as file:
+        file.create_group("nested").attrs["later"] = 1
+    with pytest.raises(SystemExit) as caught:
+        main(["check", str(path), "--schema", f"{module_name}:Owner"])
+    assert caught.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "Later" in err
+
+
 def test_io_and_invalid_root_exit_two(
     tmp_path: Path, schema_ref: str, capsys: pytest.CaptureFixture
 ) -> None:

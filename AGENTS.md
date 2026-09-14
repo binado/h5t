@@ -22,18 +22,37 @@ as pre-commit hooks (run via `prek`). Commits follow Conventional Commits (`feat
 ## Architecture
 
 `h5t` turns annotated Python classes into read-only loaders for HDF5 groups. The load produces
-**detached** records: `Group.from_file()` closes every handle before returning, and only a
-`Dataset`'s filename/path survive so its payload can be read later.
+**detached** records: `h5t.load()` closes every handle before returning, and only a `Dataset`'s
+(or a `LazyArray` payload's) filename/path survive so its payload can be read later. Plain classes
+decorated with `@h5t.dataset`/`@h5t.group` are the primary API; `Group`/`Dataset` inheritance is
+legacy (see `README.md`) and exists mainly so the two styles can freely mix within one schema.
 
-Three modules, one direction of dependency (`_cli` → `_compile` → `_spec`/`_errors`):
+Four modules, one direction of dependency (`_cli` → `_compile` → `_array`/`_spec`/`_errors`):
 
-- **`_spec.py`** — the public annotation markers (`Name`, `Attr`, `Eager`) and the compiled IR:
-  `FieldSpec` (one field: HDF5 name, `MemberKind`, cached Pydantic `TypeAdapter`, default,
-  converter) and `ClassSpec` (a class's flattened fields + `Extras` policy). Also the path
-  formatters `child_path` / `attr_path` (`/group/child`, `/group@attr`) used in every error.
+- **`_spec.py`** — the public annotation markers (`Name`, `Attr`, `Eager`, `Payload`) and the
+  compiled IR: `FieldSpec` (one field: HDF5 name, `MemberKind`, cached Pydantic `TypeAdapter`,
+  default, default factory, converter, an optional `ForeignSpec`) and `ClassSpec` (a class's
+  flattened fields + `Extras` policy). `ForeignSpec` is the compiled IR for a `Payload` field: the
+  foreign record type, its own `ClassSpec`, which of its fields holds the payload, the declared
+  `LazyArray` type when the payload is lazy, which field (if any) receives the attrs snapshot, and
+  constructor signature when one is available. Also the path formatters `child_path` / `attr_path`
+  (`/group/child`, `/group@attr`) used in every error.
+- **`_array.py`** — `LazyArray`, the detached, lazily-read dataset payload (filename/path/shape/
+  dtype snapshot, `.data`/`.read()`/`.open()`). `Dataset` delegates to an internal `_h5t_array:
+  LazyArray` rather than duplicating this state; a `Payload` field with a `LazyArray`-typed member
+  uses the same class directly.
 - **`_compile.py`** — both halves of the system: annotation → `FieldSpec` compilation, and the
   loader that walks `h5py` nodes producing instances. `MemberKind` (ATTRIBUTE / ARRAY / DATASET /
-  GROUP) is the switch that decides which loading path a field takes in `_load_group`.
+  GROUP) is the switch that decides which loading path a field takes in `_load_group_values`
+  (the body shared by `_load_group` and `_load_foreign_group`). A `Payload` field keeps
+  `MemberKind.DATASET` — `field.foreign is not None` is the finer-grained switch between
+  `_load_dataset` (an `h5t.Dataset` subclass) and `_load_foreign_dataset` (a plain record type,
+  constructed via `record_type(**values)` through the shared `_construct_record`). A `GROUP`-kind
+  record field instead stays `MemberKind.GROUP` and is told apart from a plain `Group` subclass
+  field at load time, by `"__h5t_record__" in field.member_type.__dict__`. `h5t.load(schema, path,
+  root)` is the module's public entry point — it dispatches on `schema` (a `Group` subclass or a
+  decorated record) before opening the file, and both `Group.from_file` and `h5t check` are thin
+  wrappers around it.
 - **`_cli.py`** — `h5t check`, a thin wrapper: import `pkg.mod:Class`, call `from_file`, map
   outcomes to exit codes 0 (ok) / 1 (`ValidationError`) / 2 (import, schema, usage, or I/O error).
 
@@ -100,15 +119,23 @@ frame's live locals as the resolution scope. Consequences to keep in mind:
 ### Instances are built by the loader, never constructed
 
 `Group.__init__` / `Dataset.__init__` raise `TypeError`. `_load_group` / `_load_dataset` use
-`object.__new__` plus `object.__setattr__` to populate fields and the `_h5t_*` internals. Do not
+`object.__new__` plus `object.__setattr__` to populate fields and the `_h5t_*` internals —
+`Dataset`'s only such internal is `_h5t_array: LazyArray`, which its properties delegate to. Do not
 add a working constructor, `__eq__`, or serialization — their absence is asserted by
-`tests/test_loading.py` and `tests/test_compile.py::test_removed_api_is_absent`.
+`tests/test_loading.py` and `tests/test_compile.py::test_removed_api_is_absent`. A decorated record
+is the exception to "never constructed", in both its kinds: `_load_foreign_dataset` (a `Payload`
+field, `@h5t.dataset`) and `_load_foreign_group` (`@h5t.group`) both call `_construct_record`, which
+calls the foreign record type's real `record_type(**values)`, because that type is the user's own
+and is expected to run its own `__init__`/`__post_init__`.
 
 All internal instance state is prefixed `_h5t_`. Two invariants follow from this: `_own_fields`
 skips any annotation starting with `_`, and `_check_fields` rejects a field whose Python name
 collides with a public attribute of `Group`/`Dataset` (computed live via `dir()`). **Adding a
 public method or property to `Group` or `Dataset` therefore breaks user schemas that already use
-that field name** — treat the public surface of those two classes as near-frozen.
+that field name** — treat the public surface of those two classes as near-frozen. This reserved-name
+check does not apply to a `Payload` record type: `dir()` on a plain dataclass yields only its field
+names, so there is nothing to forbid, and a field named `data` (reserved on `Dataset`) is legal
+there.
 
 ### Array annotations see through type aliases
 
@@ -143,14 +170,144 @@ value in the `attrs` snapshot, so `attrs` always contains every declared attribu
 `_merged_fields` walks the reversed MRO collecting each class's `_h5t_own`. A subclass overrides
 a base's field; two unrelated bases declaring the same name must be *equivalent* per
 `_fields_equivalent`, which compares `repr()` of annotation and default rather than `==` to avoid
-ndarray-truthiness ambiguity and adapter identity. `extras` is inherited from the nearest
-compiled base unless the subclass passes it explicitly.
+ndarray-truthiness ambiguity and adapter identity, plus `_foreign_equivalent` (record type,
+`data`, `attrs`, `lazy_type`, extras policy) for a `Payload` field. `extras` is inherited from the
+nearest compiled base unless the subclass passes it explicitly.
+
+### Foreign record types (`Payload`, `@h5t.dataset`, `@h5t.group`)
+
+A child dataset or group does not have to load into an `h5t.Dataset`/`h5t.Group` subclass. A
+`Payload` field (or the `@h5t.dataset`/`@h5t.group` decorators, below) loads it into a plain record
+type instead — typically a stdlib `dataclass` — so the record does not have to inherit from h5t and
+is not subject to `Dataset`'s/`Group`'s reserved-name check. `RecordKind` (`_spec.py`) tells the two
+shapes apart: `DATASET` (a `Payload` field or `@h5t.dataset`) names one field as the payload;
+`GROUP` (`@h5t.group`) has no payload field and instead admits nested groups, datasets, and arrays
+like a `Group` subclass does. `ForeignSpec.data` is `str | None` because only a `DATASET`-kind
+record has one.
+
+`_foreign_spec` compiles a foreign type once per `(kind, data, attrs, extras)` by delegating to
+`_compile_foreign_fields`. The outer cache has weak record-type keys and each per-type cache has
+weak `ForeignSpec` values: a live decorated marker or owner `FieldSpec` keeps a spec reusable,
+without the cached spec's `record_type` back-reference pinning an otherwise transient class. The
+compiler walks the type's MRO collecting annotations and their declaring classes, resolves the
+payload (`DATASET` only) and `attrs=` fields, then builds every remaining field via
+`_field_spec(..., dataset_owner=(kind is RecordKind.DATASET))`. `dataset_owner=True` is what still
+forces a `DATASET`-kind record to declare only attributes (`_field_spec`'s `"a dataset record may
+declare only attributes"` check); a `GROUP`-kind record skips it, since — like `Group` — it may
+reference other schema types.
+
+**Why `DATASET` stays eager and `GROUP` defers.** A `DATASET`-kind record can only declare
+attributes, so it can never forward-reference another schema type; compiling it immediately is
+always safe and only improves error locality, so `_foreign_spec` converts any
+`_UnresolvedAnnotation` straight into a `SchemaError`. A `GROUP`-kind record has no such
+restriction — including a self-reference (`child: Node | None`) — so it needs the same
+"declared before its dependency" tolerance `_Record.__init_subclass__` already gives `Group`/
+`Dataset`: `_foreign_spec` lets `_UnresolvedAnnotation` propagate uncaught for `kind is
+RecordKind.GROUP`, and the `@h5t.group` decorator (below) catches it there to store a
+`_PendingRecord` instead of a `ForeignSpec`. `_record_kind(cls)` reads `.kind` directly off
+whichever of the two sits on `cls.__dict__["__h5t_record__"]`, so the DATASET-vs-GROUP dispatch in
+`_field_spec` needs no compilation at all — only `_ensure_record_compiled` (retrying a pending
+record against its snapshotted scope, and caching the result back onto `__h5t_record__`) forces
+that.
+
+**Why a `GROUP`-kind member resolves at load time, not compile time.** `_field_spec`'s `is_record`
+branch calls `_ensure_record_compiled` for a `DATASET`-kind member (safe: never pending, never
+cyclic) but leaves `FieldSpec.foreign` as `None` for a `GROUP`-kind one, setting only
+`kind=MemberKind.GROUP`. This mirrors exactly how a plain `Group`-subclass field already works —
+`FieldSpec.member_type` stores the class, and its `__h5spec__` is read lazily by `_load_group_values`
+at load time (`:942`-era comment; see below) — and for the same reason: eagerly resolving a
+`GROUP`-kind member's `ForeignSpec` at compile time would recurse forever on a self-referential
+schema like `child: Node | None`, since compiling `Node` would try to compile `Node` again. Deferring
+the resolution to load time (once real data bounds the recursion) is what lets it terminate.
+
+Four more things fall out of how pydantic and dataclasses actually behave, verified against the
+pinned versions in `.venv`:
+
+1. `TypeAdapter(SomeDataclass, config=ConfigDict(...))` raises `PydanticUserError` — pydantic
+   rejects `config=` alongside a dataclass/BaseModel/TypedDict type — and a full unconfigured
+   adapter would revalidate the record's fields. `_build_record_adapter` instead uses an
+   unconfigured `InstanceOf` adapter (or `dict` for a TypedDict runtime value), preserving
+   optionality. It accepts constructed records unchanged while still rejecting a wrong-typed
+   class-body default or default-factory result. The record type itself remains
+   `FieldSpec.annotation` for repr/equivalence purposes.
+2. `dataclasses.field(default_factory=...)` leaves **no** class attribute, so reading defaults off
+   `cls.__dict__` (as `_own_fields` does for h5t's own classes) would silently report such a field
+   as required. `_compile_foreign_fields` reads defaults from `dataclasses.fields()` instead when
+   the record type is a dataclass, carrying a `default_factory` separately on `FieldSpec` and
+   calling it from `_missing_value` before validation. For a non-dataclass it reads a default from
+   the class that declared the final annotation, then falls back to a concrete default exposed by
+   the inspected constructor signature; the latter covers model frameworks that remove field
+   defaults from the class dictionary.
+3. `dir()` on a plain dataclass yields only its own field names, so `_check_fields`'s reserved-name
+   half has nothing to forbid there — only `_check_duplicate_names` (the half checking for repeated
+   HDF5 names, extracted out for reuse) applies to a foreign record's fields.
+4. `object.__new__` + `object.__setattr__` works even on a `frozen=True, slots=True` dataclass, but
+   skips `__init__`/`__post_init__` — wrong for a type that is the user's own. `_load_foreign_dataset`
+   and `_load_foreign_group` both call the real constructor through the shared `_construct_record`
+   (`record_type(**values)`). It pre-binds the cached signature, making only an argument-binding
+   `TypeError` a `SchemaError`; failures raised after user code starts, including a `TypeError` from
+   `__post_init__`, become `ValidationError` at the node's path. For an uninspectable callable, the
+   traceback's presence or absence of a constructor frame is the fallback distinction.
+
+Foreign annotations resolve only against the record type's module globals and class dict by
+default — `_resolved_annotations(base)` is called with no `scope`. An `Annotated[T, Payload(...)]`
+use site relies on exactly that default; the `@h5t.dataset`/`@h5t.group` decorators (below) are the
+callers that pass one, since they do have a defining frame to capture.
+
+### The `@h5t.dataset` / `@h5t.group` decorators
+
+`h5t.dataset(data=..., attrs=..., extras=...)` is sugar for `Annotated[T, Payload(...)]` that
+validates against the record type's own definition instead of a distant owner field's. It calls
+`_foreign_spec(cls, cls, data, kind=RecordKind.DATASET, data=data, attrs=attrs, extras_raw=extras,
+scope=...)` immediately — `cls` is both the record type being compiled and the `owner` a
+`SchemaError` names, so a bad `data=` surfaces at the decorator's own call site. The frame it
+captures (`inspect.currentframe().f_back.f_locals`) is the same one `_Record.__init_subclass__`
+would capture were `cls` a `Group`/`Dataset` subclass instead; passing it as `_foreign_spec`'s
+`scope` parameter lets a function-local record's annotations resolve against function locals, not
+just module globals. This scope is never retained as a weak snapshot for a later retry — it does
+not need to be, since a `DATASET`-kind `_foreign_spec` call always resolves-or-`SchemaError`s
+immediately (see above). `_field_spec` dispatches to a decorated record's compiled spec by checking
+`"__h5t_record__" in core.__dict__` (a per-class marker set by the decorator's `setattr`,
+deliberately not inherited, so a subclass of a decorated record is not accidentally one itself)
+rather than `getattr`, and only when no explicit `Payload(...)` is present at the use site — an
+explicit marker there still overrides the decorator's own `data=`/`attrs=`/`extras=`, even for a
+`GROUP`-kind record (compiling a separate, throwaway `DATASET`-kind spec for it, which then fails
+`_field_spec`'s attributes-only check unless the record genuinely has no other child members).
+
+`h5t.group(attrs=..., extras=...)` is the `GROUP`-kind counterpart, with no `data=` since a group
+record has no single payload field. It captures the same defining frame, but — unlike `dataset()` —
+*does* retain it: on `_UnresolvedAnnotation` it stores a `_PendingRecord` (kind, data, attrs,
+extras_raw, py_name, and `_weak_scope(scope, _record_annotation_names(cls))`) on
+`cls.__h5t_record__` instead of a `ForeignSpec`. `_record_annotation_names` unions `_annotation_names`
+across the record's whole MRO (not just `cls` itself, unlike `_Record`'s single-class version),
+since a foreign record's bases never compile and snapshot their own scope the way an `h5t.Group`
+base does. `_ensure_record_compiled` is the retry point: called from `_field_spec` (a `DATASET`-kind
+member), from `_load_group_values` (a `GROUP`-kind member, at load time), and from `h5t.load`
+itself, it returns a compiled `ForeignSpec` unchanged or retries a `_PendingRecord` against its
+unpacked scope, letting a renewed `_UnresolvedAnnotation` propagate uncaught so that whatever
+compiled `cls` as a field (an owner `Group`/`Dataset`'s own `_compile_class`/`__init_subclass__`, or
+a `GROUP`-kind owner record's own `_ensure_record_compiled` retry) defers too, via the machinery
+that already exists for exactly this. Load-time callers — `_load_group_values` for a nested
+`GROUP` member, and `h5t.load` for a top-level record — go through `_compiled_record`, which
+converts that renewed exception into `SchemaError`, matching `_ensure_compiled` / `__h5spec__`
+for a nested `Group` subclass. `h5t check` only catches `SchemaError`, so leaving the private
+exception uncaught there would surface as an internal traceback.
 
 ## Testing conventions
 
 `tests/conftest.py` holds the canonical `Result` / `Measurement` / `Nested` schemas exercising
-every field kind, plus `write_result()` which writes a matching file (including undeclared
-members, to exercise `extras`). Prefer extending those over new ad-hoc fixtures.
+every field kind, plus `PlainMeasurement` (decorated `@h5t.dataset`, so it also serves as a
+dataset-record CLI/`h5t.load` fixture) / `LazyMeasurement` (foreign records over the same
+`measurement` dataset, eager and `LazyArray` payloads respectively), `PlainNested` /
+`PlainResult` (`@h5t.group` records mirroring `Nested`/`Result` field-for-field over the same
+file), `write_result()` which writes a matching file (including undeclared members, to exercise
+`extras`), and `open_fd_count()` (POSIX-only, reads `/dev/fd`) shared by every fd-leak assertion.
+Prefer extending those over new ad-hoc fixtures. `tests/test_foreign.py` covers the `Payload`
+marker and `LazyArray` specifically; `tests/test_records.py` covers both the `@h5t.dataset` and
+`@h5t.group` decorator API, which compile through the same `_foreign_spec`/`ForeignSpec` machinery
+— including forward-reference and self-referential (`GROUP`-kind) schemas, mixing decorated
+records with `Group`/`Dataset` inheritance in both directions, and `PlainResult`'s field-for-field
+parity against `Result`.
 
 `tests/test_pep649.py` is the one module deliberately *without* `from __future__ import
 annotations` — it exists to exercise the lazy-annotation paths every other module opts out of, and
@@ -158,7 +315,9 @@ adding a future import there would silently void the whole file (hence
 `test_this_module_keeps_lazy_annotations`). It skips below 3.14, so `.python-version`'s 3.11 never
 runs it; use `uv run --python 3.14 pytest`. Its schema classes are declared *inside* the test
 functions, since a module-level bare forward reference would raise during collection on the
-versions the skip covers.
+versions the skip covers. Note the asymmetry it pins: `@h5t.dataset` still does not defer even
+under PEP 649 (attributes-only, so nothing is gained by deferring), while `@h5t.group` does, the
+same as `Group`/`Dataset`.
 
 `tests/acceptance_example.py` is not collected by pytest — it is a static acceptance surface
 whose annotated assignments (`version: int = result.version`) fail `ty check` if `from_file`

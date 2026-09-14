@@ -42,7 +42,7 @@ def test_custom_root_and_absolute_filename(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.chdir(tmp_path)
     result = Result.from_file("nested.h5", root="/results/run")
     assert result.measurement.path == "/results/run/measurement"
-    assert result.measurement._h5t_filename == str(path.resolve())
+    assert result.measurement._h5t_array.filename == str(path.resolve())
 
 
 @pytest.mark.parametrize("root", ["", "relative", "results/run"])

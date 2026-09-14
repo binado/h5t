@@ -6,6 +6,7 @@ inside the test functions because a module-level bare forward reference would ra
 collection time on the versions ``pytestmark`` skips.
 """
 
+import dataclasses
 import gc
 import inspect
 import sys
@@ -146,6 +147,56 @@ def test_a_lazy_subclass_of_a_deferred_base_defers_too() -> None:
         value: int
 
     assert [field.py_name for field in Sub.__h5spec__.fields] == ["later", "also"]
+
+
+def test_the_dataset_decorator_does_not_defer_even_under_pep_649() -> None:
+    # A Group/Dataset field defers via __h5spec__'s lazy metaclass property, so a bare
+    # annotation naming a not-yet-bound local resolves once the enclosing function
+    # continues past its binding (see test_a_lazy_forward_reference_in_a_function_
+    # scope_resolves_via_the_closure above). @h5t.dataset has no such hook and stays
+    # eager by design -- an attributes-only record can never forward-reference another
+    # schema type, so nothing is gained by deferring, and the decorator forces
+    # __annotate__ to evaluate right here, before Later is ever bound.
+    def declare() -> None:
+        with pytest.raises(h5t.SchemaError, match="Later"):
+
+            @h5t.dataset(data="data")
+            @dataclasses.dataclass
+            class Recording:
+                unit: Later  # noqa: F821 -- bound below; never resolves for this decorator
+                data: np.ndarray
+
+        class Later:
+            pass
+
+    declare()
+
+
+def test_the_group_decorator_defers_under_pep_649() -> None:
+    # Contrast with test_the_dataset_decorator_does_not_defer_even_under_pep_649 above:
+    # a GROUP-kind record's fields are not restricted to attributes, so it can
+    # forward-reference another schema type (including itself), and the
+    # attributes-only premise that keeps @h5t.dataset eager no longer holds. @h5t.group
+    # therefore gets the same tolerance _Record.__init_subclass__ gives Group/Dataset --
+    # here demonstrated via the PEP 649 closure win, exactly like the Group case above.
+    def declare() -> type:
+        @h5t.group()
+        @dataclasses.dataclass
+        class Local:
+            later: Later  # noqa: F821 -- bound below; reached via __annotate__'s closure
+
+        @h5t.group()
+        @dataclasses.dataclass
+        class Later:
+            value: int
+
+        return Local
+
+    schema = declare()
+    gc.collect()
+    foreign = h5t._compile._ensure_record_compiled(schema)
+    fields = {field.py_name: field for field in foreign.spec.fields}
+    assert fields["later"].member_type.__name__ == "Later"
 
 
 def test_a_lazy_schema_loads_from_a_file(tmp_path: Path) -> None:
