@@ -7,6 +7,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** the `Group`/`Dataset` inheritance API is gone. `h5t.Group`, `h5t.Dataset`,
+  `Group.from_file()`, the `extras=` class keyword, and the reserved-name check that
+  forbade a field shadowing a `Group`/`Dataset` attribute (`data`, `attrs`, `path`, ...)
+  no longer exist. `@h5t.dataset`/`@h5t.group` plus `h5t.load()` already covered every
+  position a schema can occupy -- root, nested group, nested dataset -- so inheritance
+  retained no capability of its own. To migrate:
+
+  | Before | After |
+  | --- | --- |
+  | `class X(h5t.Group, extras="forbid")` | `@h5t.group(extras="forbid")` over a `@dataclass` |
+  | `class X(h5t.Dataset)` | `@h5t.dataset(data="...")` over a `@dataclass` |
+  | `x: h5t.Dataset` | `x: h5t.LazyArray` |
+  | `X.from_file(path, root)` | `h5t.load(X, path, root)` |
+  | `dataset.attrs` | a `Mapping` field bound with `attrs="..."` |
+  | `dataset.data` / `.read()` / `.open()` / `.shape` | the same names on the record's `LazyArray` payload |
+
+  A record is now always built by calling the record type's own constructor, so a loaded
+  record has whatever `__init__`/`__post_init__`/`__eq__` its type defines.
+
+### Added
+
+- `LazyArray` (or a subclass of it) is accepted as a member annotation in its own right,
+  for a child dataset whose attributes the schema does not declare. `Eager()` still
+  prefetches such a field's payload during the load.
+
 ## [0.2.0]
 
 ### Changed
