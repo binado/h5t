@@ -1,6 +1,6 @@
 [project]
 name = "h5t"
-version = "0.2.0"
+version = "0.3.0"
 description = "Load HDF5 groups as detached, typed Python records."
 readme = "README.md"
 license = "MIT"
