@@ -1,4 +1,4 @@
-"""Schema compilation and detached HDF5 loading."""
+"""Schema compilation and detached HDF5 loading and writing."""
 
 from __future__ import annotations
 
@@ -1057,6 +1057,96 @@ def _load_foreign_group(foreign: ForeignSpec, group: h5py.Group, filename: str, 
     return _construct_record(foreign, values, path)
 
 
+def _record_value(record: Any, field: FieldSpec, path: str) -> Any:
+    """Read and validate one Python field before writing it at ``path``."""
+    try:
+        value = getattr(record, field.py_name)
+    except AttributeError as exc:
+        raise ValidationError(path, f"record has no field {field.py_name!r}") from exc
+    return _validate_value(field, value, path)
+
+
+def _dump_attribute(
+    field: FieldSpec, record: Any, node: h5py.Group | h5py.Dataset, path: str
+) -> None:
+    """Validate and write one record field as an HDF5 attribute."""
+    attribute_path = attr_path(path, field.h5_name)
+    value = _record_value(record, field, attribute_path)
+    if value is None:
+        return
+    try:
+        node.attrs[field.h5_name] = value
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(attribute_path, f"cannot write attribute: {exc}") from exc
+
+
+def _dump_foreign_dataset(
+    foreign: ForeignSpec, record: Any, group: h5py.Group, name: str, path: str
+) -> None:
+    """Write a dataset-shaped record and its declared attributes."""
+    if not isinstance(record, foreign.record_type):
+        raise ValidationError(path, f"expected an instance of {foreign.record_type.__name__}")
+
+    assert foreign.data is not None
+    try:
+        payload = getattr(record, foreign.data)
+    except AttributeError as exc:
+        raise ValidationError(path, f"record has no payload field {foreign.data!r}") from exc
+    if foreign.lazy_type is not None:
+        if not isinstance(payload, foreign.lazy_type):
+            raise ValidationError(path, f"expected payload {foreign.lazy_type.__name__}")
+        payload = payload.data
+    elif not isinstance(payload, np.ndarray):
+        raise ValidationError(path, "expected payload np.ndarray")
+
+    try:
+        dataset = group.create_dataset(name, data=payload)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(path, f"cannot write dataset: {exc}") from exc
+    for field in foreign.spec.fields:
+        _dump_attribute(field, record, dataset, path)
+
+
+def _dump_group_values(spec: ClassSpec, record: Any, group: h5py.Group, path: str) -> None:
+    """Write ``record`` fields into ``group`` according to ``spec``."""
+    for field in spec.fields:
+        if field.kind is MemberKind.ATTRIBUTE:
+            _dump_attribute(field, record, group, path)
+            continue
+
+        member_path = child_path(path, field.h5_name)
+        value = _record_value(record, field, member_path)
+        if value is None:
+            continue
+        if field.kind is MemberKind.GROUP:
+            assert field.member_type is not None
+            foreign = _compiled_record(field.member_type)
+            child = group.create_group(field.h5_name)
+            _dump_foreign_group(foreign, value, child, member_path)
+        elif field.kind is MemberKind.DATASET:
+            if field.foreign is not None:
+                _dump_foreign_dataset(field.foreign, value, group, field.h5_name, member_path)
+            else:
+                # A bare LazyArray member has no record wrapper or declared attributes.
+                lazy = typing.cast(LazyArray, value)
+                try:
+                    group.create_dataset(field.h5_name, data=lazy.data)
+                except (TypeError, ValueError) as exc:
+                    raise ValidationError(member_path, f"cannot write dataset: {exc}") from exc
+        else:
+            try:
+                group.create_dataset(field.h5_name, data=value)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(member_path, f"cannot write dataset: {exc}") from exc
+
+
+def _dump_foreign_group(foreign: ForeignSpec, record: Any, group: h5py.Group, path: str) -> None:
+    """Write a group-shaped record recursively into ``group``."""
+    if not isinstance(record, foreign.record_type):
+        raise ValidationError(path, f"expected an instance of {foreign.record_type.__name__}")
+    _dump_group_values(foreign.spec, record, group, path)
+
+
 _T = typing.TypeVar("_T")
 
 
@@ -1093,3 +1183,36 @@ def load(schema: type[_T], path: str | os.PathLike[str], root: str = "/") -> _T:
         if not isinstance(node, h5py.Group):
             raise ValidationError(normalized_root, "expected a group, found a dataset")
         return typing.cast(_T, _load_foreign_group(foreign, node, filename, normalized_root))
+
+
+def dump(record: object, path: str | os.PathLike[str], root: str = "/") -> None:
+    """Write a group record to ``root`` in a newly created HDF5 file.
+
+    The destination must not already exist. This avoids silently replacing either a
+    complete file or content below ``root``.
+    """
+    record_type = type(record)
+    if "__h5t_record__" not in record_type.__dict__:
+        raise SchemaError(f"{record_type!r} is not a decorated record (@h5t.dataset/@h5t.group)")
+    foreign = _compiled_record(record_type)
+    if foreign.kind is not RecordKind.GROUP:
+        raise SchemaError(
+            f"{record_type.__name__} is a dataset record (@h5t.dataset); h5t.dump needs a "
+            "@h5t.group record"
+        )
+    if not isinstance(record, foreign.record_type):
+        raise ValidationError("/", f"expected an instance of {foreign.record_type.__name__}")
+
+    try:
+        filesystem_path = os.fsdecode(os.fspath(path))
+    except TypeError as exc:
+        raise TypeError("path must be a filesystem path") from exc
+    if not isinstance(root, str) or not posixpath.isabs(root):
+        raise ValueError("root must be an absolute HDF5 group path")
+    normalized_root = posixpath.normpath(root)
+    if normalized_root.startswith("//"):
+        normalized_root = "/" + normalized_root.lstrip("/")
+    filename = os.path.abspath(filesystem_path)
+    with h5py.File(filename, mode="x") as h5file:
+        group = h5file.require_group(normalized_root)
+        _dump_foreign_group(foreign, record, group, normalized_root)

@@ -5,7 +5,8 @@
 [![CI](https://github.com/binado/h5t/actions/workflows/ci.yml/badge.svg)](https://github.com/binado/h5t/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/binado/h5t/blob/main/LICENSE)
 
-`h5t` loads HDF5 groups into detached, typed Python records. Group attributes and
+`h5t` loads HDF5 groups into detached, typed Python records and can write those records
+back to HDF5. Group attributes and
 ordinary NumPy-array fields are materialized while the file is open. Typed datasets
 keep snapshot metadata and can read their payload lazily without retaining an open
 file descriptor.
@@ -66,7 +67,13 @@ class Result:
 
 
 result = h5t.load(Result, Path("result.h5"), root="/")
+h5t.dump(result, Path("copy.h5"), root="/")
 ```
+
+`h5t.dump()` recursively writes a group record to a **new file**. The destination path
+must not already exist; h5t opens it with exclusive creation rather than replacing an
+existing file or existing HDF5 content. Optional fields whose value is `None` are
+omitted, matching how `h5t.load()` represents an absent optional member.
 
 Bind a `Mapping`-annotated field with `attrs=` (see below) to receive the node's full
 attribute snapshot: an immutable mapping keyed by on-disk HDF5 name, where declared
@@ -87,8 +94,8 @@ with lazy.open() as live:
 ```
 
 `h5t.load()` closes every handle on normal and exceptional exits, and so does
-`LazyArray.open()`. h5t only ever reads: it builds a record by calling the record type's
-own constructor with the loaded values, and offers no way to write one back.
+`LazyArray.open()`. It builds a record by calling the record type's own constructor with
+the loaded values.
 
 ## Field rules
 
