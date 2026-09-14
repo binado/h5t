@@ -20,8 +20,8 @@ Requires Python 3.11+. `h5py`, `numpy`, and Pydantic v2 are installed automatica
 
 ## Example
 
-Plain classes are the primary way to declare a schema -- `@h5t.dataset` for a child
-dataset, `@h5t.group` for a group (including the root), loaded with `h5t.load`:
+A schema is a plain class -- `@h5t.dataset` for a child dataset, `@h5t.group` for a
+group (including the root) -- loaded with `h5t.load`:
 
 ```python
 import dataclasses
@@ -58,6 +58,7 @@ class Result:
     ]
     array_attr: Annotated[np.ndarray, h5t.Attr()]
     values: np.ndarray                        # eager dataset payload
+    samples: h5t.LazyArray                    # child dataset, no attributes declared
     measurement: Measurement                  # loaded via @h5t.dataset
     nested: Nested                            # recursively loaded group record
     note: str | None                          # absent becomes None
@@ -67,10 +68,10 @@ class Result:
 result = h5t.load(Result, Path("result.h5"), root="/")
 ```
 
-`result.attrs` and `result.measurement.attrs` (if bound with `attrs=`, see below) are
-immutable mappings keyed by their on-disk HDF5 names. Declared attributes contain their
-Pydantic-processed values; undeclared attributes retained under `extras="ignore"`
-contain the raw h5py values.
+Bind a `Mapping`-annotated field with `attrs=` (see below) to receive the node's full
+attribute snapshot: an immutable mapping keyed by on-disk HDF5 name, where declared
+attributes hold their Pydantic-processed values and undeclared ones retained under
+`extras="ignore"` hold the raw h5py values.
 
 A `LazyArray` payload exposes snapshot metadata and explicit data access:
 
@@ -86,9 +87,8 @@ with lazy.open() as live:
 ```
 
 `h5t.load()` closes every handle on normal and exceptional exits, and so does
-`LazyArray.open()`. Loaded records cannot be directly constructed by h5t, written, or
-serialized (a `@h5t.dataset`/`@h5t.group` record is still an ordinary Python object
-otherwise -- h5t just doesn't build one except by loading a file).
+`LazyArray.open()`. h5t only ever reads: it builds a record by calling the record type's
+own constructor with the loaded values, and offers no way to write one back.
 
 ## Field rules
 
@@ -96,16 +96,15 @@ otherwise -- h5t just doesn't build one except by loading a file).
 | --- | --- | --- |
 | `@h5t.group()`-decorated class | child group (or the root) | recursively materialized via `record_type(**fields)` |
 | `@h5t.dataset(data=...)`-decorated class | child dataset | attributes loaded, `record_type(**fields)` constructed |
-| `Group` subclass (legacy) | child group | recursively materialized |
-| `Dataset` or subclass (legacy) | child dataset | metadata/attrs snapshot, payload lazy |
-| `Annotated[DatasetSubtype, Eager()]` | child dataset | complete payload cached during loading |
 | `Annotated[T, Payload("field")]` | child dataset | attributes loaded, `T(**fields)` constructed |
+| `LazyArray` (or a subclass) | child dataset | metadata snapshot, payload read on first access |
+| `Annotated[<any dataset field>, Eager()]` | child dataset | complete payload cached during loading |
 | `np.ndarray` | child dataset | complete payload loaded as an ndarray |
 | `Annotated[T, Attr(...)]` | attribute | converter, then Pydantic validation |
 | scalar or `Literal[...]` | attribute | Pydantic validation |
 
 `Name("stored-name")` renames any field kind. `Attr` is valid only for attributes and
-never combines with `Payload`. `Eager` is valid only for datasets; combined with
+never combines with `Payload`. `Eager` is valid only for dataset fields; combined with
 `Payload` it is allowed only when the payload field is `LazyArray` (it prefetches the
 array), since an `np.ndarray` payload is already eager.
 A parameterized alias such as `numpy.typing.NDArray[np.floating]` is accepted wherever
@@ -113,17 +112,19 @@ A parameterized alias such as `numpy.typing.NDArray[np.floating]` is accepted wh
 child annotations raise `SchemaError`; dynamic collections are not yet supported.
 A `@h5t.dataset` record may declare only attributes plus its one payload field; a
 `@h5t.group` record has no such restriction and may reference other schema types,
-including itself. Declarations are compiled eagerly -- at the `class` statement for
-`Group`/`Dataset`, at the decorator call for `@h5t.dataset` -- so a `SchemaError`
-usually surfaces right there. A schema that names a class (or decorated record) defined
-later in its module, or references itself, instead compiles on first use; this applies
-to `Group`/`Dataset` and to `@h5t.group`, but not to `@h5t.dataset` (see above).
+including itself. Declarations compile at the decorator call, so a `SchemaError` usually
+surfaces right there. A `@h5t.group` record that names a record defined later in its
+module, or references itself, instead compiles on first use; `@h5t.dataset` has no such
+deferral, and does not need one -- being attributes-only, it can never forward-reference
+another schema type.
 
-Every `Group`/`Dataset` subclass and every `@h5t.dataset`/`@h5t.group` record accepts
-`extras="ignore"` (the default) or `extras="forbid"`. A group policy applies to its
-immediate child and attribute names. A dataset policy applies to its attributes. Nested
-schemas keep their own policy, while a plain `np.ndarray` field never checks the
-dataset's attributes.
+A record type has no reserved field names: `data`, `path`, `shape` and `attrs` are all
+free, because h5t contributes no base class for a field name to shadow.
+
+Every `@h5t.dataset`/`@h5t.group` record accepts `extras="ignore"` (the default) or
+`extras="forbid"`. A group policy applies to its immediate child and attribute names. A
+dataset policy applies to its attributes. Nested schemas keep their own policy, while a
+plain `np.ndarray` field never checks the dataset's attributes.
 
 ## Foreign record types (`Payload`)
 
@@ -140,24 +141,23 @@ class Measurement:
     data: np.ndarray                          # eager payload
 
 @h5t.group()
-@dataclasses.dataclass
+@dataclass
 class Result:
     measurement: Annotated[Measurement, h5t.Payload("data")]
 ```
 
 `Payload("data")` names the field holding the payload: annotate it `np.ndarray` for an
 eager array, or `h5t.LazyArray` for h5t's usual detached, lazily-read payload. Every
-other field of the record type is loaded as a dataset attribute, the same as a
-`Dataset` subclass's fields: scalars, `Literal[...]`, `Attr(converter=...)`, defaults,
-and `T | None` all behave identically. `Payload`'s own `extras=` (default `"ignore"`)
-governs the dataset's attributes, since a plain class cannot take h5t's `extras=` class
-keyword. Unlike `Dataset`, a plain record type has no reserved field names -- `data`,
-`path`, `shape`, and so on are all free -- because there is no `Dataset` API for a name
-to shadow. h5t calls the record type's real constructor (`__post_init__` runs; an
-invariant it raises surfaces as `ValidationError`).
+other field of the record type is loaded as a dataset attribute: scalars, `Literal[...]`,
+`Attr(converter=...)`, defaults, and `T | None` all behave as they do on a group record.
+`Payload`'s own `extras=` (default `"ignore"`) governs the dataset's attributes, since a
+type you did not decorate cannot carry its own policy. h5t calls the record type's real
+constructor (`__post_init__` runs; an invariant it raises surfaces as `ValidationError`).
 
-Pass `attrs="field"` to bind a `Mapping`-annotated field to the same attrs snapshot
-`Dataset.attrs` provides -- validated values for declared names, raw for undeclared:
+Pass `attrs="field"` to bind a `Mapping`-annotated field to the dataset's attrs
+snapshot -- validated values for declared names, raw for undeclared. It lists every
+declared name, including ones absent from the file that fell back to `None` or to a
+default:
 
 ```python
 from collections.abc import Mapping
@@ -169,7 +169,9 @@ class Measurement:
     data: np.ndarray
     attrs: Mapping[str, Any]
 
-class Result(h5t.Group):
+@h5t.group()
+@dataclass
+class Result:
     measurement: Annotated[Measurement, h5t.Payload("data", attrs="attrs")]
 ```
 
@@ -178,40 +180,14 @@ a `LazyArray` (whose own `.path`/`.shape`/`.dtype` you read through it). An
 `Annotated[T, Payload(...)]` use site resolves `T`'s annotations against its module
 globals and class dict only; `@h5t.dataset`/`@h5t.group` additionally capture their own
 call site's frame, so a function-local record's annotations resolve against function
-locals too, the same way a function-local `Group`/`Dataset` subclass's do. A `Payload`
-field can also name a `@h5t.group`-decorated type directly -- `h5t.Group`-shaped roots
-are not the only kind of group h5t can load.
-
-## Legacy: `Group`/`Dataset` inheritance
-
-Before `@h5t.dataset`/`@h5t.group` existed, a schema was declared by inheriting from
-`h5t.Group`/`h5t.Dataset`:
-
-```python
-class Measurement(h5t.Dataset, extras="forbid"):
-    unit: str
-
-class Result(h5t.Group, extras="ignore"):
-    version: int
-    measurement: Measurement
-
-result = Result.from_file(Path("result.h5"), root="/")
-```
-
-This still works, is still fully supported, and `h5t.load(Result, ...)` and
-`Result.from_file(...)` are equivalent. It is documented here as the legacy path,
-though: it forces a schema's classes to inherit from h5t, which reserves every public
-`Group`/`Dataset` attribute name (`attrs`, `path`, `data`, ...) against a field name.
-Prefer `@h5t.dataset`/`@h5t.group` for new schemas. This inheritance-based API is
-expected to raise `DeprecationWarning` in a future 0.4 release, and to be removed in
-1.0.
+locals too. A `Payload` field can also name a `@h5t.group`-decorated type directly.
 
 ## Snapshot consistency
 
 A loaded model is a snapshot, with one deliberate exception:
 
 - Group and dataset attributes, dataset shape/dtype/path, eager datasets, and plain
-  arrays reflect the file during loading (`h5t.load()`/`from_file()`).
+  arrays reflect the file during loading (`h5t.load()`).
 - A lazy dataset's first `.data`/`.read()` observes the file at that later moment and
   caches the resulting array permanently.
 - `.open()` always opens the current file and current dataset. It may therefore observe

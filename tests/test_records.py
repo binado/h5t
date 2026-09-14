@@ -14,8 +14,9 @@ import numpy as np
 import pytest
 
 import h5t
+from h5t._spec import MemberKind
 
-from .conftest import LazyMeasurement, Nested, PlainNested, PlainResult, Result
+from .conftest import LazyMeasurement, Nested, Result
 
 # Module-level, mirroring tests/test_compile.py's _ForwardRef/_DefinedLater: a decorated
 # group record forward-references one defined later in this module, and another
@@ -60,15 +61,21 @@ def test_foreign_cache_reuses_live_specs_without_retaining_record_classes() -> N
         unit: str
         data: np.ndarray
 
-    class First(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class First:
         measurement: Annotated[Recording, h5t.Payload("data")]
 
-    class Second(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class Second:
         measurement: Annotated[Recording, h5t.Payload("data")]
 
-    first = {field.py_name: field for field in First.__h5spec__.fields}["measurement"]
-    second = {field.py_name: field for field in Second.__h5spec__.fields}["measurement"]
-    assert first.foreign is second.foreign
+    def measurement_field(record: type) -> Any:
+        spec = record.__dict__["__h5t_record__"].spec
+        return {field.py_name: field for field in spec.fields}["measurement"]
+
+    assert measurement_field(First).foreign is measurement_field(Second).foreign
 
     def make_transient() -> weakref.ReferenceType[type]:
         @h5t.dataset(data="data")
@@ -136,10 +143,12 @@ def test_decorated_class_is_usable_directly_with_no_annotated_or_payload(
         unit: str
         data: np.ndarray
 
-    class Owner(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
         measurement: Recording
 
-    result = Owner.from_file(result_file)
+    result = h5t.load(Owner, result_file)
     assert isinstance(result.measurement, Recording)
     assert result.measurement.unit == "m"
     assert np.array_equal(result.measurement.data, np.arange(5))
@@ -153,10 +162,12 @@ def test_attrs_binding_works_the_same_as_the_marker(result_file: Path) -> None:
         data: np.ndarray
         attrs: Mapping[str, Any]
 
-    class Owner(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
         measurement: Recording
 
-    result = Owner.from_file(result_file)
+    result = h5t.load(Owner, result_file)
     assert result.measurement.attrs["unit"] == "m"
     assert result.measurement.attrs["extra"] == "measurement"
 
@@ -168,10 +179,12 @@ def test_eager_marker_prefills_a_decorated_lazy_payload(result_file: Path) -> No
         unit: str
         data: h5t.LazyArray
 
-    class Owner(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
         measurement: Annotated[Recording, h5t.Eager()]
 
-    result = Owner.from_file(result_file)
+    result = h5t.load(Owner, result_file)
     assert isinstance(result.measurement.data, h5t.LazyArray)
     assert np.array_equal(result.measurement.data.data, np.arange(5))
 
@@ -186,10 +199,12 @@ def test_decorated_record_preserves_custom_lazyarray_subclass(result_file: Path)
         unit: str
         data: CustomLazyArray
 
-    class Owner(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
         measurement: Annotated[Recording, h5t.Eager()]
 
-    measurement = Owner.from_file(result_file).measurement
+    measurement = h5t.load(Owner, result_file).measurement
     assert type(measurement.data) is CustomLazyArray
 
     with h5py.File(result_file, "a") as file:
@@ -206,7 +221,9 @@ def test_eager_marker_on_an_ndarray_decorated_payload_is_schema_error() -> None:
 
     with pytest.raises(h5t.SchemaError, match="Eager and Payload"):
 
-        class Owner(h5t.Group):
+        @h5t.group()
+        @dataclasses.dataclass
+        class Owner:
             measurement: Annotated[Recording, h5t.Eager()]
 
 
@@ -219,7 +236,9 @@ def test_attr_marker_cannot_annotate_a_decorated_record_field() -> None:
 
     with pytest.raises(h5t.SchemaError, match="Attr cannot annotate"):
 
-        class Owner(h5t.Group):
+        @h5t.group()
+        @dataclasses.dataclass
+        class Owner:
             measurement: Annotated[Recording, h5t.Attr()]
 
 
@@ -233,12 +252,14 @@ def test_explicit_payload_at_use_site_overrides_the_decorators_own_binding(
         data: np.ndarray
         scale: float = 1.0
 
-    class Owner(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
         # This owner's field wants attrs=; the decorator declared none.
         measurement: Annotated[Recording, h5t.Payload("data", attrs=None, extras="forbid")]
 
     with pytest.raises(h5t.ValidationError) as caught:
-        Owner.from_file(result_file)
+        h5t.load(Owner, result_file)
     assert caught.value.path == "/measurement@extra"
 
 
@@ -249,10 +270,12 @@ def test_decorator_composes_with_frozen_slots_dataclass(result_file: Path) -> No
         unit: str
         data: np.ndarray
 
-    class Owner(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
         measurement: Recording
 
-    result = Owner.from_file(result_file)
+    result = h5t.load(Owner, result_file)
     assert result.measurement.unit == "m"
 
 
@@ -264,14 +287,18 @@ def test_decorated_lazy_measurement_matches_marker_based_loading(result_file: Pa
         data: h5t.LazyArray
         scale: float = 1.0
 
-    class ViaDecorator(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class ViaDecorator:
         measurement: DecoratedLazyMeasurement
 
-    class ViaMarker(h5t.Group):
+    @h5t.group()
+    @dataclasses.dataclass
+    class ViaMarker:
         measurement: Annotated[LazyMeasurement, h5t.Payload("data")]
 
-    decorated = ViaDecorator.from_file(result_file).measurement
-    marked = ViaMarker.from_file(result_file).measurement
+    decorated = h5t.load(ViaDecorator, result_file).measurement
+    marked = h5t.load(ViaMarker, result_file).measurement
     assert decorated.unit == marked.unit
     assert decorated.scale == marked.scale
     assert decorated.data.path == marked.data.path
@@ -302,7 +329,7 @@ def test_forward_reference_to_a_record_defined_later_in_the_module_resolves() ->
 
 def test_recursive_group_record_compiles_and_loads_a_nested_file(tmp_path: Path) -> None:
     # Regression for correction (a): a GROUP-kind member must resolve at load time
-    # (mirroring a Group subclass's own __h5spec__), or this recurses forever at
+    # (mirroring how any GROUP-kind member is resolved), or this recurses forever at
     # compile time instead.
     path = tmp_path / "recursive.h5"
     with h5py.File(path, "w") as file:
@@ -322,11 +349,16 @@ def test_attrs_binding_on_a_group_record_matches_group_attrs(result_file: Path) 
     @dataclasses.dataclass
     class WithAttrs:
         version: int
+        optional_note: str | None
         attrs: Mapping[str, Any]
+        defaulted: int = 42
 
     result = h5t.load(WithAttrs, result_file)
     assert result.attrs["version"] == 2  # declared: validated value
     assert result.attrs["undeclared"] == "raw"  # undeclared: reachable raw
+    # Absent declared names are recorded too, so `attrs` lists every declared name.
+    assert result.attrs["optional_note"] is None
+    assert result.attrs["defaulted"] == 42
 
 
 def test_dataset_record_nested_inside_a_group_record(result_file: Path) -> None:
@@ -362,7 +394,7 @@ def test_group_record_nested_inside_another_group_record(result_file: Path) -> N
     assert result.nested.answer == 42
 
 
-def test_group_subclass_field_inside_a_group_record(result_file: Path) -> None:
+def test_a_record_from_another_module_is_usable_as_a_field(result_file: Path) -> None:
     @h5t.group()
     @dataclasses.dataclass
     class Owner:
@@ -373,26 +405,11 @@ def test_group_subclass_field_inside_a_group_record(result_file: Path) -> None:
     assert result.nested.answer == 42
 
 
-def test_group_record_field_inside_a_group_subclass(result_file: Path) -> None:
-    @h5t.group()
-    @dataclasses.dataclass
-    class Inner:
-        answer: int
-
-    class Owner(h5t.Group):
-        nested: Inner
-
-    result = Owner.from_file(result_file)
-    assert isinstance(result.nested, Inner)
-    assert result.nested.answer == 42
-
-
 def test_still_unresolved_nested_group_record_is_a_schema_error(tmp_path: Path) -> None:
     # A nested @h5t.group record stays pending until load. _load_group_values compiles
-    # it after the file is open; that retry must become SchemaError, matching a nested
-    # Group subclass (which converts via __h5spec__) and a top-level h5t.load (which
-    # already wrapped). Leaving _UnresolvedAnnotation uncaught would also leak past
-    # `h5t check`, which only catches SchemaError.
+    # it after the file is open; that retry must become SchemaError via _compiled_record,
+    # matching a top-level h5t.load. Leaving _UnresolvedAnnotation uncaught would also
+    # leak past `h5t check`, which only catches SchemaError.
     @h5t.group()
     @dataclasses.dataclass
     class Inner:
@@ -400,28 +417,17 @@ def test_still_unresolved_nested_group_record_is_a_schema_error(tmp_path: Path) 
 
     assert isinstance(Inner.__dict__["__h5t_record__"], h5t._compile._PendingRecord)
 
-    class Owner(h5t.Group):
-        nested: Inner
-
     @h5t.group()
     @dataclasses.dataclass
     class Outer:
         nested: Inner
-
-    class DeferredGroup(h5t.Group):
-        later: _NeverDefined  # noqa: F821 -- never bound
-
-    class GroupOwner(h5t.Group):
-        nested: DeferredGroup
 
     path = tmp_path / "nested.h5"
     with h5py.File(path, "w") as file:
         file.create_group("nested").attrs["later"] = 1
 
     for load in (
-        lambda: Owner.from_file(path),
         lambda: h5t.load(Outer, path),
-        lambda: GroupOwner.from_file(path),
         lambda: h5t.load(Inner, path),
     ):
         with pytest.raises(h5t.SchemaError, match="_NeverDefined"):
@@ -442,17 +448,6 @@ def test_load_rejects_a_dataset_kind_record(tmp_path: Path) -> None:
         h5t.load(Recording, path)
 
 
-def test_load_rejects_a_bare_dataset_subclass(tmp_path: Path) -> None:
-    class Bare(h5t.Dataset):
-        unit: str
-
-    path = tmp_path / "empty.h5"
-    with h5py.File(path, "w"):
-        pass
-    with pytest.raises(h5t.SchemaError, match="not an h5t.Group"):
-        h5t.load(Bare, path)
-
-
 def test_load_rejects_a_plain_undecorated_class(tmp_path: Path) -> None:
     class Plain:
         pass
@@ -460,7 +455,7 @@ def test_load_rejects_a_plain_undecorated_class(tmp_path: Path) -> None:
     path = tmp_path / "empty.h5"
     with h5py.File(path, "w"):
         pass
-    with pytest.raises(h5t.SchemaError, match="not an h5t.Group"):
+    with pytest.raises(h5t.SchemaError, match="not a decorated record"):
         h5t.load(Plain, path)
 
 
@@ -472,7 +467,9 @@ def test_eager_on_a_group_record_field_is_schema_error() -> None:
 
     with pytest.raises(h5t.SchemaError, match="Eager applies only"):
 
-        class Owner(h5t.Group):
+        @h5t.group()
+        @dataclasses.dataclass
+        class Owner:
             nested: Annotated[Rec, h5t.Eager()]
 
 
@@ -486,7 +483,9 @@ def test_explicit_payload_on_a_group_record_type_with_non_attribute_fields() -> 
 
     with pytest.raises(h5t.SchemaError, match="only attributes"):
 
-        class Owner(h5t.Group):
+        @h5t.group()
+        @dataclasses.dataclass
+        class Owner:
             nested: Annotated[Rec, h5t.Payload("arr")]
 
 
@@ -500,21 +499,100 @@ def test_extras_forbid_on_a_group_record_rejects_undeclared_members(result_file:
         h5t.load(Strict, result_file)
 
 
-def test_plain_result_matches_result_field_for_field(result_file: Path) -> None:
-    expected = Result.from_file(result_file)
-    actual = h5t.load(PlainResult, result_file)
+def test_the_shared_result_schema_loads_every_field_kind(result_file: Path) -> None:
+    actual = h5t.load(Result, result_file)
 
-    assert actual.version == expected.version
-    assert actual.renamed == expected.renamed
-    assert actual.config == expected.config
-    assert np.array_equal(actual.array_attr, expected.array_attr)
-    assert np.array_equal(actual.values, expected.values)
-    assert actual.measurement.unit == expected.measurement.unit
-    assert actual.measurement.scale == expected.measurement.scale
-    assert np.array_equal(actual.measurement.data.data, expected.measurement.data)
-    assert actual.eager_measurement.unit == expected.eager_measurement.unit
-    assert np.array_equal(actual.eager_measurement.data.data, expected.eager_measurement.data)
-    assert isinstance(actual.nested, PlainNested)
-    assert actual.nested.answer == expected.nested.answer
-    assert actual.optional_note == expected.optional_note
-    assert actual.defaulted == expected.defaulted
+    assert actual.version == 2
+    assert actual.renamed == "current"
+    assert actual.config == {"enabled": True}
+    assert np.array_equal(actual.array_attr, np.arange(3))
+    assert np.array_equal(actual.values, np.arange(4))
+    assert actual.measurement.unit == "m"
+    assert actual.measurement.scale == 1.0
+    assert np.array_equal(actual.measurement.data.data, np.arange(5))
+    assert actual.eager_measurement.unit == "m"
+    assert np.array_equal(actual.eager_measurement.data.data, np.arange(5))
+    assert isinstance(actual.nested, Nested)
+    assert actual.nested.answer == 42
+    assert actual.optional_note is None
+    assert actual.defaulted == 42
+
+
+def test_lazy_array_is_a_dataset_member_in_its_own_right(result_file: Path) -> None:
+    # A child dataset whose attributes the schema does not care about needs no record
+    # type at all: LazyArray names the payload directly.
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
+        measurement: h5t.LazyArray
+        eager_measurement: Annotated[h5t.LazyArray, h5t.Eager()]
+        absent: h5t.LazyArray | None
+
+    spec = Owner.__dict__["__h5t_record__"].spec
+    field_kinds = {field.py_name: field.kind for field in spec.fields}
+    assert field_kinds["measurement"] is MemberKind.DATASET
+    assert field_kinds["absent"] is MemberKind.DATASET
+
+    loaded = h5t.load(Owner, result_file)
+    assert loaded.absent is None
+    assert loaded.measurement.path == "/measurement"
+    assert loaded.measurement.shape == (5,)
+    assert loaded.measurement.dtype == np.dtype("int64")
+
+    # Lazy: the payload reflects the file at first access, not at load time.
+    with h5py.File(result_file, "a") as file:
+        file["measurement"][...] = np.arange(5) + 10
+        file["eager_measurement"][...] = np.arange(5) + 10
+    assert np.array_equal(loaded.measurement.data, np.arange(5) + 10)
+    # Eager: prefetched during the load, so the later write is invisible.
+    assert np.array_equal(loaded.eager_measurement.data, np.arange(5))
+
+
+def test_lazy_array_member_preserves_a_custom_subclass(result_file: Path) -> None:
+    class Tracked(h5t.LazyArray):
+        pass
+
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
+        measurement: Tracked
+
+    loaded = h5t.load(Owner, result_file)
+    assert type(loaded.measurement) is Tracked
+    assert np.array_equal(loaded.measurement.read(), np.arange(5))
+
+
+def test_lazy_array_member_accepts_dataclass_subclass(result_file: Path) -> None:
+    # A @dataclass(init=False) LazyArray subclass keeps LazyArray.__init__ while
+    # still being a dataclass; the field adapter must be instance-only so pydantic
+    # does not reject config= at decorate time.
+    @dataclasses.dataclass(init=False)
+    class Tracked(h5t.LazyArray):
+        pass
+
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
+        measurement: Tracked
+        absent: Tracked | None = None
+
+    loaded = h5t.load(Owner, result_file)
+    assert type(loaded.measurement) is Tracked
+    assert loaded.absent is None
+    assert np.array_equal(loaded.measurement.read(), np.arange(5))
+
+
+def test_lazy_array_member_rejects_attr_and_payload() -> None:
+    with pytest.raises(h5t.SchemaError, match="Attr cannot annotate"):
+
+        @h5t.group()
+        @dataclasses.dataclass
+        class WithAttr:
+            measurement: Annotated[h5t.LazyArray, h5t.Attr()]
+
+    with pytest.raises(h5t.SchemaError, match="Payload cannot annotate"):
+
+        @h5t.group()
+        @dataclasses.dataclass
+        class WithPayload:
+            measurement: Annotated[h5t.LazyArray, h5t.Payload("data")]

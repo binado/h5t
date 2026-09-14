@@ -7,7 +7,7 @@ import importlib
 import sys
 from typing import NoReturn
 
-from h5t._compile import Group, load
+from h5t._compile import load
 from h5t._errors import SchemaError, ValidationError
 
 
@@ -28,13 +28,8 @@ def _load_schema(ref: str) -> type:
         schema = getattr(module, class_name)
     except AttributeError:
         _fail(f"module {module_name!r} has no attribute {class_name!r}")
-    is_group_subclass = isinstance(schema, type) and issubclass(schema, Group)
-    is_record = isinstance(schema, type) and "__h5t_record__" in schema.__dict__
-    if not (is_group_subclass or is_record):
-        _fail(
-            f"{ref!r} is not an h5t.Group schema class or a decorated record "
-            "(@h5t.dataset/@h5t.group)"
-        )
+    if not (isinstance(schema, type) and "__h5t_record__" in schema.__dict__):
+        _fail(f"{ref!r} is not a decorated record (@h5t.dataset/@h5t.group)")
     return schema
 
 
@@ -58,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Validate and materialize an HDF5 group schema.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    check = subparsers.add_parser("check", help="check an HDF5 file against a Group schema")
+    check = subparsers.add_parser("check", help="check an HDF5 file against a group schema")
     check.add_argument("file", help="path to the HDF5 file")
     check.add_argument("--schema", required=True, help="schema reference, e.g. pkg.schemas:Result")
     check.add_argument("--root", default="/", help="absolute HDF5 group path (default: /)")

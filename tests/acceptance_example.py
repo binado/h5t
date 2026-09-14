@@ -12,30 +12,11 @@ import numpy as np
 import h5t
 
 
-class Samples(h5t.Dataset):
-    unit: str
-
-
-class Nested(h5t.Group):
-    label: str
-
-
 @dataclasses.dataclass
 class Recording:
     unit: str
     payload: np.ndarray
     attrs: Mapping[str, Any]
-
-
-class Result(h5t.Group):
-    version: int
-    values: np.ndarray
-    samples: Samples
-    eager: Annotated[Samples, h5t.Eager()]
-    nested: Nested
-    optional: str | None
-    defaulted: int = 3
-    recording: Annotated[Recording, h5t.Payload("payload", attrs="attrs")]
 
 
 @h5t.dataset(data="payload", attrs="attrs")
@@ -48,26 +29,36 @@ class DecoratedRecording:
 
 @h5t.group()
 @dataclasses.dataclass
-class DecoratedResult:
+class Nested:
+    label: str
+
+
+@h5t.group()
+@dataclasses.dataclass
+class Result:
     version: int
     values: np.ndarray
+    samples: h5t.LazyArray
+    eager: Annotated[h5t.LazyArray, h5t.Eager()]
+    nested: Nested
     recording: DecoratedRecording
+    marked: Annotated[Recording, h5t.Payload("payload", attrs="attrs")]
+    optional: str | None
+    defaulted: int = 3
 
 
-result: Result = Result.from_file(Path("result.h5"))
+result: Result = h5t.load(Result, Path("result.h5"))
 version: int = result.version
 values: np.ndarray = result.values
+samples: h5t.LazyArray = result.samples
 data: np.ndarray = result.samples.data
-unit: str = result.samples.unit
+shape: tuple[int, ...] = result.eager.shape
 nested: Nested = result.nested
+label: str = result.nested.label
 optional: str | None = result.optional
 defaulted: int = result.defaulted
-recording: Recording = result.recording
-recording_payload: np.ndarray = result.recording.payload
+recording: DecoratedRecording = result.recording
+unit: str = result.recording.unit
+payload: np.ndarray = result.recording.payload
 attrs: Mapping[str, Any] = result.recording.attrs
-
-loaded_via_group: Result = h5t.load(Result, Path("result.h5"))
-loaded_via_record: DecoratedResult = h5t.load(DecoratedResult, Path("result.h5"))
-decorated_version: int = loaded_via_record.version
-decorated_recording: DecoratedRecording = loaded_via_record.recording
-decorated_payload: np.ndarray = loaded_via_record.recording.payload
+marked_payload: np.ndarray = result.marked.payload
