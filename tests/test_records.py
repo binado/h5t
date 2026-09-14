@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 import h5t
+from h5t._spec import MemberKind
 
 from .conftest import LazyMeasurement, Nested, PlainNested, PlainResult, Result
 
@@ -518,3 +519,63 @@ def test_plain_result_matches_result_field_for_field(result_file: Path) -> None:
     assert actual.nested.answer == expected.nested.answer
     assert actual.optional_note == expected.optional_note
     assert actual.defaulted == expected.defaulted
+
+
+def test_lazy_array_is_a_dataset_member_in_its_own_right(result_file: Path) -> None:
+    # A child dataset whose attributes the schema does not care about needs no record
+    # type at all: LazyArray names the payload directly.
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
+        measurement: h5t.LazyArray
+        eager_measurement: Annotated[h5t.LazyArray, h5t.Eager()]
+        absent: h5t.LazyArray | None
+
+    spec = Owner.__dict__["__h5t_record__"].spec
+    field_kinds = {field.py_name: field.kind for field in spec.fields}
+    assert field_kinds["measurement"] is MemberKind.DATASET
+    assert field_kinds["absent"] is MemberKind.DATASET
+
+    loaded = h5t.load(Owner, result_file)
+    assert loaded.absent is None
+    assert loaded.measurement.path == "/measurement"
+    assert loaded.measurement.shape == (5,)
+    assert loaded.measurement.dtype == np.dtype("int64")
+
+    # Lazy: the payload reflects the file at first access, not at load time.
+    with h5py.File(result_file, "a") as file:
+        file["measurement"][...] = np.arange(5) + 10
+        file["eager_measurement"][...] = np.arange(5) + 10
+    assert np.array_equal(loaded.measurement.data, np.arange(5) + 10)
+    # Eager: prefetched during the load, so the later write is invisible.
+    assert np.array_equal(loaded.eager_measurement.data, np.arange(5))
+
+
+def test_lazy_array_member_preserves_a_custom_subclass(result_file: Path) -> None:
+    class Tracked(h5t.LazyArray):
+        pass
+
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
+        measurement: Tracked
+
+    loaded = h5t.load(Owner, result_file)
+    assert type(loaded.measurement) is Tracked
+    assert np.array_equal(loaded.measurement.read(), np.arange(5))
+
+
+def test_lazy_array_member_rejects_attr_and_payload() -> None:
+    with pytest.raises(h5t.SchemaError, match="Attr cannot annotate"):
+
+        @h5t.group()
+        @dataclasses.dataclass
+        class WithAttr:
+            measurement: Annotated[h5t.LazyArray, h5t.Attr()]
+
+    with pytest.raises(h5t.SchemaError, match="Payload cannot annotate"):
+
+        @h5t.group()
+        @dataclasses.dataclass
+        class WithPayload:
+            measurement: Annotated[h5t.LazyArray, h5t.Payload("data")]

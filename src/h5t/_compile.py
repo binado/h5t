@@ -352,13 +352,16 @@ def _field_spec(
     is_dataset = isinstance(core, type) and issubclass(core, Dataset)
     is_group = isinstance(core, type) and issubclass(core, Group)
     is_record = isinstance(core, type) and "__h5t_record__" in core.__dict__
+    is_lazy_array = isinstance(core, type) and issubclass(core, LazyArray)
 
-    if payload_marker is not None and (is_dataset or is_group):
-        raise _schema_error(owner, py_name, "Payload cannot annotate a Group or Dataset field")
+    if payload_marker is not None and (is_dataset or is_group or is_lazy_array):
+        raise _schema_error(
+            owner, py_name, "Payload cannot annotate a Group, Dataset, or LazyArray field"
+        )
 
     foreign: ForeignSpec | None = None
     if attr_marker is not None:
-        if is_dataset or is_group or is_record:
+        if is_dataset or is_group or is_record or is_lazy_array:
             raise _schema_error(
                 owner, py_name, "Attr cannot annotate a Group, Dataset, or dataset-record field"
             )
@@ -398,6 +401,12 @@ def _field_spec(
         member_type = core
     elif is_group:
         kind = MemberKind.GROUP
+        member_type = core
+    elif is_lazy_array:
+        # A child dataset read through LazyArray directly, with no attributes declared
+        # and no record type to construct. `member_type` keeps the exact class so a
+        # user's LazyArray subclass survives, exactly as ForeignSpec.lazy_type does.
+        kind = MemberKind.DATASET
         member_type = core
     elif _is_ndarray_annotation(core):
         # Accept npt.NDArray[...] aliases. The dtype parameter is not validated
@@ -1215,6 +1224,14 @@ def _load_group_values(
             if field.foreign is not None:
                 value = _load_foreign_dataset(
                     field.foreign, node, filename, member_path, eager=field.eager
+                )
+            elif field.member_type is not None and issubclass(field.member_type, LazyArray):
+                value = field.member_type(
+                    filename,
+                    member_path,
+                    tuple(node.shape),
+                    np.dtype(node.dtype),
+                    data=np.asarray(node[()]) if field.eager else None,
                 )
             else:
                 assert field.member_type is not None
