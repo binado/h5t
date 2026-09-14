@@ -287,7 +287,11 @@ itself, it returns a compiled `ForeignSpec` unchanged or retries a `_PendingReco
 unpacked scope, letting a renewed `_UnresolvedAnnotation` propagate uncaught so that whatever
 compiled `cls` as a field (an owner `Group`/`Dataset`'s own `_compile_class`/`__init_subclass__`, or
 a `GROUP`-kind owner record's own `_ensure_record_compiled` retry) defers too, via the machinery
-that already exists for exactly this.
+that already exists for exactly this. Load-time callers — `_load_group_values` for a nested
+`GROUP` member, and `h5t.load` for a top-level record — go through `_compiled_record`, which
+converts that renewed exception into `SchemaError`, matching `_ensure_compiled` / `__h5spec__`
+for a nested `Group` subclass. `h5t check` only catches `SchemaError`, so leaving the private
+exception uncaught there would surface as an internal traceback.
 
 ## Testing conventions
 

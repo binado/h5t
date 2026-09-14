@@ -387,6 +387,47 @@ def test_group_record_field_inside_a_group_subclass(result_file: Path) -> None:
     assert result.nested.answer == 42
 
 
+def test_still_unresolved_nested_group_record_is_a_schema_error(tmp_path: Path) -> None:
+    # A nested @h5t.group record stays pending until load. _load_group_values compiles
+    # it after the file is open; that retry must become SchemaError, matching a nested
+    # Group subclass (which converts via __h5spec__) and a top-level h5t.load (which
+    # already wrapped). Leaving _UnresolvedAnnotation uncaught would also leak past
+    # `h5t check`, which only catches SchemaError.
+    @h5t.group()
+    @dataclasses.dataclass
+    class Inner:
+        later: _NeverDefined  # noqa: F821 -- never bound
+
+    assert isinstance(Inner.__dict__["__h5t_record__"], h5t._compile._PendingRecord)
+
+    class Owner(h5t.Group):
+        nested: Inner
+
+    @h5t.group()
+    @dataclasses.dataclass
+    class Outer:
+        nested: Inner
+
+    class DeferredGroup(h5t.Group):
+        later: _NeverDefined  # noqa: F821 -- never bound
+
+    class GroupOwner(h5t.Group):
+        nested: DeferredGroup
+
+    path = tmp_path / "nested.h5"
+    with h5py.File(path, "w") as file:
+        file.create_group("nested").attrs["later"] = 1
+
+    for load in (
+        lambda: Owner.from_file(path),
+        lambda: h5t.load(Outer, path),
+        lambda: GroupOwner.from_file(path),
+        lambda: h5t.load(Inner, path),
+    ):
+        with pytest.raises(h5t.SchemaError, match="_NeverDefined"):
+            load()
+
+
 def test_load_rejects_a_dataset_kind_record(tmp_path: Path) -> None:
     @h5t.dataset(data="data")
     @dataclasses.dataclass

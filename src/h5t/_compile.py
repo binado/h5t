@@ -54,8 +54,9 @@ class _UnresolvedAnnotation(Exception):
     """An annotation names something not defined yet, so compilation must defer.
 
     Private to this module: raised while resolving annotations and turned into the
-    user-visible ``SchemaError`` by ``_ensure_compiled`` if the name is still missing
-    when the spec is finally read.
+    user-visible ``SchemaError`` by ``_ensure_compiled`` (a ``Group``/``Dataset``
+    subclass) or ``_compiled_record`` (a ``@h5t.group`` record) if the name is still
+    missing when the spec is finally read.
     """
 
     def __init__(self, owner: type, name: str | None, message: str) -> None:
@@ -522,6 +523,23 @@ def _ensure_record_compiled(cls: type) -> ForeignSpec:
     return foreign
 
 
+def _unresolved_schema_error(exc: _UnresolvedAnnotation) -> SchemaError:
+    return SchemaError(f"{exc.owner.__name__}: could not resolve annotations: {exc}")
+
+
+def _compiled_record(cls: type) -> ForeignSpec:
+    """Return ``cls``'s compiled record spec, or ``SchemaError`` if still unresolved.
+
+    ``_ensure_record_compiled`` lets ``_UnresolvedAnnotation`` propagate so a compile-time
+    owner can still defer. Load-time callers are past that point: a renewed failure is a
+    ``SchemaError``, matching ``_ensure_compiled`` / ``__h5spec__`` for a ``Group`` subclass.
+    """
+    try:
+        return _ensure_record_compiled(cls)
+    except _UnresolvedAnnotation as exc:
+        raise _unresolved_schema_error(exc) from exc
+
+
 def _compile_foreign_fields(
     record_type: type,
     owner: type,
@@ -961,7 +979,7 @@ def _ensure_compiled(cls: SchemaMeta) -> None:
     try:
         _compile_class(cls)
     except _UnresolvedAnnotation as exc:
-        raise SchemaError(f"{exc.owner.__name__}: could not resolve annotations: {exc}") from exc
+        raise _unresolved_schema_error(exc) from exc
 
 
 class SchemaMeta(type):
@@ -1186,7 +1204,7 @@ def _load_group_values(
             assert field.member_type is not None
             if "__h5t_record__" in field.member_type.__dict__:
                 value = _load_foreign_group(
-                    _ensure_record_compiled(field.member_type), node, filename, member_path
+                    _compiled_record(field.member_type), node, filename, member_path
                 )
             else:
                 nested_group_type = typing.cast(type[Group], field.member_type)
@@ -1242,12 +1260,7 @@ def load(schema: type[_T], path: str | os.PathLike[str], root: str = "/") -> _T:
     if isinstance(schema, SchemaMeta) and issubclass(schema, Group):
         _ensure_compiled(schema)  # compile a deferred schema before touching the filesystem
     elif isinstance(schema, type) and "__h5t_record__" in schema.__dict__:
-        try:
-            foreign = _ensure_record_compiled(schema)
-        except _UnresolvedAnnotation as exc:
-            raise SchemaError(
-                f"{exc.owner.__name__}: could not resolve annotations: {exc}"
-            ) from exc
+        foreign = _compiled_record(schema)
         if foreign.kind is not RecordKind.GROUP:
             raise SchemaError(
                 f"{schema.__name__} is a dataset record (@h5t.dataset); h5t.load needs an "
