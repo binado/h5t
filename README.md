@@ -66,6 +66,7 @@ class Result:
 
 
 result = h5t.load(Result, Path("result.h5"), root="/")
+h5t.dump(result, Path("copy.h5"), root="/")
 ```
 
 Bind a `Mapping`-annotated field with `attrs=` (see below) to receive the node's full
@@ -86,9 +87,23 @@ with lazy.open() as live:
     first_hundred = live[:100]  # fresh file view, useful for slices
 ```
 
-`h5t.load()` closes every handle on normal and exceptional exits, and so does
-`LazyArray.open()`. h5t only ever reads: it builds a record by calling the record type's
-own constructor with the loaded values, and offers no way to write one back.
+`h5t.load()` and `h5t.dump()` close every handle on normal and exceptional exits, and
+so does `LazyArray.open()`.
+
+## Writing records
+
+`h5t.dump(record, path, root="/")` recursively writes the fields declared by a
+`@h5t.group` record to a new file. Runtime values are validated against the schema
+before writing. An optional field is omitted only when its validated value is `None`;
+a required field that is `None`, missing, or cannot be read raises `ValidationError` at
+its attribute or child path.
+
+Defaults do not mean “omit this value” when writing. Values equal to a class-body
+default or the result of a `default_factory` are materialized in the file. This is
+necessary because a loaded record contains the resolved value, but does not remember
+whether the corresponding HDF5 member was present or supplied by the loader. Thus a
+load/dump/load round trip produces equivalent records, but does not promise to preserve
+the original presence or absence of defaulted members.
 
 ## Field rules
 

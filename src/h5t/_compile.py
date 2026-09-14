@@ -1057,6 +1057,75 @@ def _load_foreign_group(foreign: ForeignSpec, group: h5py.Group, filename: str, 
     return _construct_record(foreign, values, path)
 
 
+def _record_value(record: Any, name: str, path: str) -> Any:
+    """Read one value from a record, presenting lookup failures as data errors."""
+    try:
+        if isinstance(record, Mapping):
+            return record[name]
+        return getattr(record, name)
+    except Exception as exc:
+        raise ValidationError(path, f"cannot retrieve record field {name!r}: {exc}") from exc
+
+
+def _write_field_value(record: Any, field: FieldSpec, path: str) -> Any:
+    """Retrieve and validate a field, applying the sole write-time omission rule."""
+    value = _record_value(record, field.py_name, path)
+    if value is None and not field.optional:
+        raise ValidationError(path, "required field produced None")
+    value = _validate_value(field, value, path)
+    return None if value is None and field.optional else value
+
+
+def _write_foreign_dataset(
+    foreign: ForeignSpec, record: Any, parent: h5py.Group, name: str, path: str
+) -> None:
+    """Write a dataset-shaped record and its declared attributes."""
+    assert foreign.data is not None
+    payload = _record_value(record, foreign.data, path)
+    if payload is None:
+        raise ValidationError(path, "required payload field produced None")
+    if isinstance(payload, LazyArray):
+        payload = payload.data
+    try:
+        node = parent.create_dataset(name, data=payload)
+    except Exception as exc:
+        raise ValidationError(path, f"cannot write dataset payload: {exc}") from exc
+    for field in foreign.spec.fields:
+        field_path = attr_path(path, field.h5_name)
+        value = _write_field_value(record, field, field_path)
+        if value is not None:
+            node.attrs[field.h5_name] = value
+
+
+def _write_foreign_group(foreign: ForeignSpec, record: Any, group: h5py.Group, path: str) -> None:
+    """Recursively write the members declared by a group record."""
+    for field in foreign.spec.fields:
+        field_path = (
+            attr_path(path, field.h5_name)
+            if field.kind is MemberKind.ATTRIBUTE
+            else child_path(path, field.h5_name)
+        )
+        value = _write_field_value(record, field, field_path)
+        # Defaults are deliberately not considered here. A loaded record contains the
+        # value, but carries no provenance saying whether it came from the file.
+        if value is None:
+            continue
+        if field.kind is MemberKind.ATTRIBUTE:
+            group.attrs[field.h5_name] = value
+        elif field.kind is MemberKind.ARRAY:
+            group.create_dataset(field.h5_name, data=value)
+        elif field.kind is MemberKind.DATASET:
+            if field.foreign is None:
+                payload = value.data if isinstance(value, LazyArray) else value
+                group.create_dataset(field.h5_name, data=payload)
+            else:
+                _write_foreign_dataset(field.foreign, value, group, field.h5_name, field_path)
+        else:
+            assert field.member_type is not None
+            child = group.create_group(field.h5_name)
+            _write_foreign_group(_compiled_record(field.member_type), value, child, field_path)
+
+
 _T = typing.TypeVar("_T")
 
 
@@ -1093,3 +1162,33 @@ def load(schema: type[_T], path: str | os.PathLike[str], root: str = "/") -> _T:
         if not isinstance(node, h5py.Group):
             raise ValidationError(normalized_root, "expected a group, found a dataset")
         return typing.cast(_T, _load_foreign_group(foreign, node, filename, normalized_root))
+
+
+def dump(record: Any, path: str | os.PathLike[str], root: str = "/") -> None:
+    """Write a decorated group record to a new HDF5 file.
+
+    Only optional fields whose validated runtime value is ``None`` are omitted. In
+    particular, values equal to a field default are written because records do not
+    retain the on-disk presence information observed while loading.
+    """
+    schema = type(record)
+    if not (isinstance(schema, type) and "__h5t_record__" in schema.__dict__):
+        raise SchemaError(f"{schema!r} is not a decorated record (@h5t.dataset/@h5t.group)")
+    foreign = _compiled_record(schema)
+    if foreign.kind is not RecordKind.GROUP:
+        raise SchemaError(
+            f"{schema.__name__} is a dataset record (@h5t.dataset); h5t.dump needs a "
+            "@h5t.group record"
+        )
+    try:
+        filesystem_path = os.fsdecode(os.fspath(path))
+    except TypeError as exc:
+        raise TypeError("path must be a filesystem path") from exc
+    if not isinstance(root, str) or not posixpath.isabs(root):
+        raise ValueError("root must be an absolute HDF5 group path")
+    normalized_root = posixpath.normpath(root)
+    if normalized_root.startswith("//"):
+        normalized_root = "/" + normalized_root.lstrip("/")
+    with h5py.File(filesystem_path, mode="w") as h5file:
+        group = h5file["/"] if normalized_root == "/" else h5file.require_group(normalized_root)
+        _write_foreign_group(foreign, record, group, normalized_root)
