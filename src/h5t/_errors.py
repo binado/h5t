@@ -21,4 +21,4 @@ class ValidationError(H5TError):
 
 
 class ConversionError(ValidationError):
-    """An explicit ``Attr`` converter failed."""
+    """An explicit ``Attr`` converter or serializer failed."""

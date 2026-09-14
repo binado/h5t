@@ -54,7 +54,7 @@ class Result:
     title: Annotated[str, h5t.Name("name")] # renamed attribute
     config: Annotated[
         dict[str, Any],
-        h5t.Attr(converter=json.loads),
+        h5t.Attr(converter=json.loads, serializer=json.dumps),
     ]
     array_attr: Annotated[np.ndarray, h5t.Attr()]
     values: np.ndarray                        # eager dataset payload
@@ -100,10 +100,13 @@ own constructor with the loaded values, and offers no way to write one back.
 | `LazyArray` (or a subclass) | child dataset | metadata snapshot, payload read on first access |
 | `Annotated[<any dataset field>, Eager()]` | child dataset | complete payload cached during loading |
 | `np.ndarray` | child dataset | complete payload loaded as an ndarray |
-| `Annotated[T, Attr(...)]` | attribute | converter, then Pydantic validation |
+| `Annotated[T, Attr(...)]` | attribute | read: converter, then validation; write: validation, then serializer |
 | scalar or `Literal[...]` | attribute | Pydantic validation |
 
-`Name("stored-name")` renames any field kind. `Attr` is valid only for attributes and
+`Attr(converter=..., serializer=...)` defines independent directions: `converter` turns
+the raw h5py value into a value suitable for Pydantic validation while loading, and
+`serializer` turns a validated Python value into an h5py-writable value while writing.
+h5t never assumes that a converter is reversible. `Name("stored-name")` renames any field kind. `Attr` is valid only for attributes and
 never combines with `Payload`. `Eager` is valid only for dataset fields; combined with
 `Payload` it is allowed only when the payload field is `LazyArray` (it prefetches the
 array), since an `np.ndarray` payload is already eager.

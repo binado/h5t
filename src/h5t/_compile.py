@@ -341,6 +341,9 @@ def _field_spec(
     if attr_marker is not None and attr_marker.converter is not None:
         if not callable(attr_marker.converter):
             raise _schema_error(owner, py_name, "Attr.converter must be callable")
+    if attr_marker is not None and attr_marker.serializer is not None:
+        if not callable(attr_marker.serializer):
+            raise _schema_error(owner, py_name, "Attr.serializer must be callable")
     if attr_marker is not None and eager_marker is not None:
         raise _schema_error(owner, py_name, "Attr and Eager cannot be combined")
     if payload_marker is not None and attr_marker is not None:
@@ -441,6 +444,7 @@ def _field_spec(
         optional=optional,
         default=default,
         converter=attr_marker.converter if attr_marker is not None else None,
+        serializer=attr_marker.serializer if attr_marker is not None else None,
         eager=eager_marker is not None,
         member_type=member_type,
         foreign=foreign,
@@ -927,6 +931,40 @@ def _load_attribute(
         value = _validate_value(field, value, path)
     attrs[field.h5_name] = value
     return value
+
+
+def _write_attribute(
+    field: FieldSpec,
+    value: Any,
+    node: h5py.Group | h5py.Dataset,
+    parent_path: str,
+) -> None:
+    """Validate and write one record value to an HDF5 attribute.
+
+    Serialization is intentionally independent of read-side conversion: applying a
+    converter in reverse would be ambiguous and, for many callables, impossible.
+    """
+    path = attr_path(parent_path, field.h5_name)
+    value = _validate_value(field, value, path)
+    if field.serializer is not None:
+        try:
+            value = field.serializer(value)
+        except Exception as exc:
+            raise ConversionError(path, f"attribute serializer failed: {exc}") from exc
+    # Enum instances are validated Python values, but h5py accepts their scalar
+    # representation rather than the wrapper object. NumPy scalar values already
+    # have a native HDF5 representation and must pass through unchanged.
+    if isinstance(value, Enum):
+        value = value.value
+    try:
+        node.attrs[field.h5_name] = value
+    except Exception as exc:
+        hint = (
+            " (define Attr(serializer=...) for converted values)"
+            if field.serializer is None
+            else ""
+        )
+        raise ValidationError(path, f"attribute value is not HDF5-writable{hint}: {exc}") from exc
 
 
 def _construct_record(foreign: ForeignSpec, values: dict[str, Any], path: str) -> Any:
