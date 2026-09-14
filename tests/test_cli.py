@@ -11,9 +11,14 @@ import pytest
 from h5t._cli import main
 
 SCHEMA = """
+import dataclasses
+
 import h5t
 
-class Result(h5t.Group):
+
+@h5t.group()
+@dataclasses.dataclass
+class Result:
     version: int
 """
 
@@ -63,13 +68,13 @@ def test_import_failures_exit_two(
 
 
 def test_group_record_schema_succeeds(result_file: Path, capsys: pytest.CaptureFixture) -> None:
-    assert main(["check", str(result_file), "--schema", "tests.conftest:PlainResult"]) == 0
+    assert main(["check", str(result_file), "--schema", "tests.conftest:Result"]) == 0
     assert capsys.readouterr().out.startswith("ok:")
 
 
 def test_dataset_record_schema_exits_two(result_file: Path, capsys: pytest.CaptureFixture) -> None:
     with pytest.raises(SystemExit) as caught:
-        main(["check", str(result_file), "--schema", "tests.conftest:PlainMeasurement"])
+        main(["check", str(result_file), "--schema", "tests.conftest:EagerMeasurement"])
     assert caught.value.code == 2
     assert "dataset record" in capsys.readouterr().err
 
@@ -93,7 +98,9 @@ class Inner:
     later: Later
 
 
-class Owner(h5t.Group):
+@h5t.group()
+@dataclasses.dataclass
+class Owner:
     nested: Inner
 """
     )

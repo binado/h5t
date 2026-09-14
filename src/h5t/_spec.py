@@ -33,20 +33,20 @@ class Attr:
 
 @dataclass(frozen=True)
 class Eager:
-    """Load a detached dataset's complete payload during ``from_file``."""
+    """Read a dataset field's complete payload during ``h5t.load`` instead of lazily."""
 
 
 @dataclass(frozen=True)
 class Payload:
-    """Load a child dataset into a plain record type, not an ``h5t.Dataset`` subclass.
+    """Load a child dataset into a record type that carries no ``@h5t.dataset`` marker.
 
     ``data`` names the field of the record type holding the payload; it must be
     annotated ``np.ndarray`` (materialized eagerly) or ``LazyArray`` (read on first
     access). ``attrs``, if given, names a ``Mapping``-annotated field that receives the
-    dataset's attrs snapshot -- validated values for declared names, raw for undeclared,
-    exactly like ``Dataset.attrs``. ``extras`` lives here rather than on the record type
-    itself, since a plain class cannot take h5t's ``extras=`` class keyword -- it
-    applies to the dataset's attributes exactly as ``Dataset``'s ``extras=`` does.
+    dataset's attrs snapshot -- validated values for declared names, raw for undeclared.
+    ``extras`` governs the dataset's undeclared attributes. All three live at the use
+    site rather than on the record type, which is the point: ``Payload`` is for a
+    third-party type you cannot decorate. Prefer ``@h5t.dataset`` when you can.
     """
 
     data: str
@@ -82,7 +82,7 @@ _NO_DEFAULT = object()
 
 @dataclass(frozen=True)
 class ClassSpec:
-    """The flattened schema compiled for a ``Group`` or ``Dataset`` class."""
+    """The fields and extras policy compiled for one record type."""
 
     fields: tuple[FieldSpec, ...] = ()
     extras: Extras = Extras.IGNORE
@@ -90,7 +90,7 @@ class ClassSpec:
 
 @dataclass(frozen=True)
 class ForeignSpec:
-    """Compiled loading instructions for a plain record type used as ``Payload``/``group``."""
+    """Compiled loading instructions for one record type, dataset- or group-shaped."""
 
     record_type: type
     spec: ClassSpec
