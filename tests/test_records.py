@@ -562,6 +562,26 @@ def test_lazy_array_member_preserves_a_custom_subclass(result_file: Path) -> Non
     assert np.array_equal(loaded.measurement.read(), np.arange(5))
 
 
+def test_lazy_array_member_accepts_dataclass_subclass(result_file: Path) -> None:
+    # A @dataclass(init=False) LazyArray subclass keeps LazyArray.__init__ while
+    # still being a dataclass; the field adapter must be instance-only so pydantic
+    # does not reject config= at decorate time.
+    @dataclasses.dataclass(init=False)
+    class Tracked(h5t.LazyArray):
+        pass
+
+    @h5t.group()
+    @dataclasses.dataclass
+    class Owner:
+        measurement: Tracked
+        absent: Tracked | None = None
+
+    loaded = h5t.load(Owner, result_file)
+    assert type(loaded.measurement) is Tracked
+    assert loaded.absent is None
+    assert np.array_equal(loaded.measurement.read(), np.arange(5))
+
+
 def test_lazy_array_member_rejects_attr_and_payload() -> None:
     with pytest.raises(h5t.SchemaError, match="Attr cannot annotate"):
 

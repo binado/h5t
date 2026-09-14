@@ -418,11 +418,14 @@ def _field_spec(
     if kind is not MemberKind.ATTRIBUTE and "/" in h5_name:
         raise _schema_error(owner, py_name, "a child Name cannot contain '/'")
 
-    if foreign is not None or is_record:
+    if foreign is not None or is_record or is_lazy_array:
         # Validate only the constructed/default value's runtime type. A normal
         # configured TypeAdapter is rejected for dataclasses/BaseModels/TypedDicts,
         # while an unconfigured full adapter would revalidate the record's fields.
         # `is_record` also covers GROUP-kind records resolved lazily at load time.
+        # `is_lazy_array` covers a bare LazyArray (or subclass) member: a user's
+        # `@dataclass(init=False)` subclass of LazyArray is itself a dataclass, so
+        # `_build_adapter`'s config= path would SchemaError at decorate time.
         adapter_ann = core
         adapter = _build_record_adapter(owner, py_name, core, optional)
     else:
