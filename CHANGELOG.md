@@ -9,6 +9,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `h5t.save(record, path, root="/", mode="w-", overwrite=False)`: a write path driven by
+  the same schema. Records are validated (including jaxtyping shapes and dtypes) and every
+  lazy payload is read before the file is opened; a failed write removes what it wrote
+  (best effort for `mode="a"`). `Attr(serializer=...)` is the inverse of `converter`.
+  `FieldSpec` (internal) gains a `serializer` field.
 - Dynamic collections: `dict[str, T]` / `Mapping[str, T]` fields load every child of one
   named group into a `dict`, and the new `h5t.Glob(pattern)` marker filters the children.
 - `localns=` on `@h5t.dataset` and `@h5t.group`: extra names for resolving the record's

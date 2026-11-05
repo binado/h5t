@@ -324,6 +324,9 @@ def _field_spec(
     if attr_marker is not None and attr_marker.converter is not None:
         if not callable(attr_marker.converter):
             raise _schema_error(owner, py_name, "Attr.converter must be callable")
+    if attr_marker is not None and attr_marker.serializer is not None:
+        if not callable(attr_marker.serializer):
+            raise _schema_error(owner, py_name, "Attr.serializer must be callable")
     if attr_marker is not None and eager_marker is not None:
         raise _schema_error(owner, py_name, "Attr and Eager cannot be combined")
     if payload_marker is not None and attr_marker is not None:
@@ -445,6 +448,7 @@ def _field_spec(
         optional=optional,
         default=default,
         converter=attr_marker.converter if attr_marker is not None else None,
+        serializer=attr_marker.serializer if attr_marker is not None else None,
         eager=eager_marker is not None,
         member_type=member_type,
         foreign=foreign,
@@ -1121,6 +1125,24 @@ def _load_foreign_group(foreign: ForeignSpec, group: h5py.Group, filename: str, 
 _T = typing.TypeVar("_T")
 
 
+def _filesystem_path(path: str | os.PathLike[str]) -> str:
+    """Return ``path`` as an absolute filesystem string, or raise ``TypeError``."""
+    try:
+        return os.path.abspath(os.fsdecode(os.fspath(path)))
+    except TypeError as exc:
+        raise TypeError("path must be a filesystem path") from exc
+
+
+def _normalize_root(root: str) -> str:
+    """Validate and normalize an absolute HDF5 group path."""
+    if not isinstance(root, str) or not posixpath.isabs(root):
+        raise ValueError("root must be an absolute HDF5 group path")
+    normalized = posixpath.normpath(root)
+    if normalized.startswith("//"):
+        normalized = "/" + normalized.lstrip("/")
+    return normalized
+
+
 def load(schema: type[_T], path: str | os.PathLike[str], root: str = "/") -> _T:
     """Load ``schema`` from ``root`` in the file at ``path`` and close the file.
 
@@ -1137,16 +1159,8 @@ def load(schema: type[_T], path: str | os.PathLike[str], root: str = "/") -> _T:
             "@h5t.group record"
         )
 
-    try:
-        filesystem_path = os.fsdecode(os.fspath(path))
-    except TypeError as exc:
-        raise TypeError("path must be a filesystem path") from exc
-    if not isinstance(root, str) or not posixpath.isabs(root):
-        raise ValueError("root must be an absolute HDF5 group path")
-    normalized_root = posixpath.normpath(root)
-    if normalized_root.startswith("//"):
-        normalized_root = "/" + normalized_root.lstrip("/")
-    filename = os.path.abspath(filesystem_path)
+    normalized_root = _normalize_root(root)
+    filename = _filesystem_path(path)
     with h5py.File(filename, mode="r") as h5file:
         node = h5file.get(normalized_root)
         if node is None:
