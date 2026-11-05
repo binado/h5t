@@ -18,9 +18,9 @@ _DATA_NOT_LOADED = object()
 class LazyArray:
     """A detached HDF5 dataset payload: metadata snapshot, data read on first access.
 
-    No file handle is kept open. Only the filename and dataset path are retained, so
-    the payload can be read later. Use it as a record's `Payload` field or directly as
-    a member annotation. See :doc:`/user_guide/arrays` for snapshot semantics.
+    No file is kept open: a ``LazyArray`` just remembers where the dataset lives, along
+    with its shape and dtype, and reads the numbers only when you ask. You normally get
+    one from `load` rather than creating it yourself. See :doc:`/user_guide/arrays`.
 
     Parameters
     ----------
@@ -33,7 +33,7 @@ class LazyArray:
     dtype : numpy.dtype
         Dtype captured when the file was loaded.
     data : numpy.ndarray, optional
-        An already-materialized payload; when given, nothing is read lazily.
+        Data you already have in memory; if given, nothing is read from the file.
 
     Attributes
     ----------
@@ -80,8 +80,8 @@ class LazyArray:
     def data(self) -> np.ndarray:
         """Read and cache the complete payload as a NumPy array.
 
-        The first access reads the dataset from the source file and caches the result
-        permanently; later accesses return the cached array.
+        The first access reads the dataset from the file and keeps the result; later
+        accesses reuse it.
 
         Returns
         -------
@@ -118,8 +118,8 @@ class LazyArray:
     def open(self) -> Iterator[h5py.Dataset]:
         """Open the source file and yield the dataset for live access.
 
-        Always opens the *current* file and dataset, so it may observe replacements.
-        The file is closed on normal and exceptional exit.
+        This always looks at the file as it is now, and closes it when the ``with`` block
+        ends.
 
         Yields
         ------

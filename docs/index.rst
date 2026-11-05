@@ -1,10 +1,10 @@
 h5t
 ===
 
-``h5t`` loads HDF5 groups into detached, typed Python records, and writes them back
-with the same schema. Group attributes and ordinary NumPy-array fields are materialized
-while the file is open. Typed datasets keep snapshot metadata and can read their payload
-lazily, without retaining an open file descriptor.
+``h5t`` turns HDF5 groups into plain, typed Python objects, and writes them back using
+the same description. You describe the layout of your file once as a class; h5t reads it,
+checks it, and closes the file for you. Large arrays can be loaded lazily, so you only
+pay for the data you actually use.
 
 .. code-block:: python
 
@@ -29,10 +29,10 @@ lazily, without retaining an open file descriptor.
 Where to start
 --------------
 
-- :doc:`getting_started/index`: install ``h5t``, then define, save and load a first schema.
-- :doc:`user_guide/index`: every rule of the schema language, arrays, collections,
-  writing, and the CLI.
-- :doc:`reference/index`: the public API.
+- :doc:`getting_started/index`: install ``h5t`` and save and load your first file.
+- :doc:`user_guide/index`: how to describe your files, work with arrays and collections,
+  write files, and check them from the command line.
+- :doc:`reference/index`: every function and class.
 
 .. toctree::
    :hidden:

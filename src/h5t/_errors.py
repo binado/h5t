@@ -10,16 +10,14 @@ class H5TError(Exception):
 class SchemaError(H5TError):
     """A schema class declaration is incoherent or unsupported.
 
-    Raised at the decorator call (or on first use for a deferred group record), and
-    for misuse such as loading a non-record type.
+    Usually raised right where the class is decorated.
     """
 
 
 class ValidationError(H5TError):
     """An HDF5 node (or a record being saved) does not conform to its schema.
 
-    Errors are fail-fast and path-aware: the message starts with the HDF5 path of the
-    offending node or attribute.
+    The message starts with where the problem is in the file.
 
     Parameters
     ----------

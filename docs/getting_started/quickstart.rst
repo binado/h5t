@@ -1,9 +1,10 @@
 Quickstart
 ==========
 
-A schema is a plain class, usually a dataclass, decorated with :func:`h5t.group` (a group,
-including the root) or :func:`h5t.dataset` (a child dataset). h5t adds no base class and
-builds each record by calling the class's own constructor.
+A *schema* is just a class, usually a dataclass, that describes part of your file. Mark a
+class with :func:`h5t.group` if it describes an HDF5 group (the root counts too), or with
+:func:`h5t.dataset` if it describes a dataset. Your class stays an ordinary class; h5t
+adds nothing to it.
 
 Define, save and load
 ---------------------
@@ -39,14 +40,14 @@ Define, save and load
    result = h5t.load(Result, "result.h5")
    print(result.version, result.values, result.measurement.unit)
 
-``h5t.load`` closes every handle before it returns, on normal and exceptional exits.
-The loaded record is *detached*: it holds no open file.
+When ``h5t.load`` returns, the file is already closed, even if something went wrong. The
+result is a normal Python object that doesn't depend on the file.
 
 Lazy arrays
 -----------
 
-A :class:`h5t.LazyArray` field is a snapshot of dataset metadata. The payload is read on
-first access:
+A :class:`h5t.LazyArray` field remembers a dataset's shape and type, but doesn't read the
+numbers until you ask for them:
 
 .. code-block:: python
 
@@ -70,10 +71,10 @@ first access:
    lazy = h5t.load(Run, "lazy.h5").samples
    print(lazy.path, lazy.shape, lazy.dtype, lazy.ndim)
 
-   complete = lazy.data          # first access reads and caches an ndarray
+   complete = lazy.data          # first access reads the data and keeps it
    assert lazy.read() is complete
 
    with lazy.open() as live:     # a fresh file view, useful for slices
        first_hundred = live[:100]
 
-See :doc:`/user_guide/arrays` for the full semantics.
+See :doc:`/user_guide/arrays` for more.

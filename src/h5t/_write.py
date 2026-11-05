@@ -340,9 +340,8 @@ def save(
 ) -> None:
     """Validate ``record`` against its schema and write it under ``root`` in ``path``.
 
-    Everything is validated and serialized in memory before the file is opened, so a bad
-    record never touches the target. If writing itself fails, what was written is
-    removed: the new file, or (for ``mode="a"``, best effort) the group save created.
+    The record is fully checked before the file is opened, so a bad record never touches
+    the target. If writing fails midway, what was written is removed.
 
     Parameters
     ----------

@@ -18,9 +18,8 @@ from h5t._array import LazyArray
 class Name:
     """Store a member under a different name in the HDF5 file.
 
-    Use it inside ``Annotated`` on any field kind (attribute, dataset, group or
-    collection) when the HDF5 name is not a valid Python identifier or differs from the
-    field name.
+    Use it inside ``Annotated`` when the name in the file differs from the field name,
+    for example because it isn't a valid Python identifier.
 
     Parameters
     ----------
@@ -44,19 +43,18 @@ class Name:
 class Attr:
     """Declare a field as an HDF5 attribute, with optional conversion hooks.
 
-    Scalar and ``Literal`` fields are attributes without any marker. Use ``Attr`` when
-    the stored value needs converting (e.g. a JSON string) or when an array-valued
-    field should be read from an attribute rather than a dataset. It is valid only on
-    attribute fields and never combines with ``Payload``.
+    Plain fields such as ``int`` or ``str`` are already read as attributes. Use ``Attr``
+    when the stored value needs converting (e.g. a JSON string), or when an array should
+    come from an attribute rather than a dataset.
 
     Parameters
     ----------
     converter : callable, optional
-        Applied to the value returned by h5py, before Pydantic validation. A failure
-        raises `ConversionError`.
+        Applied to the value read from the file, before validation. If it fails you get a
+        `ConversionError`.
     serializer : callable, optional
-        The inverse of ``converter`` for `save`: applied to the validated value just
-        before it is written, e.g. ``json.dumps``.
+        The reverse of ``converter``, used by `save` just before writing, e.g.
+        ``json.dumps``.
 
     Examples
     --------
@@ -79,9 +77,8 @@ class Attr:
 class Eager:
     """Read a dataset field's complete payload during `load` instead of lazily.
 
-    Valid only on dataset fields. Combined with `Payload` it is allowed only when the
-    payload field is a `LazyArray` (it prefetches the array), since an ``np.ndarray``
-    payload is already eager.
+    Use it on a dataset field typed `LazyArray` when you want the data ready straight
+    away. (An ``np.ndarray`` field is always read at load time.)
 
     Examples
     --------
@@ -98,20 +95,18 @@ class Eager:
 class Payload:
     """Load a child dataset into a record type that carries no ``@h5t.dataset`` marker.
 
-    Use it for a type you cannot decorate, such as a third-party class. All three
-    options live at the use site rather than on the record type. Prefer `dataset` when
-    you can decorate the class.
+    Use it for a class you can't decorate, such as one from another library. Prefer
+    `dataset` when the class is yours.
 
     Parameters
     ----------
     data : str
-        The field of the record type holding the payload. Annotate it ``np.ndarray``
-        (materialized eagerly) or `LazyArray` (read on first access).
+        The field that receives the data. Annotate it ``np.ndarray`` (read now) or
+        `LazyArray` (read later).
     attrs : str, optional
-        A ``Mapping``-annotated field that receives the dataset's attribute snapshot:
-        validated values for declared names, raw h5py values for undeclared ones.
+        A ``Mapping``-annotated field that receives all of the dataset's attributes.
     extras : {"ignore", "forbid"}
-        Policy for the dataset's undeclared attributes.
+        Whether to ignore (default) or reject attributes the class doesn't declare.
 
     Examples
     --------
