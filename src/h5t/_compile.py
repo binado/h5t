@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import inspect
 import os
 import posixpath
+import re
 import sys
 import types
 import typing
@@ -32,6 +34,7 @@ from h5t._spec import (
     Extras,
     FieldSpec,
     ForeignSpec,
+    Glob,
     MemberKind,
     Name,
     Payload,
@@ -114,7 +117,7 @@ def _split_annotation(owner: type, py_name: str, annotation: Any) -> tuple[Any, 
 
 
 def _adapter_annotation(core: Any, metadata: list[Any], optional: bool) -> Any:
-    foreign = tuple(item for item in metadata if not isinstance(item, (Name, Attr, Eager)))
+    foreign = tuple(item for item in metadata if not isinstance(item, (Name, Attr, Eager, Glob)))
     annotation = Annotated[core, *foreign] if foreign else core
     return annotation | None if optional else annotation
 
@@ -252,6 +255,45 @@ def _is_scalar_annotation(core: Any) -> bool:
     return isinstance(core, type) and (issubclass(core, Enum) or issubclass(core, np.generic))
 
 
+def _compile_glob(owner: type, py_name: str, marker: Glob) -> re.Pattern[str]:
+    pattern = marker.pattern
+    if not isinstance(pattern, str) or not pattern:
+        raise _schema_error(owner, py_name, "Glob requires a non-empty string pattern")
+    if "/" in pattern:
+        raise _schema_error(owner, py_name, "a Glob pattern cannot contain '/'")
+    return re.compile(fnmatch.translate(pattern))
+
+
+def _collection_item(owner: type, py_name: str, core: Any) -> FieldSpec:
+    """Compile the item type of a ``dict[str, T]`` / ``Mapping[str, T]`` collection."""
+    origin = typing.get_origin(core) or core
+    args = typing.get_args(core)
+    if origin not in (dict, Mapping) or len(args) != 2:
+        raise _schema_error(
+            owner,
+            py_name,
+            "a collection must be annotated dict[str, T] or Mapping[str, T]; "
+            "use Attr() for a dict-valued attribute",
+        )
+    key, item_annotation = args
+    if key is not str:
+        raise _schema_error(owner, py_name, "a collection key type must be str")
+    _, item_metadata, item_optional = _split_annotation(owner, py_name, item_annotation)
+    if item_optional:
+        raise _schema_error(owner, py_name, "collection items cannot be optional")
+    for forbidden in (Name, Attr, Glob):
+        if any(isinstance(m, forbidden) for m in item_metadata):
+            raise _schema_error(
+                owner, py_name, f"{forbidden.__name__} cannot annotate a collection item"
+            )
+    item = _field_spec(owner, py_name, item_annotation, _NO_DEFAULT, dataset_owner=False)
+    if item.kind is MemberKind.ATTRIBUTE:
+        raise _schema_error(owner, py_name, "collection items must be groups or datasets")
+    if item.kind is MemberKind.COLLECTION:
+        raise _schema_error(owner, py_name, "nested collections are not supported")
+    return item
+
+
 def _reject_eager_on_eager_payload(
     owner: type, py_name: str, eager_marker: Eager | None, foreign: ForeignSpec
 ) -> None:
@@ -274,6 +316,7 @@ def _field_spec(
     attr_marker = _marker(metadata, Attr, owner, py_name)
     eager_marker = _marker(metadata, Eager, owner, py_name)
     payload_marker = _marker(metadata, Payload, owner, py_name)
+    glob_marker = _marker(metadata, Glob, owner, py_name)
 
     h5_name = name_marker.name if name_marker is not None else py_name
     if not isinstance(h5_name, str) or not h5_name:
@@ -299,6 +342,8 @@ def _field_spec(
         raise _schema_error(owner, py_name, "Payload cannot annotate a LazyArray field")
 
     foreign: ForeignSpec | None = None
+    item: FieldSpec | None = None
+    glob: re.Pattern[str] | None = None
     if attr_marker is not None:
         if is_record or is_lazy_array:
             raise _schema_error(owner, py_name, "Attr cannot annotate a record or LazyArray field")
@@ -349,13 +394,22 @@ def _field_spec(
     elif _is_scalar_annotation(core):
         kind = MemberKind.ATTRIBUTE
         member_type = None
+    elif _is_mapping_annotation(core):
+        # No Attr marker (that branch ran first): a collection, i.e. one child group
+        # whose children become the items of a dict.
+        kind = MemberKind.COLLECTION
+        member_type = None
+        item = _collection_item(owner, py_name, core)
+        glob = _compile_glob(owner, py_name, glob_marker) if glob_marker is not None else None
     else:
         raise _schema_error(
             owner,
             py_name,
-            f"unsupported annotation {core!r}; containers require Attr(), and dynamic "
-            "collections are not supported",
+            f"unsupported annotation {core!r}; containers require Attr()",
         )
+
+    if glob_marker is not None and kind is not MemberKind.COLLECTION:
+        raise _schema_error(owner, py_name, "Glob applies only to dict[str, T] collection fields")
 
     if eager_marker is not None and kind is not MemberKind.DATASET:
         raise _schema_error(owner, py_name, "Eager applies only to dataset fields")
@@ -364,7 +418,11 @@ def _field_spec(
     if kind is not MemberKind.ATTRIBUTE and "/" in h5_name:
         raise _schema_error(owner, py_name, "a child Name cannot contain '/'")
 
-    if foreign is not None or is_record or is_lazy_array:
+    if kind is MemberKind.COLLECTION:
+        # The adapter only checks a default; each item is validated by its own adapter.
+        adapter_ann = dict
+        adapter = _build_record_adapter(owner, py_name, dict, optional)
+    elif foreign is not None or is_record or is_lazy_array:
         # Validate only the constructed/default value's runtime type. A normal
         # configured TypeAdapter is rejected for dataclasses/BaseModels/TypedDicts,
         # while an unconfigured full adapter would revalidate the record's fields.
@@ -392,6 +450,8 @@ def _field_spec(
         foreign=foreign,
         default_factory=default_factory,
         array=array_spec,
+        item=item,
+        glob=glob,
     )
 
 
@@ -965,6 +1025,55 @@ def _load_foreign_dataset_in_scope(
     return _construct_record(foreign, values, path)
 
 
+def _load_member(field: FieldSpec, node: Any, filename: str, path: str) -> Any:
+    """Load one non-attribute, non-collection member from ``node`` and validate it."""
+    if field.kind is MemberKind.GROUP:
+        if not isinstance(node, h5py.Group):
+            raise ValidationError(path, "expected a group, found a dataset")
+        assert field.member_type is not None
+        # A GROUP-kind record's ForeignSpec is deliberately not resolved at compile
+        # time (see _field_spec), so this is where a pending one is retried.
+        # `_compiled_record` turns a still-unresolved name into SchemaError.
+        value = _load_foreign_group(_compiled_record(field.member_type), node, filename, path)
+    elif field.kind is MemberKind.DATASET:
+        if not isinstance(node, h5py.Dataset):
+            raise ValidationError(path, "expected a dataset, found a group")
+        if field.foreign is not None:
+            value = _load_foreign_dataset(field.foreign, node, filename, path, eager=field.eager)
+        else:
+            # A bare LazyArray member: no record type, no declared attributes.
+            assert field.member_type is not None
+            value = _lazy_from_node(
+                typing.cast(type[LazyArray], field.member_type),
+                filename,
+                path,
+                node,
+                eager=field.eager,
+                array=field.array,
+            )
+    else:
+        if not isinstance(node, h5py.Dataset):
+            raise ValidationError(path, "expected a dataset, found a group")
+        if field.array is not None:
+            _check_array(field.array, _ghost(node), path)
+        value = np.asarray(node[()])
+    return _validate_value(field, value, path)
+
+
+def _load_collection(field: FieldSpec, node: Any, filename: str, path: str) -> dict[str, Any]:
+    """Load each (glob-matching) child of the collection's group as one item."""
+    if not isinstance(node, h5py.Group):
+        raise ValidationError(path, "expected a group, found a dataset")
+    assert field.item is not None
+    items: dict[str, Any] = {}
+    for name in node.keys():
+        key = str(name)
+        if field.glob is not None and field.glob.match(key) is None:
+            continue
+        items[key] = _load_member(field.item, node[name], filename, child_path(path, key))
+    return items
+
+
 def _load_group_values(
     spec: ClassSpec, group: h5py.Group, filename: str, path: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -993,41 +1102,10 @@ def _load_group_values_in_scope(
             values[field.py_name] = _missing_value(field, member_path)
             continue
         node = group[field.h5_name]
-        if field.kind is MemberKind.GROUP:
-            if not isinstance(node, h5py.Group):
-                raise ValidationError(member_path, "expected a group, found a dataset")
-            assert field.member_type is not None
-            # A GROUP-kind record's ForeignSpec is deliberately not resolved at compile
-            # time (see _field_spec), so this is where a pending one is retried.
-            # `_compiled_record` turns a still-unresolved name into SchemaError.
-            value = _load_foreign_group(
-                _compiled_record(field.member_type), node, filename, member_path
-            )
-        elif field.kind is MemberKind.DATASET:
-            if not isinstance(node, h5py.Dataset):
-                raise ValidationError(member_path, "expected a dataset, found a group")
-            if field.foreign is not None:
-                value = _load_foreign_dataset(
-                    field.foreign, node, filename, member_path, eager=field.eager
-                )
-            else:
-                # A bare LazyArray member: no record type, no declared attributes.
-                assert field.member_type is not None
-                value = _lazy_from_node(
-                    typing.cast(type[LazyArray], field.member_type),
-                    filename,
-                    member_path,
-                    node,
-                    eager=field.eager,
-                    array=field.array,
-                )
+        if field.kind is MemberKind.COLLECTION:
+            values[field.py_name] = _load_collection(field, node, filename, member_path)
         else:
-            if not isinstance(node, h5py.Dataset):
-                raise ValidationError(member_path, "expected a dataset, found a group")
-            if field.array is not None:
-                _check_array(field.array, _ghost(node), member_path)
-            value = np.asarray(node[()])
-        values[field.py_name] = _validate_value(field, value, member_path)
+            values[field.py_name] = _load_member(field, node, filename, member_path)
 
     return values, attrs
 

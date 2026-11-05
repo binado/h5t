@@ -46,7 +46,13 @@ Four modules, one direction of dependency (`_cli` → `_compile` → `_array`/`_
   dataset whose attributes the schema does not declare.
 - **`_compile.py`** — both halves of the system: annotation → `FieldSpec` compilation, and the
   loader that walks `h5py` nodes producing instances. `MemberKind` (ATTRIBUTE / ARRAY / DATASET /
-  GROUP) is the switch that decides which loading path a field takes in `_load_group_values`.
+  GROUP / COLLECTION) is the switch that decides which loading path a field takes in
+  `_load_group_values`. A `COLLECTION` field (`dict[str, T]`, compiled by `_collection_item`)
+  carries the item's own `FieldSpec` in `FieldSpec.item` and an optional compiled `Glob` regex
+  in `FieldSpec.glob`; `_load_collection` walks the one child group and calls `_load_member`
+  per matching child. `_load_member` is the per-member node-type check + GROUP/DATASET/ARRAY
+  load + validation, shared by plain fields and collection items, so bare-array items run in
+  the owner's `jaxtyped` scope while record items open their own.
   Within `MemberKind.DATASET`, `field.foreign is not None` is the finer-grained switch between
   `_load_foreign_dataset` (a record type, constructed via `record_type(**values)` through the
   shared `_construct_record`) and constructing `field.member_type` — a `LazyArray` subclass —
@@ -315,6 +321,7 @@ Module split: `tests/test_compile.py` covers field classification, deferral and 
 errors; `tests/test_foreign.py` covers the `Payload` marker specifically; `tests/test_records.py`
 covers the `@h5t.dataset`/`@h5t.group` decorator API — including forward-reference and
 self-referential (`GROUP`-kind) schemas, and bare `LazyArray` members.
+`tests/test_collections.py` covers `dict[str, T]` collections and `h5t.Glob`.
 
 `tests/test_pep649.py` is the one module deliberately *without* `from __future__ import
 annotations` — it exists to exercise the lazy-annotation paths every other module opts out of, and

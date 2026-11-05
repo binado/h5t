@@ -3,7 +3,7 @@
 from h5t._array import LazyArray
 from h5t._compile import dataset, group, load
 from h5t._errors import ConversionError, H5TError, SchemaError, ValidationError
-from h5t._spec import Attr, Eager, Name, Payload
+from h5t._spec import Attr, Eager, Glob, Name, Payload
 
 __version__ = "0.3.0"
 
@@ -11,6 +11,7 @@ __all__ = [
     "Attr",
     "ConversionError",
     "Eager",
+    "Glob",
     "H5TError",
     "LazyArray",
     "Name",

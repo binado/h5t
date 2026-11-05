@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -54,6 +55,22 @@ class Payload:
     extras: Literal["ignore", "forbid"] = "ignore"
 
 
+@dataclass(frozen=True)
+class Glob:
+    """Filter which children of a collection field's group are loaded.
+
+    Parameters
+    ----------
+    pattern : str
+        A shell-style pattern (``fnmatch.fnmatchcase``: ``*``, ``?``, ``[seq]``),
+        matched case-sensitively against each child's name. It may not be empty or
+        contain ``/``. Children that do not match are skipped. Valid only on a
+        ``dict[str, T]`` / ``Mapping[str, T]`` field.
+    """
+
+    pattern: str = "*"
+
+
 class Extras(Enum):
     """Policy for undeclared immediate HDF5 members."""
 
@@ -68,6 +85,7 @@ class MemberKind(Enum):
     ARRAY = "array"
     DATASET = "dataset"
     GROUP = "group"
+    COLLECTION = "collection"
 
 
 class RecordKind(Enum):
@@ -134,6 +152,8 @@ class FieldSpec:
     foreign: ForeignSpec | None = None
     default_factory: Callable[[], Any] | None = None
     array: ArraySpec | None = None
+    item: FieldSpec | None = None
+    glob: re.Pattern[str] | None = field(default=None, compare=False)
 
     @property
     def has_default(self) -> bool:

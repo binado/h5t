@@ -44,6 +44,7 @@ class Result:
     fisher: Float[np.ndarray, "n n"]
     lazy_fisher: Float[h5t.LazyArray, "n _"]
     nested: Nested
+    snaps: dict[str, Nested]
     recording: DecoratedRecording
     marked: Annotated[Recording, h5t.Payload("payload", attrs="attrs")]
     optional: str | None
@@ -54,6 +55,7 @@ result: Result = h5t.load(Result, Path("result.h5"))
 fisher: np.ndarray = result.fisher
 lazy_fisher: h5t.LazyArray = result.lazy_fisher
 version: int = result.version
+snaps: dict[str, Nested] = result.snaps
 values: np.ndarray = result.values
 samples: h5t.LazyArray = result.samples
 data: np.ndarray = result.samples.data

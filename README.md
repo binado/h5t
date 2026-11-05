@@ -101,6 +101,7 @@ own constructor with the loaded values, and offers no way to write one back.
 | `Annotated[<any dataset field>, Eager()]` | child dataset | complete payload cached during loading |
 | `np.ndarray` | child dataset | complete payload loaded as an ndarray |
 | `Float[np.ndarray, "n n"]`, `Float[LazyArray, "n _"]` (jaxtyping) | child dataset | dtype and shape checked against the file's metadata before any read; otherwise as `np.ndarray` / `LazyArray` |
+| `dict[str, T]` / `Mapping[str, T]` | child group named by the field | one item per child of that group, as a plain `dict`; `T` is any group/dataset record, `Payload` type, `LazyArray`, `np.ndarray` or jaxtyping array; filter with `Glob` |
 | `Annotated[T, Attr(...)]` | attribute | converter, then Pydantic validation |
 | scalar or `Literal[...]` | attribute | Pydantic validation |
 
@@ -111,7 +112,31 @@ array), since an `np.ndarray` payload is already eager.
 A parameterized alias such as `numpy.typing.NDArray[np.floating]` is accepted wherever
 `np.ndarray` is; for `NDArray` the dtype parameter is not validated (use jaxtyping, below,
 to check it). Unsupported collection-shaped
-child annotations raise `SchemaError`; dynamic collections are not yet supported.
+child annotations raise `SchemaError`.
+
+### Dynamic collections (`dict[str, T]`, `Glob`)
+
+Real files often hold one group or dataset per sample, with names a schema cannot list.
+A `dict[str, T]` or `Mapping[str, T]` field (no `Attr`) mirrors the HDF5 tree: it names
+**one child group** (`Name` is honoured), and its value is a plain `dict` with one item per
+child of that group, in HDF5 iteration order. `Annotated[..., h5t.Glob("chain_?")]` keeps
+only children whose name matches the shell-style pattern (case-sensitive; it may not be empty
+or contain `/`). Attributes on the collection's group are ignored.
+
+```python
+@h5t.group()
+@dataclass
+class Run:
+    snapshots: dict[str, Snapshot]
+    chains: Annotated[dict[str, h5t.LazyArray], h5t.Glob("chain_?")]
+    raw: Annotated[dict[str, Snapshot], h5t.Name("Raw Data")] = field(default_factory=dict)
+```
+
+A missing group follows the usual rules (`| None`, a default or `default_factory`, else a
+`ValidationError`). Keys must be `str`; items cannot be scalars, optional, nested
+collections, or carry `Name`/`Attr`/`Glob`. Bare array items share the owner record's
+jaxtyping dimension bindings; record items bind independently. Layouts with per-sample
+groups at the file *root* are not covered yet.
 A [jaxtyping](https://docs.kidger.site/jaxtyping/) annotation over `np.ndarray` or
 `LazyArray` has its dtype and shape checked by jaxtyping itself, from the dataset's HDF5
 metadata and without reading the data or casting it. `Float` accepts any float width and
