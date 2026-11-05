@@ -340,9 +340,8 @@ def save(
 ) -> None:
     """Validate ``record`` against its schema and write it under ``root`` in ``path``.
 
-    Everything is validated and serialized in memory before the file is opened, so a bad
-    record never touches the target. If writing itself fails, what was written is
-    removed: the new file, or (for ``mode="a"``, best effort) the group save created.
+    The record is fully checked before the file is opened, so a bad record never touches
+    the target. If writing fails midway, what was written is removed.
 
     Parameters
     ----------
@@ -369,6 +368,16 @@ def save(
         An ``Attr(serializer=...)`` raised.
     ValueError
         ``mode`` or ``root`` is invalid.
+
+    Examples
+    --------
+    >>> import dataclasses, h5t
+    >>> @h5t.group()
+    ... @dataclasses.dataclass
+    ... class Result:
+    ...     version: int
+    >>> h5t.save(Result(version=1), "out.h5", mode="w")
+    >>> h5t.save(Result(version=2), "out.h5", root="/run2", mode="a")
     """
     if mode not in ("w-", "x", "w", "a"):
         raise ValueError(f"mode must be 'w-', 'x', 'w' or 'a', got {mode!r}")

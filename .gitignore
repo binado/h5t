@@ -13,3 +13,6 @@ build/
 .mypy_cache/
 .ruff_cache/
 .hypothesis/
+
+# Docs
+docs/_build/

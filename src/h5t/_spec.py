@@ -16,19 +16,57 @@ from h5t._array import LazyArray
 
 @dataclass(frozen=True)
 class Name:
-    """Use ``name`` for this member in the HDF5 file."""
+    """Store a member under a different name in the HDF5 file.
+
+    Use it inside ``Annotated`` when the name in the file differs from the field name,
+    for example because it isn't a valid Python identifier.
+
+    Parameters
+    ----------
+    name : str
+        The name of the attribute, dataset or group in the file.
+
+    Examples
+    --------
+    >>> from typing import Annotated
+    >>> import dataclasses, h5t
+    >>> @h5t.group()
+    ... @dataclasses.dataclass
+    ... class Run:
+    ...     title: Annotated[str, h5t.Name("run title")]
+    """
 
     name: str
 
 
 @dataclass(frozen=True)
 class Attr:
-    """Declare a field as an HDF5 attribute.
+    """Declare a field as an HDF5 attribute, with optional conversion hooks.
 
-    ``converter`` is applied to the value returned by h5py before Pydantic
-    validation. It is useful for serialized attributes such as JSON strings.
-    ``serializer`` is its inverse for ``h5t.save``: it is applied to the validated
-    value just before it is written, e.g. ``json.dumps``.
+    Plain fields such as ``int`` or ``str`` are already read as attributes. Use ``Attr``
+    when the stored value needs converting (e.g. a JSON string), or when an array should
+    come from an attribute rather than a dataset.
+
+    Parameters
+    ----------
+    converter : callable, optional
+        Applied to the value read from the file, before validation. If it fails you get a
+        `ConversionError`.
+    serializer : callable, optional
+        The reverse of ``converter``, used by `save` just before writing, e.g.
+        ``json.dumps``.
+
+    Examples
+    --------
+    >>> import json
+    >>> from typing import Annotated, Any
+    >>> import dataclasses, h5t
+    >>> @h5t.group()
+    ... @dataclasses.dataclass
+    ... class Run:
+    ...     config: Annotated[
+    ...         dict[str, Any], h5t.Attr(converter=json.loads, serializer=json.dumps)
+    ...     ]
     """
 
     converter: Callable[[Any], Any] | None = None
@@ -37,20 +75,51 @@ class Attr:
 
 @dataclass(frozen=True)
 class Eager:
-    """Read a dataset field's complete payload during ``h5t.load`` instead of lazily."""
+    """Read a dataset field's complete payload during `load` instead of lazily.
+
+    Use it on a dataset field typed `LazyArray` when you want the data ready straight
+    away. (An ``np.ndarray`` field is always read at load time.)
+
+    Examples
+    --------
+    >>> from typing import Annotated
+    >>> import dataclasses, h5t
+    >>> @h5t.group()
+    ... @dataclasses.dataclass
+    ... class Run:
+    ...     samples: Annotated[h5t.LazyArray, h5t.Eager()]
+    """
 
 
 @dataclass(frozen=True)
 class Payload:
     """Load a child dataset into a record type that carries no ``@h5t.dataset`` marker.
 
-    ``data`` names the field of the record type holding the payload; it must be
-    annotated ``np.ndarray`` (materialized eagerly) or ``LazyArray`` (read on first
-    access). ``attrs``, if given, names a ``Mapping``-annotated field that receives the
-    dataset's attrs snapshot -- validated values for declared names, raw for undeclared.
-    ``extras`` governs the dataset's undeclared attributes. All three live at the use
-    site rather than on the record type, which is the point: ``Payload`` is for a
-    third-party type you cannot decorate. Prefer ``@h5t.dataset`` when you can.
+    Use it for a class you can't decorate, such as one from another library. Prefer
+    `dataset` when the class is yours.
+
+    Parameters
+    ----------
+    data : str
+        The field that receives the data. Annotate it ``np.ndarray`` (read now) or
+        `LazyArray` (read later).
+    attrs : str, optional
+        A ``Mapping``-annotated field that receives all of the dataset's attributes.
+    extras : {"ignore", "forbid"}
+        Whether to ignore (default) or reject attributes the class doesn't declare.
+
+    Examples
+    --------
+    >>> from typing import Annotated
+    >>> import dataclasses, numpy as np, h5t
+    >>> @dataclasses.dataclass
+    ... class Measurement:
+    ...     unit: str
+    ...     data: np.ndarray
+    >>> @h5t.group()
+    ... @dataclasses.dataclass
+    ... class Result:
+    ...     measurement: Annotated[Measurement, h5t.Payload("data")]
     """
 
     data: str
@@ -62,13 +131,23 @@ class Payload:
 class Glob:
     """Filter which children of a collection field's group are loaded.
 
+    Valid only on a ``dict[str, T]`` / ``Mapping[str, T]`` field.
+
     Parameters
     ----------
     pattern : str
         A shell-style pattern (``fnmatch.fnmatchcase``: ``*``, ``?``, ``[seq]``),
         matched case-sensitively against each child's name. It may not be empty or
-        contain ``/``. Children that do not match are skipped. Valid only on a
-        ``dict[str, T]`` / ``Mapping[str, T]`` field.
+        contain ``/``. Children that do not match are skipped.
+
+    Examples
+    --------
+    >>> from typing import Annotated
+    >>> import dataclasses, h5t
+    >>> @h5t.group()
+    ... @dataclasses.dataclass
+    ... class Run:
+    ...     chains: Annotated[dict[str, h5t.LazyArray], h5t.Glob("chain_?")]
     """
 
     pattern: str = "*"

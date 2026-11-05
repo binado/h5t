@@ -736,21 +736,46 @@ def dataset(
     extras: Literal["ignore", "forbid"] = "ignore",
     localns: Mapping[str, Any] | None = None,
 ) -> Callable[[_C], _C]:
-    """Mark a plain class as an h5t dataset record, in place of ``Annotated[T, Payload(...)]``.
+    """Mark a plain class as an h5t dataset record.
 
-    Compiles and validates immediately, against the class's own definition: a bad
-    ``data=`` name raises right here rather than at a distant owner field that happens
-    to use this type. An explicit ``Payload(...)`` at a particular use site still
-    overrides these defaults there, same as if this decorator had never run.
+    A dataset record has one field that holds the data; every other field is read from
+    the dataset's attributes. The class is checked immediately, so a mistake raises
+    `SchemaError` right at the decorator.
 
-    Typed to preserve ``cls``'s own identity through the decorator (``Callable[[_C], _C]``
-    rather than ``Callable[[type], type]``), so a decorated class keeps its precise type
-    for a static checker -- e.g. through ``h5t.load``'s own ``TypeVar`` return.
+    Parameters
+    ----------
+    data : str
+        The field that receives the data: ``np.ndarray`` (read now) or `LazyArray`
+        (read later).
+    attrs : str, optional
+        A ``Mapping``-annotated field that receives all of the dataset's attributes.
+    extras : {"ignore", "forbid"}
+        Whether to ignore (default) or reject attributes the class doesn't declare.
+    localns : mapping, optional
+        Extra names that annotations may refer to, for names the decorating code can't
+        see. See :doc:`/user_guide/compilation`.
 
-    ``localns`` adds names to the annotation namespace on top of the decorating
-    function's own locals. A dataset record never defers, so it matters only for a name
-    the decorating frame does not hold.
+    Returns
+    -------
+    callable
+        A class decorator returning the class itself.
+
+    Raises
+    ------
+    SchemaError
+        The declaration is incoherent or unsupported.
+
+    Examples
+    --------
+    >>> import dataclasses, h5t
+    >>> @h5t.dataset(data="values")
+    ... @dataclasses.dataclass
+    ... class Measurement:
+    ...     unit: str
+    ...     values: h5t.LazyArray
     """
+    # Typed Callable[[_C], _C] (not Callable[[type], type]) so a decorated class keeps its
+    # precise type for static checkers, e.g. through h5t.load's TypeVar return.
 
     def decorator(cls: _C) -> _C:
         foreign = _foreign_spec(
@@ -774,20 +799,44 @@ def group(
     extras: Literal["ignore", "forbid"] = "ignore",
     localns: Mapping[str, Any] | None = None,
 ) -> Callable[[_C], _C]:
-    """Mark a plain class as an h5t group record, loadable via ``h5t.load``.
+    """Mark a plain class as an h5t group record, loadable via `load`.
 
-    Unlike ``dataset()``, a group record's fields are not restricted to attributes, so
-    it may forward-reference another schema type -- including itself
-    (``child: Node | None``). An unresolved annotation therefore defers compilation
-    instead of raising immediately, and is retried lazily by ``_ensure_record_compiled``
-    the first time this record is actually used as a field or loaded directly via
-    ``h5t.load``.
+    A group record can have attributes, arrays, datasets and nested groups, and may refer
+    to classes defined later or to itself (``child: Node | None``); in that case it is
+    checked the first time it is used. See :doc:`/user_guide/compilation`.
 
-    The retry sees module globals, the class's own name, and ``localns`` -- not the
-    decorating function's locals, which are read for the immediate compile only. A
-    function-local record that defers and names another function-local type must
-    therefore pass it, e.g. ``@h5t.group(localns={"Child": Child})``.
+    Parameters
+    ----------
+    attrs : str, optional
+        A ``Mapping``-annotated field that receives all of the group's attributes.
+    extras : {"ignore", "forbid"}
+        Whether to ignore (default) or reject children and attributes the class doesn't
+        declare.
+    localns : mapping, optional
+        Extra names that annotations may refer to. Needed only for a class defined inside
+        a function that refers to a later local class, e.g. ``localns={"Child": Child}``.
+
+    Returns
+    -------
+    callable
+        A class decorator returning the class itself.
+
+    Raises
+    ------
+    SchemaError
+        The declaration is incoherent or unsupported.
+
+    Examples
+    --------
+    >>> import dataclasses, h5t
+    >>> @h5t.group(extras="forbid")
+    ... @dataclasses.dataclass
+    ... class Result:
+    ...     version: int
+    ...     note: str | None = None
     """
+    # The deferred retry is done by _ensure_record_compiled the first time the record is
+    # used as a field or loaded.
 
     def decorator(cls: _C) -> _C:
         # Plant the pending marker first: the class's own name is seeded into the
@@ -1144,10 +1193,47 @@ def _normalize_root(root: str) -> str:
 
 
 def load(schema: type[_T], path: str | os.PathLike[str], root: str = "/") -> _T:
-    """Load ``schema`` from ``root`` in the file at ``path`` and close the file.
+    """Load a group record from an HDF5 file and close the file.
 
-    ``schema`` is a ``@h5t.group``-decorated record; a ``@h5t.dataset`` record names a
-    dataset, not a group-shaped root, and is rejected with ``SchemaError``.
+    The file is closed before ``load`` returns, even on error, so the result doesn't
+    depend on it. (A `LazyArray` remembers the file name so it can read its data later.)
+
+    Parameters
+    ----------
+    schema : type
+        A class decorated with ``@h5t.group``. (A ``@h5t.dataset`` class describes a
+        dataset, so it can't be loaded directly.)
+    path : str or os.PathLike
+        The HDF5 file to read.
+    root : str
+        Absolute path of the group to load.
+
+    Returns
+    -------
+    object
+        An instance of ``schema``.
+
+    Raises
+    ------
+    SchemaError
+        ``schema`` is not a group record, or one of its annotations can't be resolved.
+    ValidationError
+        The file does not conform to the schema (including a missing ``root``).
+    ConversionError
+        An ``Attr(converter=...)`` raised.
+    ValueError
+        ``root`` is not an absolute path.
+
+    Examples
+    --------
+    >>> import dataclasses, h5t
+    >>> @h5t.group()
+    ... @dataclasses.dataclass
+    ... class Result:
+    ...     version: int
+    >>> h5t.save(Result(version=1), "result.h5", mode="w")
+    >>> h5t.load(Result, "result.h5").version
+    1
     """
     if not (isinstance(schema, type) and "__h5t_record__" in schema.__dict__):
         raise SchemaError(f"{schema!r} is not a decorated record (@h5t.dataset/@h5t.group)")

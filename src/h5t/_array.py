@@ -16,7 +16,46 @@ _DATA_NOT_LOADED = object()
 
 
 class LazyArray:
-    """A detached HDF5 dataset payload: metadata snapshot, data read on first access."""
+    """A detached HDF5 dataset payload: metadata snapshot, data read on first access.
+
+    No file is kept open: a ``LazyArray`` just remembers where the dataset lives, along
+    with its shape and dtype, and reads the numbers only when you ask. You normally get
+    one from `load` rather than creating it yourself. See :doc:`/user_guide/arrays`.
+
+    Parameters
+    ----------
+    filename : str
+        File the dataset lives in.
+    path : str
+        Absolute HDF5 path of the dataset.
+    shape : tuple of int
+        Shape captured when the file was loaded.
+    dtype : numpy.dtype
+        Dtype captured when the file was loaded.
+    data : numpy.ndarray, optional
+        Data you already have in memory; if given, nothing is read from the file.
+
+    Attributes
+    ----------
+    filename : str
+        File the dataset lives in.
+    path : str
+        Absolute HDF5 path of the dataset.
+    shape : tuple of int
+        Shape captured at load time.
+    dtype : numpy.dtype
+        Dtype captured at load time.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from h5t import LazyArray
+    >>> lazy = LazyArray("run.h5", "/samples", (3,), np.dtype("f8"), data=np.zeros(3))
+    >>> lazy.ndim
+    1
+    >>> lazy.data.shape
+    (3,)
+    """
 
     def __init__(
         self,
@@ -39,7 +78,21 @@ class LazyArray:
 
     @property
     def data(self) -> np.ndarray:
-        """Read and cache the complete current payload as a NumPy array."""
+        """Read and cache the complete payload as a NumPy array.
+
+        The first access reads the dataset from the file and keeps the result; later
+        accesses reuse it.
+
+        Returns
+        -------
+        numpy.ndarray
+            The complete payload.
+
+        Raises
+        ------
+        ValidationError
+            The dataset no longer exists in the source file, or is not a dataset.
+        """
         if self._h5t_data is _DATA_NOT_LOADED:
             with self.open() as dataset:
                 value = np.asarray(dataset[()])
@@ -47,12 +100,38 @@ class LazyArray:
         return typing.cast(np.ndarray, self._h5t_data)
 
     def read(self) -> np.ndarray:
-        """Return the same cached complete payload as ``data``."""
+        """Return the complete payload; an alias of `data`.
+
+        Returns
+        -------
+        numpy.ndarray
+            The same cached array as `data`.
+
+        Raises
+        ------
+        ValidationError
+            The dataset no longer exists in the source file, or is not a dataset.
+        """
         return self.data
 
     @contextmanager
     def open(self) -> Iterator[h5py.Dataset]:
-        """Open the current source file and yield this dataset for live access."""
+        """Open the source file and yield the dataset for live access.
+
+        This always looks at the file as it is now, and closes it when the ``with`` block
+        ends.
+
+        Yields
+        ------
+        h5py.Dataset
+            The open dataset, valid only inside the ``with`` block. Useful for reading
+            slices without loading the whole payload.
+
+        Raises
+        ------
+        ValidationError
+            The dataset no longer exists, or the path names a group.
+        """
         with h5py.File(self.filename, mode="r") as h5file:
             node = h5file.get(self.path)
             if node is None:
