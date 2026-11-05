@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Documentation
+
+- Sphinx documentation site (getting started, user guide, API reference) for Read the Docs.
+- Numpy-style docstrings for the whole public API.
+- README trimmed to a short pitch and one example; the rest moved into the user guide.
+
 ## [0.4.0]
 
 ### Added

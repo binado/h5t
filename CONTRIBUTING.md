@@ -32,8 +32,21 @@ skipped on the `.python-version` default (3.11), so run it explicitly with
 references.
 
 See `AGENTS.md` for the architecture and the invariants each module depends on (compilation
-timing, instance construction via `object.__new__`, the frozen `Group`/`Dataset` public surface,
-etc.) before making non-trivial changes.
+timing, records built through their own constructor, deferral of `@h5t.group` forward
+references, etc.) before making non-trivial changes.
+
+## Documentation
+
+The docs are Sphinx/RST under `docs/`, hosted on Read the Docs. Public docstrings are
+numpy-style and rendered by autodoc + napoleon.
+
+```bash
+uv sync --group docs
+just docs build     # warnings are errors (-W), as in CI and on Read the Docs
+just docs open      # build, then open in a browser
+```
+
+Code examples in the docs should run as written.
 
 ## Commit messages
 

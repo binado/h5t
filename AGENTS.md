@@ -12,10 +12,18 @@ uv run --python 3.14 pytest              # PEP 649 paths; skipped on the default
 uv run ty check                          # type check (Astral's ty, not mypy/pyright)
 uv run ruff check .                      # lint
 uv run ruff format --check src tests     # format check, as CI runs it
+just docs build                          # Sphinx docs; warnings are errors (-W)
+just docs build                          # Sphinx docs; warnings are errors (-W)
 ```
 
 `[tool.ty.src]` restricts type checking to `src/h5t` and `tests/acceptance_example.py`. `prek.toml`
 runs ruff-check, ruff-format and ty as pre-commit hooks. Commits follow Conventional Commits.
+
+Public docstrings are numpy-style and rendered by Sphinx (`docs/`, built with `-W`), so keep
+them user-facing; put internal reasoning in `#` comments.
+
+Public docstrings are numpy-style and rendered by Sphinx (`docs/`, built with `-W`), so keep
+them user-facing; put internal reasoning in `#` comments.
 
 ## Architecture
 

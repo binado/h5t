@@ -369,6 +369,16 @@ def save(
         An ``Attr(serializer=...)`` raised.
     ValueError
         ``mode`` or ``root`` is invalid.
+
+    Examples
+    --------
+    >>> import dataclasses, h5t
+    >>> @h5t.group()
+    ... @dataclasses.dataclass
+    ... class Result:
+    ...     version: int
+    >>> h5t.save(Result(version=1), "out.h5", mode="w")
+    >>> h5t.save(Result(version=2), "out.h5", root="/run2", mode="a")
     """
     if mode not in ("w-", "x", "w", "a"):
         raise ValueError(f"mode must be 'w-', 'x', 'w' or 'a', got {mode!r}")
