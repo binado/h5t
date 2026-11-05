@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0]
+
 ### Added
 
 - `h5t.save(record, path, root="/", mode="w-", overwrite=False)`: a write path driven by
@@ -16,6 +18,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FieldSpec` (internal) gains a `serializer` field.
 - Dynamic collections: `dict[str, T]` / `Mapping[str, T]` fields load every child of one
   named group into a `dict`, and the new `h5t.Glob(pattern)` marker filters the children.
+- jaxtyping array validation: `Float[np.ndarray, "n n"]` and `Float[h5t.LazyArray, "n _"]`
+  fields (and dataset-record payloads) have their dtype and shape checked by jaxtyping
+  against the file's metadata, with no data read and no casting. Named dimensions unify
+  across the array fields of one record. Plain `np.ndarray` and `NDArray[...]` stay
+  unchecked.
 - `localns=` on `@h5t.dataset` and `@h5t.group`: extra names for resolving the record's
   annotations.
 
@@ -24,16 +31,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Behavior change:** a deferred `@h5t.group` record no longer retains a snapshot of the
   decorating function's locals. A function-local record that defers on a later-defined
   name *and* uses a function-local type now needs `localns={...}`; otherwise `h5t.load`
-  raises `SchemaError`. Function-local self-references now resolve. Annotation
-  resolution uses `typing.get_type_hints` (≤3.13) / `annotationlib` (3.14+) instead of
-  h5t's own bytecode scanning, which means a broken annotation on a base class now fails
-  the subclass, and names in the class body no longer resolve in string annotations.
-
-- jaxtyping array validation: `Float[np.ndarray, "n n"]` and `Float[h5t.LazyArray, "n _"]`
-  fields (and dataset-record payloads) have their dtype and shape checked by jaxtyping
-  against the file's metadata, with no data read and no casting. Named dimensions unify
-  across the array fields of one record. Plain `np.ndarray` and `NDArray[...]` stay
-  unchecked. jaxtyping (>=0.2.36) is now a dependency.
+  raises `SchemaError`. Function-local self-references now resolve.
+- **Behavior change:** annotation resolution uses `typing.get_type_hints` (<=3.13) /
+  `annotationlib` (3.14+) instead of h5t's own bytecode scanning. A broken annotation on a
+  base class now fails the subclass, and names in the class body no longer resolve in
+  string annotations.
+- **New dependency:** `jaxtyping>=0.2.36` is now a required runtime dependency.
 
 ## [0.3.0]
 
@@ -86,7 +89,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Initial release: `Group`/`Dataset` schema classes, `Name`/`Attr`/`Eager` markers, the
   `h5t check` CLI, and Pydantic-backed attribute validation.
 
-[Unreleased]: https://github.com/binado/h5t/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/binado/h5t/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/binado/h5t/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/binado/h5t/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/binado/h5t/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/binado/h5t/commits/v0.1.0
