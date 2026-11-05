@@ -6,7 +6,7 @@ from h5t._errors import ConversionError, H5TError, SchemaError, ValidationError
 from h5t._spec import Attr, Eager, Glob, Name, Payload
 from h5t._write import save
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Attr",
