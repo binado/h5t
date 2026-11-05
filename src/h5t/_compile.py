@@ -83,7 +83,6 @@ def _raised_by_annotation(exc: NameError, cls: type) -> bool:
     return code is getattr(getattr(cls, "__annotate__", None), "__code__", None)
 
 
-
 def _split_annotation(owner: type, py_name: str, annotation: Any) -> tuple[Any, list[Any], bool]:
     """Extract h5t/constraint metadata and optionality from an annotation."""
     metadata: list[Any] = []
@@ -583,6 +582,20 @@ def _foreign_spec(
 _C = typing.TypeVar("_C", bound=type)
 
 
+def _transient_locals(localns: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Read the decorator caller's locals once, for the immediate compile only.
+
+    ``sys._getframe(2)`` is the frame that applied the decorator (this helper is called
+    from ``decorator``, which the ``class`` statement's caller invoked). The copy is
+    never stored, so nothing it names outlives the compile; an explicit ``localns``
+    wins over it.
+    """
+    namespace = dict(sys._getframe(2).f_locals)
+    if localns:
+        namespace.update(localns)
+    return namespace
+
+
 def dataset(
     data: str,
     attrs: str | None = None,
@@ -610,7 +623,7 @@ def dataset(
             data=data,
             attrs=attrs,
             extras_raw=extras,
-            localns=localns,
+            localns=_transient_locals(localns),
         )
         setattr(cls, "__h5t_record__", foreign)  # noqa: B010 -- cls is an arbitrary user class
         return cls
@@ -655,7 +668,7 @@ def group(
                 data=None,
                 attrs=attrs,
                 extras_raw=extras,
-                localns=localns,
+                localns=_transient_locals(localns),
             )
         except _UnresolvedAnnotation:
             return cls
