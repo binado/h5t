@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
 
-import numpy as np
 from pydantic import TypeAdapter
 
 from h5t._array import LazyArray
@@ -82,44 +81,18 @@ _NO_DEFAULT = object()
 
 
 @dataclass(frozen=True)
-class Fixed:
-    """An axis that must have exactly ``size`` elements."""
-
-    size: int
-
-
-@dataclass(frozen=True)
-class Named:
-    """An axis whose size binds on first use and must agree everywhere in one record."""
-
-    name: str
-
-
-@dataclass(frozen=True)
-class Anon:
-    """An axis of any size (``_``)."""
-
-
-@dataclass(frozen=True)
-class Variadic:
-    """Any number of axes (``...``, ``*_``, or ``*name``); ``name`` binds their shape."""
-
-    name: str | None
-
-
-Dim = Fixed | Named | Anon | Variadic
-
-
-@dataclass(frozen=True)
 class ArraySpec:
-    """The shape and dtype a jaxtyping annotation asks an HDF5 dataset to satisfy.
+    """A jaxtyping array annotation, kept whole so jaxtyping does the checking.
 
-    ``dtypes`` is the set of NumPy dtypes (native byte order) the dataset's dtype must
-    belong to; ``None`` accepts any dtype (jaxtyping's ``Shaped``).
+    ``hint`` is the jaxtyping class itself (``Float[np.ndarray, "n n"]``); it is excluded
+    from comparison because jaxtyping builds a fresh class per subscript, so two
+    identical annotations would otherwise never compare equal. ``family`` (``Float``) and
+    ``dim_str`` carry the identity.
     """
 
-    dims: tuple[Dim, ...]
-    dtypes: frozenset[np.dtype[Any]] | None
+    hint: type = field(compare=False, repr=False)
+    family: type
+    dim_str: str
 
 
 @dataclass(frozen=True)

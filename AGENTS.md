@@ -140,19 +140,27 @@ class whose public surface a field name could shadow. Only `_check_duplicate_nam
 
 ### jaxtyping arrays: `ArraySpec` and `_check_array`
 
-`_unwrap_jaxtyping` duck-types a class carrying `dim_str`, `dtypes` and `array_type` (h5t
-never imports jaxtyping) and rewrites it, early in `_field_spec` and in the payload check of
-`_compile_foreign_fields`, to its backing `np.ndarray` or `LazyArray` subclass, so every
-later branch classifies it exactly as the unannotated type. Only `FieldSpec.array` /
-`ForeignSpec.payload_array` (an `ArraySpec`: `Fixed`/`Named`/`Anon`/`Variadic` dims plus a
-dtype frozenset, `None` for `Shaped`) records the difference. `_parse_dim_str` rejects what
-cannot be checked from metadata (`#`, `?`, arithmetic, a second variadic); `_resolve_dtypes`
-drops names NumPy cannot represent (bfloat16, fp8).
+jaxtyping is a runtime dependency and does the checking; h5t never parses a shape string.
+`_unwrap_jaxtyping` recognises an `AbstractArray` subclass and rewrites it, early in
+`_field_spec` and in the payload check of `_compile_foreign_fields`, to its backing
+`np.ndarray` or `LazyArray` subclass, so every later branch classifies it exactly as the
+unannotated type. The jaxtyping class itself is kept on `FieldSpec.array` /
+`ForeignSpec.payload_array` as an `ArraySpec` (`hint` is excluded from equality because
+jaxtyping builds a fresh class per subscript; `family` and `dim_str` carry identity).
 
-`_check_array` reads only `node.shape`/`node.dtype`, before any `node[()]`. Binding scope
-is one `_load_group_values` call: `bindings`/`origins` are created there and never passed to
-a nested `_load_foreign_group`, and `_load_foreign_dataset` uses fresh ones. A named variadic
-binds under `*name`, a separate key from a plain `name`.
+`_check_array` calls `hint.__instancecheck_str__(candidate)` -- the non-public method
+behind `isinstance`, which returns the failure reason (`""` means it conforms) -- and wraps a
+reason in `ValidationError(path, reason)`. The candidate needs only `shape` and `dtype`, so
+no data is read: an `np.ndarray` field gets `_ghost(node)`, a zero-stride
+`np.broadcast_to` of a 0-d array (one scalar allocated, however large the dataset), and a
+`LazyArray` field gets the `LazyArray` built from the same metadata (`_lazy_from_node`
+checks it before any eager read). A guard test fails if jaxtyping drops the attributes or
+the method.
+
+Binding scope is a `with jaxtyped("context")` -- jaxtyping's public scoping API -- opened
+once per `_load_group_values` call and once per `_load_foreign_dataset`. A nested record
+opens its own context, so it starts with fresh bindings. Error text is jaxtyping's, so it
+does not name the path that bound a dimension.
 
 ### Array annotations see through type aliases
 

@@ -6,7 +6,6 @@ import dataclasses
 import inspect
 import os
 import posixpath
-import re
 import sys
 import types
 import typing
@@ -18,6 +17,7 @@ from typing import Annotated, Any, ClassVar, Literal
 
 import h5py
 import numpy as np
+from jaxtyping import AbstractArray, jaxtyped
 from pydantic import ConfigDict, InstanceOf, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
@@ -25,22 +25,17 @@ from h5t._array import LazyArray
 from h5t._errors import ConversionError, SchemaError, ValidationError
 from h5t._spec import (
     _NO_DEFAULT,
-    Anon,
     ArraySpec,
     Attr,
     ClassSpec,
-    Dim,
     Eager,
     Extras,
     FieldSpec,
-    Fixed,
     ForeignSpec,
     MemberKind,
     Name,
-    Named,
     Payload,
     RecordKind,
-    Variadic,
     attr_path,
     child_path,
 )
@@ -307,75 +302,14 @@ def _is_ndarray_annotation(core: Any) -> bool:
     return False
 
 
-_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-
-
-def _parse_dim_str(owner: type, py_name: str, dim_str: str) -> tuple[Dim, ...]:
-    """Parse a jaxtyping shape string into dimensions, rejecting what h5t cannot check."""
-    dims: list[Dim] = []
-    for token in dim_str.split():
-        dim: Dim
-        if token == "_":
-            dim = Anon()
-        elif token in ("...", "*_"):
-            dim = Variadic(None)
-        elif token.startswith("*") and _IDENTIFIER.fullmatch(token[1:]):
-            dim = Variadic(token[1:])
-        elif token.isdecimal():
-            dim = Fixed(int(token))
-        elif _IDENTIFIER.fullmatch(token):
-            dim = Named(token)
-        elif "#" in token:
-            raise _schema_error(
-                owner, py_name, f"broadcast dimension {token!r} is not supported in {dim_str!r}"
-            )
-        elif "?" in token:
-            raise _schema_error(
-                owner, py_name, f"symbolic-optional dimension {token!r} is not supported"
-            )
-        elif any(ch in token for ch in "=+-*/%()"):
-            raise _schema_error(
-                owner, py_name, f"dimension expression {token!r} is not supported in {dim_str!r}"
-            )
-        else:
-            raise _schema_error(owner, py_name, f"unrecognized dimension {token!r} in {dim_str!r}")
-        dims.append(dim)
-    if sum(isinstance(dim, Variadic) for dim in dims) > 1:
-        raise _schema_error(
-            owner, py_name, f"at most one variadic dimension is allowed: {dim_str!r}"
-        )
-    return tuple(dims)
-
-
-def _resolve_dtypes(owner: type, py_name: str, names: Any) -> frozenset[np.dtype[Any]] | None:
-    """Map jaxtyping dtype names onto NumPy dtypes; ``None`` means any dtype."""
-    if not isinstance(names, tuple):
-        return None  # jaxtyping's `Shaped` uses a sentinel rather than a tuple
-    resolved: set[np.dtype[Any]] = set()
-    for name in names:
-        try:
-            resolved.add(np.dtype(name))
-        except TypeError:
-            continue  # bfloat16, fp8, int4, ...: NumPy cannot represent it, so no file has it
-    if not resolved:
-        raise _schema_error(
-            owner, py_name, f"none of the dtypes {names!r} can be represented by NumPy"
-        )
-    return frozenset(resolved)
-
-
 def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> tuple[Any, ArraySpec | None]:
     """Split a jaxtyping array type into its backing class and an ``ArraySpec``.
 
-    Detected by duck typing (a class carrying ``dim_str``, ``dtypes`` and ``array_type``)
-    so h5t never imports jaxtyping. Anything else is returned unchanged.
+    The backing class (``np.ndarray`` or a ``LazyArray`` subclass) is what the rest of
+    the compiler classifies; the jaxtyping class is kept to do the checking at load time.
+    Anything that is not a jaxtyping array is returned unchanged.
     """
-    if not (
-        isinstance(core, type)
-        and hasattr(core, "dim_str")
-        and hasattr(core, "dtypes")
-        and hasattr(core, "array_type")
-    ):
+    if not (isinstance(core, type) and issubclass(core, AbstractArray)):
         return core, None
     array_type = core.array_type
     if not (
@@ -387,85 +321,43 @@ def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> tuple[Any, ArrayS
             py_name,
             f"jaxtyping array type {array_type!r} is not supported; use np.ndarray or LazyArray",
         )
-    spec = ArraySpec(
-        _parse_dim_str(owner, py_name, core.dim_str), _resolve_dtypes(owner, py_name, core.dtypes)
-    )
-    return array_type, spec
+    return array_type, ArraySpec(core, core.dtype, core.dim_str)
 
 
-def _check_array(
-    spec: ArraySpec,
+def _check_array(spec: ArraySpec, candidate: Any, path: str) -> None:
+    """Ask jaxtyping whether ``candidate`` satisfies ``spec``; call inside a record scope.
+
+    ``candidate`` stands in for the dataset and only needs ``shape`` and ``dtype``: a
+    zero-stride ghost ndarray, or the ``LazyArray`` built from the same metadata. Named
+    dimensions bind in the enclosing ``jaxtyped("context")``.
+    """
+    reason = spec.hint.__instancecheck_str__(candidate)  # ty: ignore[unresolved-attribute]
+    if reason:
+        raise ValidationError(path, reason)
+
+
+def _ghost(node: h5py.Dataset) -> np.ndarray:
+    """Return an ndarray with ``node``'s shape and dtype that allocates one scalar only."""
+    return np.broadcast_to(np.empty((), node.dtype), node.shape)
+
+
+def _lazy_from_node(
+    lazy_type: type[LazyArray],
+    filename: str,
+    path: str,
     node: h5py.Dataset,
-    bindings: dict[str, Any],
-    origins: dict[str, str],
-    path: str,
-) -> None:
-    """Check ``node``'s dtype and shape against ``spec`` without reading any data."""
-    if spec.dtypes is not None:
-        dtype = np.dtype(node.dtype).newbyteorder("=")
-        if dtype not in spec.dtypes:
-            expected = ", ".join(sorted(d.name for d in spec.dtypes))
-            raise ValidationError(path, f"dtype {dtype.name} is not one of {expected}")
-
-    shape = tuple(int(size) for size in node.shape)
-    dims = spec.dims
-    variadic = next((i for i, dim in enumerate(dims) if isinstance(dim, Variadic)), None)
-    if variadic is None:
-        if len(shape) != len(dims):
-            raise ValidationError(
-                path, f"expected {len(dims)} dimensions, found {len(shape)} (shape {shape})"
-            )
-        spans = [(dim, i, i + 1) for i, dim in enumerate(dims)]
-    else:
-        fixed = len(dims) - 1
-        if len(shape) < fixed:
-            raise ValidationError(
-                path, f"expected at least {fixed} dimensions, found {len(shape)} (shape {shape})"
-            )
-        stop = len(shape) - (len(dims) - variadic - 1)
-        spans = [(dim, i, i + 1) for i, dim in enumerate(dims[:variadic])]
-        spans.append((dims[variadic], variadic, stop))
-        spans.extend((dim, stop + k, stop + k + 1) for k, dim in enumerate(dims[variadic + 1 :]))
-
-    for dim, start, stop in spans:
-        if isinstance(dim, Fixed):
-            if shape[start] != dim.size:
-                raise ValidationError(
-                    path, f"axis {start} has size {shape[start]}, expected {dim.size}"
-                )
-        elif isinstance(dim, Named):
-            _bind(
-                dim.name, dim.name, shape[start], f"axis {start} has size", bindings, origins, path
-            )
-        elif isinstance(dim, Variadic) and dim.name is not None:
-            _bind(
-                f"*{dim.name}",
-                f"*{dim.name}",
-                shape[start:stop],
-                f"axes {start}:{stop} have shape",
-                bindings,
-                origins,
-                path,
-            )
-
-
-def _bind(
-    key: str,
-    label: str,
-    value: Any,
-    found: str,
-    bindings: dict[str, Any],
-    origins: dict[str, str],
-    path: str,
-) -> None:
-    """Bind ``key`` to ``value`` on first use; afterwards require the same value."""
-    if key not in bindings:
-        bindings[key] = value
-        origins[key] = path
-    elif bindings[key] != value:
-        raise ValidationError(
-            path, f"{found} {value}, expected {label}={bindings[key]} (bound by {origins[key]})"
-        )
+    *,
+    eager: bool,
+    array: ArraySpec | None,
+) -> LazyArray:
+    """Build a ``LazyArray``, validating its metadata before any payload is read."""
+    shape, dtype = tuple(node.shape), np.dtype(node.dtype)
+    lazy = lazy_type(filename, path, shape, dtype)
+    if array is not None:
+        _check_array(array, lazy, path)
+    if eager:
+        lazy = lazy_type(filename, path, shape, dtype, data=np.asarray(node[()]))
+    return lazy
 
 
 def _is_mapping_annotation(core: Any) -> bool:
@@ -1146,6 +1038,14 @@ def _load_foreign_dataset(
     foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str, *, eager: bool = False
 ) -> Any:
     """Load ``node`` into an instance of ``foreign.record_type`` via its constructor."""
+    # A dataset record is its own binding scope: named dims bind from its payload only.
+    with jaxtyped("context"):
+        return _load_foreign_dataset_in_scope(foreign, node, filename, path, eager=eager)
+
+
+def _load_foreign_dataset_in_scope(
+    foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str, *, eager: bool
+) -> Any:
     spec = foreign.spec
     _check_dataset_extras(spec, node, path)
     raw = _raw_attrs(node)
@@ -1155,18 +1055,18 @@ def _load_foreign_dataset(
         values[field.py_name] = _load_attribute(field, raw, attrs, path)
 
     assert foreign.data is not None
-    if foreign.payload_array is not None:
-        # A dataset record is its own binding scope: named dims bind from this payload only.
-        _check_array(foreign.payload_array, node, {}, {}, path)
     if foreign.lazy_type is not None:
-        values[foreign.data] = foreign.lazy_type(
+        values[foreign.data] = _lazy_from_node(
+            foreign.lazy_type,
             filename,
             path,
-            tuple(node.shape),
-            np.dtype(node.dtype),
-            data=np.asarray(node[()]) if eager else None,
+            node,
+            eager=eager,
+            array=foreign.payload_array,
         )
     else:
+        if foreign.payload_array is not None:
+            _check_array(foreign.payload_array, _ghost(node), path)
         values[foreign.data] = np.asarray(node[()])
     if foreign.attrs is not None:
         values[foreign.attrs] = MappingProxyType(attrs)
@@ -1179,9 +1079,14 @@ def _load_group_values(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load ``spec``'s fields from ``group``, returning ``(values, attrs snapshot)``."""
     # Named dimensions unify across this record's own array fields only; a nested record
-    # calls back in here and so starts with empty bindings of its own.
-    bindings: dict[str, Any] = {}
-    origins: dict[str, str] = {}
+    # calls back in here and so opens a scope of its own.
+    with jaxtyped("context"):
+        return _load_group_values_in_scope(spec, group, filename, path)
+
+
+def _load_group_values_in_scope(
+    spec: ClassSpec, group: h5py.Group, filename: str, path: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _check_group_extras(spec, group, path)
     raw = _raw_attrs(group)
     attrs = dict(raw)
@@ -1217,21 +1122,19 @@ def _load_group_values(
             else:
                 # A bare LazyArray member: no record type, no declared attributes.
                 assert field.member_type is not None
-                if field.array is not None:
-                    _check_array(field.array, node, bindings, origins, member_path)
-                lazy_type = typing.cast(type[LazyArray], field.member_type)
-                value = lazy_type(
+                value = _lazy_from_node(
+                    typing.cast(type[LazyArray], field.member_type),
                     filename,
                     member_path,
-                    tuple(node.shape),
-                    np.dtype(node.dtype),
-                    data=np.asarray(node[()]) if field.eager else None,
+                    node,
+                    eager=field.eager,
+                    array=field.array,
                 )
         else:
             if not isinstance(node, h5py.Dataset):
                 raise ValidationError(member_path, "expected a dataset, found a group")
             if field.array is not None:
-                _check_array(field.array, node, bindings, origins, member_path)
+                _check_array(field.array, _ghost(node), member_path)
             value = np.asarray(node[()])
         values[field.py_name] = _validate_value(field, value, member_path)
 

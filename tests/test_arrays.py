@@ -9,11 +9,10 @@ from typing import Annotated, Any
 import h5py
 import numpy as np
 import pytest
-from jaxtyping import Float, Float64, Num, Shaped
+from jaxtyping import AbstractArray, AbstractDtype, Float, Float64, Num, Shaped
 
 import h5t
-from h5t._compile import _parse_dim_str
-from h5t._spec import Anon, ArraySpec, Fixed, MemberKind, Named, Variadic
+from h5t._spec import ArraySpec, MemberKind
 
 
 def write(path: Path, **datasets: Any) -> Path:
@@ -27,12 +26,12 @@ def spec_of(record: type, name: str = "x") -> Any:
     return next(f for f in record.__dict__["__h5t_record__"].spec.fields if f.py_name == name)
 
 
-def test_guard_jaxtyping_exposes_the_attributes_h5t_duck_types_on() -> None:
+def test_guard_jaxtyping_exposes_what_h5t_relies_on() -> None:
     cls = Float[np.ndarray, "n"]
-    assert cls.dim_str == "n"
-    assert isinstance(cls.dtypes, tuple)
-    assert cls.array_type is np.ndarray
-    assert not isinstance(Shaped[np.ndarray, "n"].dtypes, tuple)
+    assert issubclass(cls, AbstractArray)
+    assert (cls.dim_str, cls.array_type, cls.dtype) == ("n", np.ndarray, Float)
+    assert callable(cls.__instancecheck_str__)
+    assert cls.__instancecheck_str__(np.zeros(3)) == ""  # "" means the value conforms
 
 
 def test_compiles_to_array_spec() -> None:
@@ -44,10 +43,9 @@ def test_compiles_to_array_spec() -> None:
 
     x = spec_of(R)
     assert x.kind is MemberKind.ARRAY
-    assert x.array == ArraySpec(
-        (Variadic("batch"), Named("n"), Fixed(3), Anon()), frozenset({np.dtype("float64")})
-    )
-    assert spec_of(R, "y").array == ArraySpec((), None)
+    assert x.array == ArraySpec(Float64[np.ndarray, "*batch n 3 _"], Float64, "*batch n 3 _")
+    assert x.array != ArraySpec(Float64[np.ndarray, "n"], Float64, "n")
+    assert spec_of(R, "y").array.dim_str == ""
 
 
 def test_plain_ndarray_stays_unchecked() -> None:
@@ -74,7 +72,7 @@ def test_float_accepts_any_width_float64_is_exact(tmp_path: Path) -> None:
         path = write(tmp_path / f"{dtype}.h5", x=np.zeros(3, dtype))
         assert h5t.load(Wide, path).x.dtype == dtype
     path = write(tmp_path / "f32.h5", x=np.zeros(3, "float32"))
-    with pytest.raises(h5t.ValidationError, match=r"/x: dtype float32 is not one of float64"):
+    with pytest.raises(h5t.ValidationError, match=r"/x: this array has dtype float32, not float64"):
         h5t.load(Exact, path)
 
 
@@ -85,7 +83,7 @@ def test_dtype_mismatch(tmp_path: Path) -> None:
         x: Float[np.ndarray, "n"]
 
     path = write(tmp_path / "i.h5", x=np.arange(3))
-    with pytest.raises(h5t.ValidationError, match=r"/x: dtype int64 is not one of"):
+    with pytest.raises(h5t.ValidationError, match=r"/x: this array has dtype int64, not any of"):
         h5t.load(R, path)
 
 
@@ -115,7 +113,9 @@ def test_rank_mismatch(tmp_path: Path) -> None:
         x: Num[np.ndarray, "n n"]
 
     path = write(tmp_path / "a.h5", x=np.zeros(3))
-    with pytest.raises(h5t.ValidationError, match=r"/x: expected 2 dimensions, found 1"):
+    with pytest.raises(
+        h5t.ValidationError, match=r"/x: this array has 1 dimensions, not the 2 expected"
+    ):
         h5t.load(R, path)
 
 
@@ -126,7 +126,7 @@ def test_fixed_size_mismatch(tmp_path: Path) -> None:
         x: Num[np.ndarray, "n 3"]
 
     path = write(tmp_path / "a.h5", x=np.zeros((2, 4)))
-    with pytest.raises(h5t.ValidationError, match=r"/x: axis 1 has size 4, expected 3"):
+    with pytest.raises(h5t.ValidationError, match=r"/x: the dimension size 4 does not equal 3"):
         h5t.load(R, path)
 
 
@@ -142,7 +142,8 @@ def test_named_dim_unifies_across_fields(tmp_path: Path) -> None:
     assert h5t.load(Pair, good).b.shape == (3,)
     bad = write(tmp_path / "b.h5", a=np.zeros((3, 3)), b=np.zeros(4))
     with pytest.raises(
-        h5t.ValidationError, match=r"/b: axis 0 has size 4, expected n=3 \(bound by /a\)"
+        h5t.ValidationError,
+        match=r"/b: the size of dimension n is 4 which does not equal the existing value of 3",
     ):
         h5t.load(Pair, bad)
 
@@ -154,7 +155,10 @@ def test_named_dim_must_agree_within_one_array(tmp_path: Path) -> None:
         x: Float[np.ndarray, "n n"]
 
     path = write(tmp_path / "a.h5", x=np.zeros((2, 3)))
-    with pytest.raises(h5t.ValidationError, match=r"axis 1 has size 3, expected n=2"):
+    with pytest.raises(
+        h5t.ValidationError,
+        match=r"the size of dimension n is 3 which does not equal the existing value of 2",
+    ):
         h5t.load(R, path)
 
 
@@ -185,7 +189,7 @@ def test_variadic_forms(tmp_path: Path) -> None:
     )
     with pytest.raises(
         h5t.ValidationError,
-        match=r"/b: axes 0:2 have shape \(5, 7\), expected \*batch=\(5, 6\) \(bound by /a\)",
+        match=r"/b: the shape of its variadic dimensions '\*batch' is \(5, 7\)",
     ):
         h5t.load(R, bad)
 
@@ -196,7 +200,9 @@ def test_variadic_rank_too_small(tmp_path: Path) -> None:
     class R:
         x: Float[np.ndarray, "*b n 3"]
 
-    with pytest.raises(h5t.ValidationError, match=r"expected at least 2 dimensions, found 1"):
+    with pytest.raises(
+        h5t.ValidationError, match=r"this array has 1 dimensions, which is fewer than 2"
+    ):
         h5t.load(R, write(tmp_path / "a.h5", x=np.zeros(3)))
 
 
@@ -207,7 +213,9 @@ def test_scalar(tmp_path: Path) -> None:
         x: Float[np.ndarray, ""]
 
     assert h5t.load(R, write(tmp_path / "s.h5", x=np.float64(2.0))).x.shape == ()
-    with pytest.raises(h5t.ValidationError, match=r"expected 0 dimensions, found 1"):
+    with pytest.raises(
+        h5t.ValidationError, match=r"this array has 1 dimensions, not the 0 expected"
+    ):
         h5t.load(R, write(tmp_path / "v.h5", x=np.zeros(1)))
 
 
@@ -245,7 +253,9 @@ def test_dataset_record_payload(tmp_path: Path) -> None:
     path = write(tmp_path / "d.h5", series=np.zeros((4, 2)), other=np.zeros(9))
     assert h5t.load(R, path).series.values.shape == (4, 2)  # `n` is the payload's own scope
 
-    with pytest.raises(h5t.ValidationError, match=r"/series: axis 1 has size 3, expected 2"):
+    with pytest.raises(
+        h5t.ValidationError, match=r"/series: the dimension size 3 does not equal 2"
+    ):
         h5t.load(R, write(tmp_path / "bad.h5", series=np.zeros((4, 3)), other=np.zeros(9)))
 
 
@@ -262,7 +272,7 @@ def test_dataset_record_lazy_payload(tmp_path: Path) -> None:
 
     path = write(tmp_path / "d.h5", series=np.zeros(4))
     assert h5t.load(R, path).series.values.shape == (4,)
-    with pytest.raises(h5t.ValidationError, match=r"/series: dtype int64"):
+    with pytest.raises(h5t.ValidationError, match=r"/series: this array has dtype int64"):
         h5t.load(R, write(tmp_path / "bad.h5", series=np.arange(4)))
 
 
@@ -296,7 +306,9 @@ def test_lazy_array_is_checked_without_reading_data(
     assert loaded.samples._h5t_data is not None
     assert loaded.samples.shape == (5, 2)
     assert type(loaded.samples) is h5t.LazyArray
-    with pytest.raises(h5t.ValidationError, match=r"/samples: axis 1 has size 3, expected 2"):
+    with pytest.raises(
+        h5t.ValidationError, match=r"/samples: the dimension size 3 does not equal 2"
+    ):
         h5t.load(R, bad)
 
 
@@ -310,47 +322,45 @@ def test_lazy_array_eager_marker_is_allowed(tmp_path: Path) -> None:
     assert loaded.samples.data.tolist() == [0.0, 1.0, 2.0]
 
 
-@pytest.mark.parametrize(
-    ("dims", "message"),
-    [
-        ("#n", "broadcast"),
-        ("?n", "symbolic-optional"),
-        ("n+1", "expression"),
-        ("m=n", "expression"),
-        ("n*2", "expression"),
-        ("n$", "unrecognized"),
-    ],
-)
-def test_unsupported_grammar_is_a_schema_error(dims: str, message: str) -> None:
-    with pytest.raises(h5t.SchemaError, match=rf"R\.x: .*{message}"):
+def test_jaxtyping_grammar_beyond_the_basics_comes_for_free(tmp_path: Path) -> None:
+    @h5t.group()
+    @dataclasses.dataclass
+    class R:
+        a: Float[np.ndarray, "#n"]  # broadcastable: a size-1 axis matches anything
+        b: Float[np.ndarray, "n m"]
+        c: Float[np.ndarray, "m+1"]  # arithmetic over a bound name
+
+    ok = write(tmp_path / "ok.h5", a=np.zeros(1), b=np.zeros((4, 2)), c=np.zeros(3))
+    assert h5t.load(R, ok).c.shape == (3,)
+    bad = write(tmp_path / "bad.h5", a=np.zeros(1), b=np.zeros((4, 2)), c=np.zeros(4))
+    with pytest.raises(h5t.ValidationError, match=r"/c: "):
+        h5t.load(R, bad)
+
+
+def test_custom_jaxtyping_dtype_family(tmp_path: Path) -> None:
+    class Single(AbstractDtype):
+        dtypes = ["float32", "float64"]
+
+    @h5t.group()
+    @dataclasses.dataclass
+    class R:
+        x: Single[np.ndarray, "n"]
+        y: Single[h5t.LazyArray, "n"]
+
+    path = write(tmp_path / "ok.h5", x=np.zeros(3, "float32"), y=np.zeros(3))
+    assert h5t.load(R, path).x.dtype == "float32"
+    with pytest.raises(h5t.ValidationError, match=r"/x: this array has dtype int8"):
+        h5t.load(R, write(tmp_path / "bad.h5", x=np.zeros(3, "int8"), y=np.zeros(3)))
+
+
+def test_invalid_shape_string_is_a_schema_error() -> None:
+    # jaxtyping rejects it when the annotation is evaluated; h5t reports it as a schema error.
+    with pytest.raises(h5t.SchemaError, match=r"R: could not resolve annotations"):
 
         @h5t.group()
         @dataclasses.dataclass
         class R:
-            x: Float[np.ndarray, dims]  # ty: ignore[invalid-type-form]
-
-
-def test_second_variadic_is_rejected_even_if_jaxtyping_let_it_through() -> None:
-    # jaxtyping refuses this at subscript time; h5t's own check is a backstop.
-    class Owner: ...
-
-    with pytest.raises(h5t.SchemaError, match="at most one variadic"):
-        _parse_dim_str(Owner, "x", "*a n ...")
-
-
-class _Unrepresentable:
-    dim_str = "n"
-    dtypes = ("bfloat16", "float8_e5m2")
-    array_type = np.ndarray
-
-
-def test_unrepresentable_dtype_set_is_a_schema_error() -> None:
-    with pytest.raises(h5t.SchemaError, match=r"R\.x: none of the dtypes"):
-
-        @h5t.group()
-        @dataclasses.dataclass
-        class R:
-            x: _Unrepresentable
+            x: Float[np.ndarray, "n, m"]
 
 
 def test_unsupported_array_type_is_a_schema_error() -> None:

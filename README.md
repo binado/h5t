@@ -113,16 +113,15 @@ A parameterized alias such as `numpy.typing.NDArray[np.floating]` is accepted wh
 to check it). Unsupported collection-shaped
 child annotations raise `SchemaError`; dynamic collections are not yet supported.
 A [jaxtyping](https://docs.kidger.site/jaxtyping/) annotation over `np.ndarray` or
-`LazyArray` checks the dataset's dtype and shape from HDF5 metadata, without reading the
-data, and never casts. `Float` accepts any float width and `Float64` only float64 (a file's
-byte order is ignored); `Shaped` accepts any dtype. Shape strings may use integers, names,
-`_`, and one variadic (`...`, `*_` or `*name`). A name binds on first use and must agree
-across every array field of the same record (a nested record starts fresh, and a
-`@h5t.dataset` record is its own scope), so `fisher: Float[np.ndarray, "n n"]` with
+`LazyArray` has its dtype and shape checked by jaxtyping itself, from the dataset's HDF5
+metadata and without reading the data or casting it. `Float` accepts any float width and
+`Float64` only float64 (a file's byte order is ignored); `Shaped` accepts any dtype, and a
+custom `AbstractDtype` subclass works too. The whole shape grammar is jaxtyping's (`...`,
+`*batch`, `#n`, `n+1`, ...). A named dimension binds on first use and must agree across
+every array field of the same record (a nested record starts fresh, and a `@h5t.dataset`
+record is its own scope), so `fisher: Float[np.ndarray, "n n"]` with
 `fiducials: Float[np.ndarray, "n"]` rejects a mismatched file as
-`/fiducials: axis 0 has size 4, expected n=3 (bound by /fisher)`. Broadcast (`#n`),
-`?n`, and arithmetic dimensions raise `SchemaError`. h5t duck-types jaxtyping and does
-not depend on it.
+`/fiducials: the size of dimension n is 4 which does not equal the existing value of 3`.
 A `@h5t.dataset` record may declare only attributes plus its one payload field; a
 `@h5t.group` record has no such restriction and may reference other schema types,
 including itself. Declarations compile at the decorator call, so a `SchemaError` usually

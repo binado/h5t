@@ -253,5 +253,5 @@ def test_bare_jaxtyping_annotation_inside_a_function(tmp_path: Path) -> None:
     with h5py.File(path, "w") as f:
         f["x"] = np.zeros(3)
         f["y"] = np.zeros(4)
-    with pytest.raises(h5t.ValidationError, match=r"/y: axis 0 has size 4, expected n=3"):
+    with pytest.raises(h5t.ValidationError, match=r"/y: the size of dimension n is 4"):
         h5t.load(R, path)

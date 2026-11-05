@@ -26,6 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "h5py>=3.10",
+    "jaxtyping>=0.2.36",
     "numpy>=1.26",
     "pydantic>=2.4,<3",
 ]
@@ -45,7 +46,6 @@ dev = [
     "hypothesis>=6",
     "ty>=0.0.74",
     "ruff>=0.6",
-    "jaxtyping>=0.2.36",
 ]
 
 [build-system]
