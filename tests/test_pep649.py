@@ -10,9 +10,8 @@ import dataclasses
 import gc
 import inspect
 import sys
-import weakref
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
 import h5py
 import numpy as np
@@ -106,30 +105,30 @@ def test_a_lazy_annotation_helper_that_raises_becomes_a_schema_error() -> None:
             value: alias()
 
 
-def test_a_mixed_record_snapshots_the_scope_for_its_quoted_annotations() -> None:
-    # A quoted annotation still resolves through the namespace h5t builds, so the
-    # deferred path must snapshot its dependency. The sources it reads them from are
-    # version-dependent: strings on Python versions through 3.13, and __annotate__
-    # code-object names via _code_names(code) and _quoted_names(code) on Python 3.14+.
+def test_a_deferred_record_needs_localns_for_a_quoted_function_local_annotation() -> None:
+    # A quoted annotation is a bare string even under PEP 649, so the `__annotate__`
+    # closure cannot carry it: a deferred record resolves it only through localns.
     @h5t.group()
     @dataclasses.dataclass
     class Dependency:
         value: int
 
-    label = "on-disk"
+    def declare(**kwargs: Any) -> type:
+        # Dependency is not in this frame, so the record defers at decoration.
+        @h5t.group(**kwargs)
+        @dataclasses.dataclass
+        class Deferred:
+            dependency: "Dependency"
 
-    @h5t.group()
-    @dataclasses.dataclass
-    class Deferred:
-        dependency: "Dependency"
-        renamed: "Annotated[int, h5t.Name(label)]"
-        undefined: _NeverDefined  # noqa: F821 -- forces the deferred path
+        return Deferred
 
-    snapshot = marker(Deferred).scope
-    assert isinstance(snapshot["Dependency"], weakref.ref)
-    assert snapshot["Dependency"]() is Dependency
-    # A str rejects weakref.ref, so it is the one kind of entry held strongly.
-    assert snapshot["label"] == label
+    plain = declare()
+    with_localns = declare(localns={"Dependency": Dependency})
+
+    with pytest.raises(h5t.SchemaError, match="Dependency"):
+        h5t.load(plain, "never-opened.h5")
+    fields = h5t._compile._compiled_record(with_localns).spec.fields
+    assert fields[0].member_type is Dependency
 
 
 def test_a_record_whose_base_carries_the_unresolved_annotation_defers_too() -> None:
@@ -198,7 +197,7 @@ def test_the_group_decorator_defers_under_pep_649() -> None:
 
     record = declare()
     gc.collect()
-    assert marker(record).scope == {}  # nothing snapshotted; the closure carries it
+    assert marker(record).localns is None  # nothing retained; the closure carries it
     foreign = h5t._compile._ensure_record_compiled(record)
     fields = {field.py_name: field for field in foreign.spec.fields}
     assert fields["later"].member_type.__name__ == "Later"

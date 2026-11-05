@@ -9,6 +9,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `localns=` on `@h5t.dataset` and `@h5t.group`: extra names for resolving the record's
+  annotations.
+
+### Changed
+
+- **Behavior change:** a deferred `@h5t.group` record no longer retains a snapshot of the
+  decorating function's locals. A function-local record that defers on a later-defined
+  name *and* uses a function-local type now needs `localns={...}`; otherwise `h5t.load`
+  raises `SchemaError`. Function-local self-references now resolve. Annotation
+  resolution uses `typing.get_type_hints` (≤3.13) / `annotationlib` (3.14+) instead of
+  h5t's own bytecode scanning, which means a broken annotation on a base class now fails
+  the subclass, and names in the class body no longer resolve in string annotations.
+
+### Added
+
 - jaxtyping array validation: `Float[np.ndarray, "n n"]` and `Float[h5t.LazyArray, "n _"]`
   fields (and dataset-record payloads) have their dtype and shape checked by jaxtyping
   against the file's metadata, with no data read and no casting. Named dimensions unify

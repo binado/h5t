@@ -130,6 +130,12 @@ module, or references itself, instead compiles on first use; `@h5t.dataset` has 
 deferral, and does not need one -- being attributes-only, it can never forward-reference
 another schema type.
 
+A record declared inside a function sees that function's locals when the decorator runs,
+so ordinary function-local records and self-references just work. A deferred
+`@h5t.group` record is retried later without them: if it both forward-references a name
+and uses a function-local type, pass the type explicitly with
+`@h5t.group(localns={"Child": Child})` (`@h5t.dataset` accepts `localns=` too).
+
 A record type has no reserved field names: `data`, `path`, `shape` and `attrs` are all
 free, because h5t contributes no base class for a field name to shadow.
 

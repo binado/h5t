@@ -10,7 +10,7 @@ import sys
 import types
 import typing
 import weakref
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Mapping
 from enum import Enum
 from types import MappingProxyType
 from typing import Annotated, Any, ClassVar, Literal
@@ -79,130 +79,10 @@ def _raised_by_annotation(exc: NameError, cls: type) -> bool:
     if tb is None:
         return False
     code = tb.tb_frame.f_code
-    if code.co_filename == _ANNOTATION_FILE:
+    if code.co_filename in (_ANNOTATION_FILE, "<string>"):
         return True
     # A class with no annotations of its own has ``__annotate__ is None``.
     return code is getattr(getattr(cls, "__annotate__", None), "__code__", None)
-
-
-def _code_names(code: types.CodeType) -> set[str]:
-    """Collect every name ``code`` and the code objects nested in it could load.
-
-    ``co_names`` over-approximates -- it also holds attribute names -- which is the
-    safe direction, since a name the snapshot drops is one resolution cannot find.
-    Nested code objects (a lambda inside an annotation) load their names the same way.
-
-    ``co_freevars`` is deliberately not collected. A class ``__annotate__`` has free
-    variables only when an enclosing function scope exists, which is exactly when its
-    closure keeps those cells reachable on its own -- so for that set the snapshot is
-    redundant, and adding it would only widen what ``_weak_scope`` holds strongly.
-    """
-    names: set[str] = set()
-    pending = [code]
-    while pending:
-        current = pending.pop()
-        names.update(current.co_names)
-        pending.extend(c for c in current.co_consts if isinstance(c, types.CodeType))
-    return names
-
-
-def _names_in_source(source: str) -> set[str]:
-    """Collect every name the annotation expression ``source`` could load."""
-    try:
-        code = compile(source, _ANNOTATION_FILE, "eval")
-    except SyntaxError:
-        # Unparseable: reading the spec raises SchemaError, so nothing is needed.
-        return set()
-    return _code_names(code)
-
-
-def _referenced_names(annotations: Mapping[str, Any]) -> set[str]:
-    """Collect every name the string annotations in ``annotations`` could load."""
-    names: set[str] = set()
-    for annotation in annotations.values():
-        if isinstance(annotation, str):
-            names.update(_names_in_source(annotation))
-    return names
-
-
-def _quoted_names(code: types.CodeType) -> set[str]:
-    """Collect every name the string constants in ``code`` could load.
-
-    A quoted annotation is a plain string constant in ``__annotate__``: the names it
-    mentions never reach ``co_names``, and the compiler makes no closure cell for them
-    either, so unlike a bare annotation it has nothing else to resolve through.
-    Reading them back out of the constants is what keeps a quoted forward reference
-    resolvable in a class that some *other* annotation forced onto the deferred path.
-    """
-    names: set[str] = set()
-    pending = [code]
-    while pending:
-        current = pending.pop()
-        for const in current.co_consts:
-            if isinstance(const, types.CodeType):
-                pending.append(const)
-            elif isinstance(const, str):
-                names.update(_names_in_source(const))
-    return names
-
-
-def _annotation_names(cls: type) -> set[str]:
-    """Collect every name ``cls``'s own annotations could load, however they failed.
-
-    Reading the annotations yields PEP 563 strings, which name what they mention. On
-    3.14 the read is itself the evaluation (PEP 649), so an annotation that could not
-    resolve has no value left to inspect: the names come straight off the
-    ``__annotate__`` code object instead, without re-running an expression that
-    already raised. ``annotationlib``'s ``STRING`` and ``FORWARDREF`` formats look
-    like the obvious source here and are not: both re-execute the annotation with the
-    real globals first and swallow whatever it raises, which would run a user's
-    annotation helper -- and hide its bug -- from inside an exception handler.
-    """
-    try:
-        annotations = inspect.get_annotations(cls, eval_str=False)
-    except Exception:
-        annotate = getattr(cls, "__annotate__", None)
-        code = getattr(annotate, "__code__", None)
-        if code is None:
-            return set()
-        # _weak_scope keeps only names the scope holds, so the compiler's own
-        # __classdict__ freevar drops out.
-        return _code_names(code) | _quoted_names(code)
-    return _referenced_names(annotations)
-
-
-def _weak_scope(scope: Mapping[str, Any], names: Collection[str]) -> dict[str, Any]:
-    """Snapshot the ``names`` entries of ``scope``, weakly wherever the value allows.
-
-    Scopes are only retained by the deferred path, where the snapshot may outlive the
-    frame it came from, so it keeps just the names the unresolved annotations mention.
-    Values that reject ``weakref.ref`` (``int``, ``str``, tuples, dicts) are stored
-    directly, and an unfiltered snapshot would let one of those containers pin an
-    unrelated local object graph for as long as the schema class lives.
-    """
-    snapshot: dict[str, Any] = {}
-    for name in names:
-        if name not in scope:
-            continue
-        value = scope[name]
-        try:
-            snapshot[name] = weakref.ref(value)
-        except TypeError:
-            snapshot[name] = value
-    return snapshot
-
-
-def _unpack_scope(snapshot: Mapping[str, Any]) -> dict[str, Any]:
-    """Reverse ``_weak_scope``, dropping entries whose referent was collected."""
-    scope: dict[str, Any] = {}
-    for name, value in snapshot.items():
-        if isinstance(value, weakref.ref):
-            referent = value()
-            if referent is not None:
-                scope[name] = referent
-        else:
-            scope[name] = value
-    return scope
 
 
 def _split_annotation(owner: type, py_name: str, annotation: Any) -> tuple[Any, list[Any], bool]:
@@ -538,7 +418,7 @@ class _PendingRecord:
     attrs: str | None
     extras_raw: str
     py_name: str
-    scope: Mapping[str, Any]
+    localns: Mapping[str, Any] | None
 
 
 def _record_kind(cls: type) -> RecordKind:
@@ -546,23 +426,8 @@ def _record_kind(cls: type) -> RecordKind:
     return cls.__dict__["__h5t_record__"].kind
 
 
-def _record_annotation_names(cls: type) -> set[str]:
-    """Union ``_annotation_names`` across ``cls``'s MRO.
-
-    A record's bases never compile or snapshot a scope of their own, so the snapshot
-    taken here must cover them too, mirroring the MRO walk ``_compile_foreign_fields``
-    does when it actually resolves the annotations.
-    """
-    names: set[str] = set()
-    for base in cls.__mro__:
-        if base is object:
-            continue
-        names |= _annotation_names(base)
-    return names
-
-
 def _ensure_record_compiled(cls: type) -> ForeignSpec:
-    """Return ``cls``'s ``ForeignSpec``, retrying a pending one against its scope.
+    """Return ``cls``'s ``ForeignSpec``, retrying a pending one with its ``localns``.
 
     Caches the result back onto ``cls.__h5t_record__``. A renewed ``_UnresolvedAnnotation``
     propagates uncaught, so a ``GROUP``-kind owner record's own ``_ensure_record_compiled``
@@ -580,7 +445,7 @@ def _ensure_record_compiled(cls: type) -> ForeignSpec:
         data=pending.data,
         attrs=pending.attrs,
         extras_raw=pending.extras_raw,
-        scope=_unpack_scope(pending.scope),
+        localns=pending.localns,
     )
     setattr(cls, "__h5t_record__", foreign)  # noqa: B010 -- cls is an arbitrary user class
     return foreign
@@ -612,7 +477,7 @@ def _compile_foreign_fields(
     data: str | None,
     attrs: str | None,
     extras: Extras,
-    scope: Mapping[str, Any] | None,
+    localns: Mapping[str, Any] | None,
 ) -> ForeignSpec:
     """Compile ``record_type``'s own fields (and payload, for a ``DATASET`` record).
 
@@ -628,7 +493,7 @@ def _compile_foreign_fields(
     for base in reversed(record_type.__mro__):
         if base is object:
             continue
-        base_annotations = _resolved_annotations(base, scope)
+        base_annotations = _resolved_annotations(base, localns)
         for field_name, field_annotation in base_annotations.items():
             if field_name.startswith("_") or typing.get_origin(field_annotation) is ClassVar:
                 continue
@@ -726,18 +591,18 @@ def _foreign_spec(
     data: str | None,
     attrs: str | None,
     extras_raw: str,
-    scope: Mapping[str, Any] | None = None,
+    localns: Mapping[str, Any] | None = None,
 ) -> ForeignSpec:
     """Compile a plain ``record_type`` into a ``Payload``/``group`` record's fields.
 
     Cached per ``(kind, data, attrs, extras)``, since the same foreign class may be
     reused as a target from more than one field or schema. An
     ``Annotated[T, Payload(...)]`` use site resolves ``record_type``'s annotations
-    against its module globals and class dict only (``scope=None``): there is no
-    defining frame to capture at a distant use site, so an unresolved annotation is
-    always a ``SchemaError``. The ``@h5t.dataset``/``@h5t.group`` decorators do have
-    such a frame -- their own -- and pass it as ``scope``, so a function-local record's
-    annotations resolve against function locals too.
+    against its module globals only (``localns=None``): there is no defining frame to
+    read at a distant use site, so an unresolved annotation is always a ``SchemaError``.
+    The ``@h5t.dataset``/``@h5t.group`` decorators read their caller's locals once, for
+    this immediate compile, and pass them as ``localns``; a deferred ``@h5t.group``
+    retries with only the ``localns=`` the user gave it.
 
     A ``DATASET``-kind record's own fields can only be attributes, so it can never
     forward-reference another schema type: compiling it here regardless of deferral is
@@ -771,7 +636,7 @@ def _foreign_spec(
             data=data,
             attrs=attrs,
             extras=extras,
-            scope=scope,
+            localns=localns,
         )
     except _UnresolvedAnnotation as exc:
         if kind is RecordKind.GROUP:
@@ -787,8 +652,25 @@ def _foreign_spec(
 _C = typing.TypeVar("_C", bound=type)
 
 
+def _transient_locals(localns: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Read the decorator caller's locals once, for the immediate compile only.
+
+    ``sys._getframe(2)`` is the frame that applied the decorator (this helper is called
+    from ``decorator``, which the ``class`` statement's caller invoked). The copy is
+    never stored, so nothing it names outlives the compile; an explicit ``localns``
+    wins over it.
+    """
+    namespace = dict(sys._getframe(2).f_locals)
+    if localns:
+        namespace.update(localns)
+    return namespace
+
+
 def dataset(
-    data: str, attrs: str | None = None, extras: Literal["ignore", "forbid"] = "ignore"
+    data: str,
+    attrs: str | None = None,
+    extras: Literal["ignore", "forbid"] = "ignore",
+    localns: Mapping[str, Any] | None = None,
 ) -> Callable[[_C], _C]:
     """Mark a plain class as an h5t dataset record, in place of ``Annotated[T, Payload(...)]``.
 
@@ -800,13 +682,13 @@ def dataset(
     Typed to preserve ``cls``'s own identity through the decorator (``Callable[[_C], _C]``
     rather than ``Callable[[type], type]``), so a decorated class keeps its precise type
     for a static checker -- e.g. through ``h5t.load``'s own ``TypeVar`` return.
+
+    ``localns`` adds names to the annotation namespace on top of the decorating
+    function's own locals. A dataset record never defers, so it matters only for a name
+    the decorating frame does not hold.
     """
 
     def decorator(cls: _C) -> _C:
-        frame = inspect.currentframe()
-        scope: Mapping[str, Any] = (
-            frame.f_back.f_locals if frame is not None and frame.f_back else {}
-        )
         foreign = _foreign_spec(
             cls,
             cls,
@@ -815,7 +697,7 @@ def dataset(
             data=data,
             attrs=attrs,
             extras_raw=extras,
-            scope=scope,
+            localns=_transient_locals(localns),
         )
         setattr(cls, "__h5t_record__", foreign)  # noqa: B010 -- cls is an arbitrary user class
         return cls
@@ -824,7 +706,9 @@ def dataset(
 
 
 def group(
-    attrs: str | None = None, extras: Literal["ignore", "forbid"] = "ignore"
+    attrs: str | None = None,
+    extras: Literal["ignore", "forbid"] = "ignore",
+    localns: Mapping[str, Any] | None = None,
 ) -> Callable[[_C], _C]:
     """Mark a plain class as an h5t group record, loadable via ``h5t.load``.
 
@@ -834,13 +718,26 @@ def group(
     instead of raising immediately, and is retried lazily by ``_ensure_record_compiled``
     the first time this record is actually used as a field or loaded directly via
     ``h5t.load``.
+
+    The retry sees module globals, the class's own name, and ``localns`` -- not the
+    decorating function's locals, which are read for the immediate compile only. A
+    function-local record that defers and names another function-local type must
+    therefore pass it, e.g. ``@h5t.group(localns={"Child": Child})``.
     """
 
     def decorator(cls: _C) -> _C:
-        frame = inspect.currentframe()
-        scope: Mapping[str, Any] = (
-            frame.f_back.f_locals if frame is not None and frame.f_back else {}
+        # Plant the pending marker first: the class's own name is seeded into the
+        # annotation namespace, so a self-reference resolves to `cls` immediately and
+        # `_field_spec` must already see it as a GROUP-kind record.
+        pending = _PendingRecord(
+            kind=RecordKind.GROUP,
+            data=None,
+            attrs=attrs,
+            extras_raw=extras,
+            py_name=cls.__name__,
+            localns=localns,
         )
+        setattr(cls, "__h5t_record__", pending)  # noqa: B010
         try:
             foreign = _foreign_spec(
                 cls,
@@ -850,19 +747,13 @@ def group(
                 data=None,
                 attrs=attrs,
                 extras_raw=extras,
-                scope=scope,
+                localns=_transient_locals(localns),
             )
         except _UnresolvedAnnotation:
-            pending = _PendingRecord(
-                kind=RecordKind.GROUP,
-                data=None,
-                attrs=attrs,
-                extras_raw=extras,
-                py_name=cls.__name__,
-                scope=_weak_scope(scope, _record_annotation_names(cls)),
-            )
-            setattr(cls, "__h5t_record__", pending)  # noqa: B010
             return cls
+        except BaseException:
+            delattr(cls, "__h5t_record__")
+            raise
         setattr(cls, "__h5t_record__", foreign)  # noqa: B010
         return cls
 
@@ -876,34 +767,34 @@ def _annotation_failure(cls: type, exc: Exception) -> Exception:
     return SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}")
 
 
-def _resolved_annotations(cls: type, scope: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Return ``cls``'s own annotations, evaluating PEP 563 strings.
+def _resolved_annotations(cls: type, localns: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return ``cls``'s own annotations with strings and lazy values evaluated.
 
-    Names resolve against the defining module, then ``scope`` -- the live locals of
-    the defining frame while the class is being created, or the weak snapshot kept
-    by the deferred path -- then the class body.
+    Names resolve against the defining module, then ``localns`` (always seeded with the
+    class's own name, so a function-local record can reference itself).
     """
+    namespace: dict[str, Any] = {cls.__name__: cls}
+    if localns:
+        namespace.update(localns)
     try:
-        annotations = inspect.get_annotations(cls, eval_str=False)
-    except Exception as exc:
-        # PEP 649 (3.14+): this call evaluates lazy annotations, so it fails here
-        # where older versions failed at the ``class`` statement itself.
-        raise _annotation_failure(cls, exc) from exc
-    if not any(isinstance(annotation, str) for annotation in annotations.values()):
-        return annotations
-    if scope is None:
-        scope = _unpack_scope(cls.__dict__.get("_h5t_scope", {}))
-    module = sys.modules.get(cls.__module__)
-    namespace: dict[str, Any] = dict(vars(module)) if module is not None else {}
-    namespace.update(scope)
-    namespace.update(vars(cls))
-    try:
-        return {
-            name: eval(compile(annotation, _ANNOTATION_FILE, "eval"), namespace)
-            if isinstance(annotation, str)
-            else annotation
-            for name, annotation in annotations.items()
-        }
+        if sys.version_info >= (3, 14):
+            # Deferred: annotationlib exists only on 3.14+. Format.VALUE, not STRING or
+            # FORWARDREF, which would run a user's annotation helper under a swallowing
+            # try/except and hide its bug.
+            import annotationlib
+
+            raw = annotationlib.get_annotations(cls, format=annotationlib.Format.VALUE)
+            module = sys.modules.get(cls.__module__)
+            globalns = vars(module) if module is not None else {}
+            return {
+                name: eval(compile(value, _ANNOTATION_FILE, "eval"), globalns, namespace)
+                if isinstance(value, str)
+                else value
+                for name, value in raw.items()
+            }
+        own = inspect.get_annotations(cls)
+        hints = typing.get_type_hints(cls, localns=namespace, include_extras=True)
+        return {name: hints[name] for name in own}
     except Exception as exc:
         raise _annotation_failure(cls, exc) from exc
 
