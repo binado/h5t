@@ -100,6 +100,7 @@ own constructor with the loaded values, and offers no way to write one back.
 | `LazyArray` (or a subclass) | child dataset | metadata snapshot, payload read on first access |
 | `Annotated[<any dataset field>, Eager()]` | child dataset | complete payload cached during loading |
 | `np.ndarray` | child dataset | complete payload loaded as an ndarray |
+| `Float[np.ndarray, "n n"]`, `Float[LazyArray, "n _"]` (jaxtyping) | child dataset | dtype and shape checked against the file's metadata before any read; otherwise as `np.ndarray` / `LazyArray` |
 | `Annotated[T, Attr(...)]` | attribute | converter, then Pydantic validation |
 | scalar or `Literal[...]` | attribute | Pydantic validation |
 
@@ -108,8 +109,20 @@ never combines with `Payload`. `Eager` is valid only for dataset fields; combine
 `Payload` it is allowed only when the payload field is `LazyArray` (it prefetches the
 array), since an `np.ndarray` payload is already eager.
 A parameterized alias such as `numpy.typing.NDArray[np.floating]` is accepted wherever
-`np.ndarray` is; the dtype parameter is not validated. Unsupported collection-shaped
+`np.ndarray` is; for `NDArray` the dtype parameter is not validated (use jaxtyping, below,
+to check it). Unsupported collection-shaped
 child annotations raise `SchemaError`; dynamic collections are not yet supported.
+A [jaxtyping](https://docs.kidger.site/jaxtyping/) annotation over `np.ndarray` or
+`LazyArray` checks the dataset's dtype and shape from HDF5 metadata, without reading the
+data, and never casts. `Float` accepts any float width and `Float64` only float64 (a file's
+byte order is ignored); `Shaped` accepts any dtype. Shape strings may use integers, names,
+`_`, and one variadic (`...`, `*_` or `*name`). A name binds on first use and must agree
+across every array field of the same record (a nested record starts fresh, and a
+`@h5t.dataset` record is its own scope), so `fisher: Float[np.ndarray, "n n"]` with
+`fiducials: Float[np.ndarray, "n"]` rejects a mismatched file as
+`/fiducials: axis 0 has size 4, expected n=3 (bound by /fisher)`. Broadcast (`#n`),
+`?n`, and arithmetic dimensions raise `SchemaError`. h5t duck-types jaxtyping and does
+not depend on it.
 A `@h5t.dataset` record may declare only attributes plus its one payload field; a
 `@h5t.group` record has no such restriction and may reference other schema types,
 including itself. Declarations compile at the decorator call, so a `SchemaError` usually

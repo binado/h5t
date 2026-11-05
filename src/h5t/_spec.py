@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
 
+import numpy as np
 from pydantic import TypeAdapter
 
 from h5t._array import LazyArray
@@ -81,6 +82,47 @@ _NO_DEFAULT = object()
 
 
 @dataclass(frozen=True)
+class Fixed:
+    """An axis that must have exactly ``size`` elements."""
+
+    size: int
+
+
+@dataclass(frozen=True)
+class Named:
+    """An axis whose size binds on first use and must agree everywhere in one record."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class Anon:
+    """An axis of any size (``_``)."""
+
+
+@dataclass(frozen=True)
+class Variadic:
+    """Any number of axes (``...``, ``*_``, or ``*name``); ``name`` binds their shape."""
+
+    name: str | None
+
+
+Dim = Fixed | Named | Anon | Variadic
+
+
+@dataclass(frozen=True)
+class ArraySpec:
+    """The shape and dtype a jaxtyping annotation asks an HDF5 dataset to satisfy.
+
+    ``dtypes`` is the set of NumPy dtypes (native byte order) the dataset's dtype must
+    belong to; ``None`` accepts any dtype (jaxtyping's ``Shaped``).
+    """
+
+    dims: tuple[Dim, ...]
+    dtypes: frozenset[np.dtype[Any]] | None
+
+
+@dataclass(frozen=True)
 class ClassSpec:
     """The fields and extras policy compiled for one record type."""
 
@@ -99,6 +141,7 @@ class ForeignSpec:
     attrs: str | None
     lazy_type: type[LazyArray] | None
     signature: inspect.Signature | None
+    payload_array: ArraySpec | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +160,7 @@ class FieldSpec:
     member_type: type | None = None
     foreign: ForeignSpec | None = None
     default_factory: Callable[[], Any] | None = None
+    array: ArraySpec | None = None
 
     @property
     def has_default(self) -> bool:

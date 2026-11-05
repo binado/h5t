@@ -138,6 +138,22 @@ record field may be called `data`, `attrs`, `path` or `shape` freely — h5t con
 class whose public surface a field name could shadow. Only `_check_duplicate_names` (repeated
 *HDF5* names within one record) applies.
 
+### jaxtyping arrays: `ArraySpec` and `_check_array`
+
+`_unwrap_jaxtyping` duck-types a class carrying `dim_str`, `dtypes` and `array_type` (h5t
+never imports jaxtyping) and rewrites it, early in `_field_spec` and in the payload check of
+`_compile_foreign_fields`, to its backing `np.ndarray` or `LazyArray` subclass, so every
+later branch classifies it exactly as the unannotated type. Only `FieldSpec.array` /
+`ForeignSpec.payload_array` (an `ArraySpec`: `Fixed`/`Named`/`Anon`/`Variadic` dims plus a
+dtype frozenset, `None` for `Shaped`) records the difference. `_parse_dim_str` rejects what
+cannot be checked from metadata (`#`, `?`, arithmetic, a second variadic); `_resolve_dtypes`
+drops names NumPy cannot represent (bfloat16, fp8).
+
+`_check_array` reads only `node.shape`/`node.dtype`, before any `node[()]`. Binding scope
+is one `_load_group_values` call: `bindings`/`origins` are created there and never passed to
+a nested `_load_foreign_group`, and `_load_foreign_dataset` uses fresh ones. A named variadic
+binds under `*name`, a separate key from a plain `name`.
+
 ### Array annotations see through type aliases
 
 `_is_ndarray_annotation` decides the `ARRAY` kind, and it cannot just read

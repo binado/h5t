@@ -45,6 +45,7 @@ dev = [
     "hypothesis>=6",
     "ty>=0.0.74",
     "ruff>=0.6",
+    "jaxtyping>=0.2.36",
 ]
 
 [build-system]
@@ -68,6 +69,11 @@ convention = "numpy"
 [tool.ruff.lint.per-file-ignores]
 # B018 fires on attribute access inside pytest.raises blocks.
 "tests/**" = ["D", "B018"]
+# jaxtyping shape strings ("n n", "*batch") are not forward references: F722 misreads them,
+# and UP037 would strip the quotes from single-name ones ("n"), turning them into names.
+"tests/test_arrays.py" = ["F722", "F821", "UP037"]
+"tests/test_pep649.py" = ["F722", "F821", "UP037"]
+"tests/acceptance_example.py" = ["F722", "F821", "UP037"]
 
 [tool.ty.src]
 include = ["src/h5t", "tests/acceptance_example.py"]

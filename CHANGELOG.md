@@ -7,6 +7,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- jaxtyping array validation: `Float[np.ndarray, "n n"]` and `Float[h5t.LazyArray, "n _"]`
+  fields (and dataset-record payloads) have their dtype and shape checked against the
+  file's metadata, with no data read and no casting. Named dimensions unify across the
+  array fields of one record, and errors name the path that bound them. Broadcast, `?`,
+  and arithmetic dimensions raise `SchemaError`. jaxtyping is detected by duck typing and
+  is not a dependency of h5t. Plain `np.ndarray` and `NDArray[...]` stay unchecked.
+
 ## [0.3.0]
 
 ### Removed
