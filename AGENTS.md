@@ -21,14 +21,14 @@ as pre-commit hooks (run via `prek`). Commits follow Conventional Commits (`feat
 
 ## Architecture
 
-`h5t` turns annotated Python classes into read-only loaders for HDF5 groups. The load produces
+`h5t` turns annotated Python classes into loaders (and, via `h5t.save`, writers) for HDF5 groups. The load produces
 **detached** records: `h5t.load()` closes every handle before returning, and only a `LazyArray`
 payload's filename/path survive so its payload can be read later. A schema is always a plain
 class decorated with `@h5t.dataset`/`@h5t.group` (or, for a type you cannot decorate, reached
 through a `Payload` marker at the use site). h5t contributes no base class and builds no
 instance itself -- every record is constructed by calling the record type's own constructor.
 
-Four modules, one direction of dependency (`_cli` → `_compile` → `_array`/`_spec`/`_errors`):
+Five modules, one direction of dependency (`_cli`/`_write` → `_compile` → `_array`/`_spec`/`_errors`):
 
 - **`_spec.py`** — the public annotation markers (`Name`, `Attr`, `Eager`, `Payload`) and the
   compiled IR: `FieldSpec` (one field: HDF5 name, `MemberKind`, cached Pydantic `TypeAdapter`,
@@ -60,6 +60,14 @@ Four modules, one direction of dependency (`_cli` → `_compile` → `_array`/`_
   resolved at load time via `_compiled_record`. `h5t.load(schema, path, root)` is the
   module's public entry point — it resolves and kind-checks `schema` before opening the file, and
   `h5t check` is a thin wrapper around it.
+- **`_write.py`** — `h5t.save`, in two phases. *Plan* (`_plan_group`, `_plan_dataset_record`,
+  `_plan_member`, `_plan_collection`) walks the compiled spec over an in-memory record, mirroring
+  the load functions one for one (same `jaxtyped("context")` scopes, reusing `_validate_value` and
+  `_check_array`), reads every `LazyArray` payload without caching it, and builds a `_GroupPlan` /
+  `_DatasetPlan` tree without touching the target file. *Apply* (`_apply`) opens the file, prepares
+  `root` (`_prepare_target`), writes the tree, and on failure removes the new file, or for `mode="a"`
+  rolls back via `_Undo` (best effort; an `overwrite=True` clear is not restorable). The `attrs=`
+  snapshot writes its undeclared entries raw; `Attr(serializer=)` is the inverse of `converter`.
 - **`_cli.py`** — `h5t check`, a thin wrapper: import `pkg.mod:Class`, call `h5t.load`, map
   outcomes to exit codes 0 (ok) / 1 (`ValidationError`) / 2 (import, schema, usage, or I/O error).
 

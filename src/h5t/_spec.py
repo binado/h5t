@@ -27,9 +27,12 @@ class Attr:
 
     ``converter`` is applied to the value returned by h5py before Pydantic
     validation. It is useful for serialized attributes such as JSON strings.
+    ``serializer`` is its inverse for ``h5t.save``: it is applied to the validated
+    value just before it is written, e.g. ``json.dumps``.
     """
 
     converter: Callable[[Any], Any] | None = None
+    serializer: Callable[[Any], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,7 @@ class FieldSpec:
     optional: bool = False
     default: Any = _NO_DEFAULT
     converter: Callable[[Any], Any] | None = None
+    serializer: Callable[[Any], Any] | None = None
     eager: bool = False
     member_type: type | None = None
     foreign: ForeignSpec | None = None

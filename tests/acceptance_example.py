@@ -69,3 +69,5 @@ unit: str = result.recording.unit
 payload: np.ndarray = result.recording.payload
 attrs: Mapping[str, Any] = result.recording.attrs
 marked_payload: np.ndarray = result.marked.payload
+
+saved: None = h5t.save(result, Path("out.h5"), root="/run", mode="a", overwrite=True)

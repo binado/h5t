@@ -1,7 +1,7 @@
 [project]
 name = "h5t"
 version = "0.3.0"
-description = "Load HDF5 groups as detached, typed Python records."
+description = "Load and save HDF5 groups as detached, typed Python records."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -73,6 +73,7 @@ convention = "numpy"
 # and UP037 would strip the quotes from single-name ones ("n"), turning them into names.
 "tests/test_arrays.py" = ["F722", "F821", "UP037"]
 "tests/test_collections.py" = ["F722", "F821", "UP037"]
+"tests/test_save.py" = ["F722", "F821", "UP037"]
 "tests/test_pep649.py" = ["F722", "F821", "UP037"]
 "tests/acceptance_example.py" = ["F722", "F821", "UP037"]
 

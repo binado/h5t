@@ -5,7 +5,8 @@
 [![CI](https://github.com/binado/h5t/actions/workflows/ci.yml/badge.svg)](https://github.com/binado/h5t/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/binado/h5t/blob/main/LICENSE)
 
-`h5t` loads HDF5 groups into detached, typed Python records. Group attributes and
+`h5t` loads HDF5 groups into detached, typed Python records, and writes them back with
+the same schema. Group attributes and
 ordinary NumPy-array fields are materialized while the file is open. Typed datasets
 keep snapshot metadata and can read their payload lazily without retaining an open
 file descriptor.
@@ -87,8 +88,38 @@ with lazy.open() as live:
 ```
 
 `h5t.load()` closes every handle on normal and exceptional exits, and so does
-`LazyArray.open()`. h5t only ever reads: it builds a record by calling the record type's
-own constructor with the loaded values, and offers no way to write one back.
+`LazyArray.open()`. Loading builds a record by calling the record type's own constructor
+with the loaded values; `h5t.save` (below) is the inverse.
+
+## Writing
+
+`h5t.save(record, path, root="/", mode="w-", overwrite=False)` validates a `@h5t.group`
+record against its own schema and writes it, so the code that produces files is checked
+by the same declarations that read them:
+
+```python
+h5t.save(result, "out.h5")                          # fails if out.h5 exists
+h5t.save(result, "out.h5", root="/run2", mode="a")  # add another group to the file
+```
+
+- `mode`: `"w-"`/`"x"` (default) fail if the file exists, `"w"` truncates, `"a"` writes into
+  an existing file or creates one.
+- `root`: missing intermediate groups are created. A `root` group that already has members
+  or attributes raises `ValidationError` unless `overwrite=True`, which replaces its
+  contents (destructive, and not undone if the write then fails).
+- `Attr(serializer=...)` is the inverse of `converter` (e.g. `json.dumps`). An `Enum`
+  attribute is stored as its `.value`; an attribute h5py cannot store (such as a `dict`)
+  is a `ValidationError` telling you to add a serializer. A `None` optional is omitted.
+- A field bound with `attrs=` writes its undeclared entries back as raw attributes, so
+  load -> save keeps them. Declared names always come from their typed fields.
+- Collection keys must be non-empty, contain no `/`, and match the field's `Glob`;
+  otherwise the item would not load back.
+
+Validation-first: the whole record is validated, jaxtyping shapes are checked, and every
+`LazyArray` payload is read *before* the file is opened, so a bad record never touches the
+target (and saving into the file a `LazyArray` came from is safe). If the write itself
+fails, the new file is removed; with `mode="a"` the group that `save` created is removed
+on a best-effort basis.
 
 ## Field rules
 
@@ -235,6 +266,8 @@ A loaded model is a snapshot, with one deliberate exception:
   caches the resulting array permanently.
 - `.open()` always opens the current file and current dataset. It may therefore observe
   replacements or fail if the source was changed or deleted.
+- `h5t.save` copies lazy payloads: an uncached one is read from its source file at save
+  time, without caching it on your record.
 
 ## CLI
 
