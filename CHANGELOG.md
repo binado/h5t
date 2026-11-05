@@ -9,6 +9,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Dynamic collections: `dict[str, T]` / `Mapping[str, T]` fields load every child of one
+  named group into a `dict`, and the new `h5t.Glob(pattern)` marker filters the children.
 - `localns=` on `@h5t.dataset` and `@h5t.group`: extra names for resolving the record's
   annotations.
 
@@ -21,8 +23,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resolution uses `typing.get_type_hints` (≤3.13) / `annotationlib` (3.14+) instead of
   h5t's own bytecode scanning, which means a broken annotation on a base class now fails
   the subclass, and names in the class body no longer resolve in string annotations.
-
-### Added
 
 - jaxtyping array validation: `Float[np.ndarray, "n n"]` and `Float[h5t.LazyArray, "n _"]`
   fields (and dataset-record payloads) have their dtype and shape checked by jaxtyping
