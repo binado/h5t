@@ -14,8 +14,10 @@ import weakref
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import h5py
 import numpy as np
 import pytest
+from jaxtyping import Float
 
 import h5t
 from h5t._compile import _PendingRecord
@@ -237,3 +239,19 @@ def test_a_lazy_schema_loads_from_a_file(tmp_path: Path) -> None:
     assert np.array_equal(record.measurement.data.read(), np.arange(5))
     assert record.nested.answer == 42
     assert record.optional_note is None
+
+
+def test_bare_jaxtyping_annotation_inside_a_function(tmp_path: Path) -> None:
+    # No future import: `Float[np.ndarray, "n"]` is evaluated lazily by __annotate__.
+    @h5t.group()
+    @dataclasses.dataclass
+    class R:
+        x: Float[np.ndarray, "n"]
+        y: Float[np.ndarray, "n"]
+
+    path = tmp_path / "a.h5"
+    with h5py.File(path, "w") as f:
+        f["x"] = np.zeros(3)
+        f["y"] = np.zeros(4)
+    with pytest.raises(h5t.ValidationError, match=r"/y: the size of dimension n is 4"):
+        h5t.load(R, path)

@@ -138,6 +138,30 @@ record field may be called `data`, `attrs`, `path` or `shape` freely — h5t con
 class whose public surface a field name could shadow. Only `_check_duplicate_names` (repeated
 *HDF5* names within one record) applies.
 
+### jaxtyping arrays: `ArraySpec` and `_check_array`
+
+jaxtyping is a runtime dependency and does the checking; h5t never parses a shape string.
+`_unwrap_jaxtyping` recognises an `AbstractArray` subclass and rewrites it, early in
+`_field_spec` and in the payload check of `_compile_foreign_fields`, to its backing
+`np.ndarray` or `LazyArray` subclass, so every later branch classifies it exactly as the
+unannotated type. The jaxtyping class itself is kept on `FieldSpec.array` /
+`ForeignSpec.payload_array` as an `ArraySpec` (`hint` is excluded from equality because
+jaxtyping builds a fresh class per subscript; `family` and `dim_str` carry identity).
+
+`_check_array` calls `hint.__instancecheck_str__(candidate)` -- the non-public method
+behind `isinstance`, which returns the failure reason (`""` means it conforms) -- and wraps a
+reason in `ValidationError(path, reason)`. The candidate needs only `shape` and `dtype`, so
+no data is read: an `np.ndarray` field gets `_ghost(node)`, a zero-stride
+`np.broadcast_to` of a 0-d array (one scalar allocated, however large the dataset), and a
+`LazyArray` field gets the `LazyArray` built from the same metadata (`_lazy_from_node`
+checks it before any eager read). A guard test fails if jaxtyping drops the attributes or
+the method.
+
+Binding scope is a `with jaxtyped("context")` -- jaxtyping's public scoping API -- opened
+once per `_load_group_values` call and once per `_load_foreign_dataset`. A nested record
+opens its own context, so it starts with fresh bindings. Error text is jaxtyping's, so it
+does not name the path that bound a dimension.
+
 ### Array annotations see through type aliases
 
 `_is_ndarray_annotation` decides the `ARRAY` kind, and it cannot just read

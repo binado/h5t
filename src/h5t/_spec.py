@@ -81,6 +81,21 @@ _NO_DEFAULT = object()
 
 
 @dataclass(frozen=True)
+class ArraySpec:
+    """A jaxtyping array annotation, kept whole so jaxtyping does the checking.
+
+    ``hint`` is the jaxtyping class itself (``Float[np.ndarray, "n n"]``); it is excluded
+    from comparison because jaxtyping builds a fresh class per subscript, so two
+    identical annotations would otherwise never compare equal. ``family`` (``Float``) and
+    ``dim_str`` carry the identity.
+    """
+
+    hint: type = field(compare=False, repr=False)
+    family: type
+    dim_str: str
+
+
+@dataclass(frozen=True)
 class ClassSpec:
     """The fields and extras policy compiled for one record type."""
 
@@ -99,6 +114,7 @@ class ForeignSpec:
     attrs: str | None
     lazy_type: type[LazyArray] | None
     signature: inspect.Signature | None
+    payload_array: ArraySpec | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +133,7 @@ class FieldSpec:
     member_type: type | None = None
     foreign: ForeignSpec | None = None
     default_factory: Callable[[], Any] | None = None
+    array: ArraySpec | None = None
 
     @property
     def has_default(self) -> bool:

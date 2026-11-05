@@ -7,6 +7,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- jaxtyping array validation: `Float[np.ndarray, "n n"]` and `Float[h5t.LazyArray, "n _"]`
+  fields (and dataset-record payloads) have their dtype and shape checked by jaxtyping
+  against the file's metadata, with no data read and no casting. Named dimensions unify
+  across the array fields of one record. Plain `np.ndarray` and `NDArray[...]` stay
+  unchecked. jaxtyping (>=0.2.36) is now a dependency.
+
 ## [0.3.0]
 
 ### Removed

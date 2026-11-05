@@ -17,6 +17,7 @@ from typing import Annotated, Any, ClassVar, Literal
 
 import h5py
 import numpy as np
+from jaxtyping import AbstractArray, jaxtyped
 from pydantic import ConfigDict, InstanceOf, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
@@ -24,6 +25,7 @@ from h5t._array import LazyArray
 from h5t._errors import ConversionError, SchemaError, ValidationError
 from h5t._spec import (
     _NO_DEFAULT,
+    ArraySpec,
     Attr,
     ClassSpec,
     Eager,
@@ -300,6 +302,64 @@ def _is_ndarray_annotation(core: Any) -> bool:
     return False
 
 
+def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> tuple[Any, ArraySpec | None]:
+    """Split a jaxtyping array type into its backing class and an ``ArraySpec``.
+
+    The backing class (``np.ndarray`` or a ``LazyArray`` subclass) is what the rest of
+    the compiler classifies; the jaxtyping class is kept to do the checking at load time.
+    Anything that is not a jaxtyping array is returned unchanged.
+    """
+    if not (isinstance(core, type) and issubclass(core, AbstractArray)):
+        return core, None
+    array_type = core.array_type
+    if not (
+        array_type is np.ndarray
+        or (isinstance(array_type, type) and issubclass(array_type, LazyArray))
+    ):
+        raise _schema_error(
+            owner,
+            py_name,
+            f"jaxtyping array type {array_type!r} is not supported; use np.ndarray or LazyArray",
+        )
+    return array_type, ArraySpec(core, core.dtype, core.dim_str)
+
+
+def _check_array(spec: ArraySpec, candidate: Any, path: str) -> None:
+    """Ask jaxtyping whether ``candidate`` satisfies ``spec``; call inside a record scope.
+
+    ``candidate`` stands in for the dataset and only needs ``shape`` and ``dtype``: a
+    zero-stride ghost ndarray, or the ``LazyArray`` built from the same metadata. Named
+    dimensions bind in the enclosing ``jaxtyped("context")``.
+    """
+    reason = spec.hint.__instancecheck_str__(candidate)  # ty: ignore[unresolved-attribute]
+    if reason:
+        raise ValidationError(path, reason)
+
+
+def _ghost(node: h5py.Dataset) -> np.ndarray:
+    """Return an ndarray with ``node``'s shape and dtype that allocates one scalar only."""
+    return np.broadcast_to(np.empty((), node.dtype), node.shape)
+
+
+def _lazy_from_node(
+    lazy_type: type[LazyArray],
+    filename: str,
+    path: str,
+    node: h5py.Dataset,
+    *,
+    eager: bool,
+    array: ArraySpec | None,
+) -> LazyArray:
+    """Build a ``LazyArray``, validating its metadata before any payload is read."""
+    shape, dtype = tuple(node.shape), np.dtype(node.dtype)
+    lazy = lazy_type(filename, path, shape, dtype)
+    if array is not None:
+        _check_array(array, lazy, path)
+    if eager:
+        lazy = lazy_type(filename, path, shape, dtype, data=np.asarray(node[()]))
+    return lazy
+
+
 def _is_mapping_annotation(core: Any) -> bool:
     """Report whether ``core`` denotes a ``Mapping`` (bare, subscripted, or ``dict``)."""
     origin = typing.get_origin(core) or core
@@ -345,6 +405,12 @@ def _field_spec(
         raise _schema_error(owner, py_name, "Attr and Eager cannot be combined")
     if payload_marker is not None and attr_marker is not None:
         raise _schema_error(owner, py_name, "Attr and Payload cannot be combined")
+
+    # A jaxtyping array is rewritten to its backing class (np.ndarray or LazyArray) so the
+    # branches below classify it as they would the unannotated type; only `array` differs.
+    core, array_spec = _unwrap_jaxtyping(owner, py_name, core)
+    if array_spec is not None and attr_marker is not None:
+        raise _schema_error(owner, py_name, "Attr cannot annotate a jaxtyping array field")
 
     is_record = isinstance(core, type) and "__h5t_record__" in core.__dict__
     is_lazy_array = isinstance(core, type) and issubclass(core, LazyArray)
@@ -445,6 +511,7 @@ def _field_spec(
         member_type=member_type,
         foreign=foreign,
         default_factory=default_factory,
+        array=array_spec,
     )
 
 
@@ -580,6 +647,7 @@ def _compile_foreign_fields(
         raise _schema_error(owner, py_name, f"cannot inspect constructor: {exc}") from exc
 
     lazy_type: type[LazyArray] | None = None
+    payload_array: ArraySpec | None = None
     if kind is RecordKind.DATASET:
         assert data is not None
         if data not in annotations:
@@ -588,6 +656,7 @@ def _compile_foreign_fields(
             )
         payload_annotation = annotations.pop(data)
         payload_core, _, _ = _split_annotation(record_type, data, payload_annotation)
+        payload_core, payload_array = _unwrap_jaxtyping(record_type, data, payload_core)
         if _is_ndarray_annotation(payload_core):
             lazy_type = None
         elif isinstance(payload_core, type) and issubclass(payload_core, LazyArray):
@@ -644,6 +713,7 @@ def _compile_foreign_fields(
         attrs=attrs,
         lazy_type=lazy_type,
         signature=signature,
+        payload_array=payload_array,
     )
 
 
@@ -968,6 +1038,14 @@ def _load_foreign_dataset(
     foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str, *, eager: bool = False
 ) -> Any:
     """Load ``node`` into an instance of ``foreign.record_type`` via its constructor."""
+    # A dataset record is its own binding scope: named dims bind from its payload only.
+    with jaxtyped("context"):
+        return _load_foreign_dataset_in_scope(foreign, node, filename, path, eager=eager)
+
+
+def _load_foreign_dataset_in_scope(
+    foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str, *, eager: bool
+) -> Any:
     spec = foreign.spec
     _check_dataset_extras(spec, node, path)
     raw = _raw_attrs(node)
@@ -978,14 +1056,17 @@ def _load_foreign_dataset(
 
     assert foreign.data is not None
     if foreign.lazy_type is not None:
-        values[foreign.data] = foreign.lazy_type(
+        values[foreign.data] = _lazy_from_node(
+            foreign.lazy_type,
             filename,
             path,
-            tuple(node.shape),
-            np.dtype(node.dtype),
-            data=np.asarray(node[()]) if eager else None,
+            node,
+            eager=eager,
+            array=foreign.payload_array,
         )
     else:
+        if foreign.payload_array is not None:
+            _check_array(foreign.payload_array, _ghost(node), path)
         values[foreign.data] = np.asarray(node[()])
     if foreign.attrs is not None:
         values[foreign.attrs] = MappingProxyType(attrs)
@@ -997,6 +1078,15 @@ def _load_group_values(
     spec: ClassSpec, group: h5py.Group, filename: str, path: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load ``spec``'s fields from ``group``, returning ``(values, attrs snapshot)``."""
+    # Named dimensions unify across this record's own array fields only; a nested record
+    # calls back in here and so opens a scope of its own.
+    with jaxtyped("context"):
+        return _load_group_values_in_scope(spec, group, filename, path)
+
+
+def _load_group_values_in_scope(
+    spec: ClassSpec, group: h5py.Group, filename: str, path: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _check_group_extras(spec, group, path)
     raw = _raw_attrs(group)
     attrs = dict(raw)
@@ -1032,17 +1122,19 @@ def _load_group_values(
             else:
                 # A bare LazyArray member: no record type, no declared attributes.
                 assert field.member_type is not None
-                lazy_type = typing.cast(type[LazyArray], field.member_type)
-                value = lazy_type(
+                value = _lazy_from_node(
+                    typing.cast(type[LazyArray], field.member_type),
                     filename,
                     member_path,
-                    tuple(node.shape),
-                    np.dtype(node.dtype),
-                    data=np.asarray(node[()]) if field.eager else None,
+                    node,
+                    eager=field.eager,
+                    array=field.array,
                 )
         else:
             if not isinstance(node, h5py.Dataset):
                 raise ValidationError(member_path, "expected a dataset, found a group")
+            if field.array is not None:
+                _check_array(field.array, _ghost(node), member_path)
             value = np.asarray(node[()])
         values[field.py_name] = _validate_value(field, value, member_path)
 
