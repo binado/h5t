@@ -63,68 +63,63 @@ gone: it drives `_field_spec`'s dispatch, `_compile_foreign_fields`'s attributes
 
 ### Compilation is eager, with a fallback for forward references
 
-The `@h5t.dataset` / `@h5t.group` decorators call `_foreign_spec` at the decorator call, passing
-the defining frame's live locals (`inspect.currentframe().f_back.f_locals`) as the resolution
-scope. Consequences to keep in mind:
+The `@h5t.dataset` / `@h5t.group` decorators call `_foreign_spec` at the decorator call. Names in
+the annotations resolve against the record's module globals, then a `localns` mapping: the
+decorator caller's locals (read once by `_transient_locals` via `sys._getframe(2).f_locals`,
+copied, and never stored), overlaid with the user's explicit `localns=` kwarg, and always seeded
+with the class's own name so a function-local record can reference itself. Consequences:
 
 - A `SchemaError` for a bad declaration surfaces from the decorator call, so tests assert it by
   wrapping the decorated `class` statement itself — nothing needs to read the compiled spec.
 - A `NameError` raised by the annotation expression itself is *not* an error, **for a
   `GROUP`-kind record**: `_resolved_annotations` raises the private `_UnresolvedAnnotation`,
-  `_foreign_spec` lets it through, and the `group()` decorator stores a `_PendingRecord` (carrying
-  a weak snapshot of the scope) on `cls.__h5t_record__` instead of a `ForeignSpec`. Only that
-  path retains a scope. `@h5t.dataset` does not defer and does not need to — see "Why `DATASET`
-  stays eager and `GROUP` defers" below.
+  `_foreign_spec` lets it through, and the `group()` decorator keeps a `_PendingRecord` (kind,
+  data, attrs, extras_raw, py_name, and only the user's explicit `localns`) on
+  `cls.__h5t_record__` instead of a `ForeignSpec`. A deferred record retains **no** frame, scope
+  or snapshot. `@h5t.dataset` does not defer and does not need to — see "Why `DATASET` stays
+  eager and `GROUP` defers" below.
+- `group()` plants that pending marker *before* it compiles. Because the class's own name is
+  seeded into the namespace, a self-reference (`child: Node | None`) resolves to `cls` at once,
+  and `_field_spec` must already see `cls` as a `GROUP`-kind record. A failure other than
+  deferral removes the marker again.
 - A `NameError` escaping a *function the annotation calls* is a bug in that function, not a
   forward reference, and takes the `SchemaError` path. `_raised_by_annotation` tells the two apart
-  by the frame that raised, which it recognises two ways: a PEP 563 string is compiled under the
-  `_ANNOTATION_FILE` filename rather than `eval`'s default `<string>`, and a PEP 649 annotation
+  by the frame that raised: a string annotation is compiled under `_ANNOTATION_FILE` (h5t's own
+  `eval`, 3.14) or under `<string>` (`typing.get_type_hints`, ≤3.13), and a PEP 649 annotation
   runs in the class's own `__annotate__` (matched by code-object identity, since it is compiled
-  under the *user's* module filename). A callee's frame is neither. One accepted asymmetry: a
-  `NameError` from a lambda *nested inside* an annotation defers on ≤3.13 but is a `SchemaError`
-  on 3.14, because the innermost frame is the lambda rather than `__annotate__`.
-- On 3.14+, `inspect.get_annotations` is itself the evaluation point (PEP 649), so it raises where
-  older versions raised at the `class` statement. `_resolved_annotations` therefore guards that
-  call too and routes the failure through the same `_annotation_failure` classifier as the string
-  path — a `NameError` from the annotation defers, anything else becomes `SchemaError`. Because
-  3.14 does not cache `__annotations__` on the class, a deferred record re-evaluates its annotation
-  expressions on the retry: an annotation with side effects runs them twice.
+  under the *user's* module filename). A callee's frame is none of these. Two accepted
+  weaknesses: `<string>` also matches any `exec`'d code, and a `NameError` from a lambda *nested
+  inside* an annotation defers on ≤3.13 but is a `SchemaError` on 3.14, because the innermost
+  frame is the lambda rather than `__annotate__`.
+- `_resolved_annotations` on ≤3.13 calls `typing.get_type_hints(cls, localns=..., include_extras=True)`
+  and keeps only the keys of `inspect.get_annotations(cls)`, so the per-base walk in
+  `_compile_foreign_fields` still sees each base's own annotations. `get_type_hints` evaluates the
+  whole MRO, so a broken annotation on a base now fails the subclass's compile. On 3.14+ it calls
+  `annotationlib.get_annotations(cls, format=Format.VALUE)`, which is itself the evaluation point
+  (PEP 649) and raises where older versions raised at the `class` statement; quoted annotations
+  come back as strings, which h5t evaluates itself. Both routes feed the same
+  `_annotation_failure` classifier. `Format.STRING` and `Format.FORWARDREF` look like the obvious
+  choice and must not be used: both first probe the annotate function with the *real* globals and
+  swallow whatever it raises, so they would execute a user's annotation helper — and hide its bug —
+  inside an exception handler, breaking the callee-`NameError` rule above.
+- Because 3.14 does not cache `__annotations__` on the class, a deferred record re-evaluates its
+  annotation expressions on the retry: an annotation with side effects runs them twice.
 - `_ensure_record_compiled` is the retry point for compile-time callers, and the only way anything
   reads a record's spec without converting a still-unresolved name. It returns a compiled
-  `ForeignSpec` unchanged, or retries a `_PendingRecord` against its unpacked scope and caches the
-  result back onto `__h5t_record__`. It is called from `_field_spec` (a `DATASET`-kind member).
+  `ForeignSpec` unchanged, or retries a `_PendingRecord` with its `localns` and caches the result
+  back onto `__h5t_record__`. It is called from `_field_spec` (a `DATASET`-kind member).
   Load-time callers (`_load_group_values` for a `GROUP`-kind member, and `h5t.load` itself before
   touching the filesystem) go through `_compiled_record`, which wraps it and turns a renewed
   `_UnresolvedAnnotation` into the user-visible `SchemaError`. Because every read funnels through
   these two, deferral needs no `model_rebuild()`-style public API.
-- `_resolved_annotations` searches module globals → scope (live frame locals, or the unpacked
-  `_PendingRecord.scope`) → class dict. `_weak_scope`/`_unpack_scope` mirror pydantic's
-  `build_lenient_weakvaluedict`: values that reject `weakref.ref` (`int`, `str`, tuples, dicts) are
-  stored directly. Because those entries are strong, the snapshot keeps only the names
-  `_record_annotation_names` finds in the unresolved annotations — otherwise an unrelated local
-  container would pin its contents for the record's lifetime. `_record_annotation_names` unions
-  `_annotation_names` across the whole MRO, since a record's bases never compile and snapshot a
-  scope of their own.
-- `_annotation_names` picks its source from how the annotations failed. If they read back as PEP
-  563 strings, `_referenced_names` compiles each and walks it. On 3.14 an unresolved annotation
-  never became a value, so the names come off the `__annotate__` code object instead: `_code_names`
-  walks `co_names`, and `_quoted_names` recovers the names inside string constants, since a quoted
-  annotation is a bare constant that `co_names` never mentions. Both recurse into nested code
-  objects and both over-approximate, which is the safe direction. `co_freevars` is deliberately
-  *not* collected: an `__annotate__` has free variables only when an enclosing function scope
-  exists, which is precisely when its own closure keeps them reachable — the snapshot would be
-  redundant there, and collecting them would only widen what `_weak_scope` pins strongly. `annotationlib`'s
-  `Format.STRING` and `Format.FORWARDREF` look like the obvious source here and must not be used:
-  both first probe the annotate function with the *real* globals and swallow whatever it raises, so
-  they would execute a user's annotation helper — and hide its bug — from inside an exception
-  handler, breaking the callee-`NameError` rule above.
-- Accepted limitation, ≤3.13 and quoted annotations only: a record that both lives in a function
-  scope *and* forward-references a class from that same scope may find the referent collected. On
-  3.14 a *bare* annotation escapes it entirely — `__annotate__` closes over the defining function's
-  cells, so the referent is reachable with or without the snapshot. The flip side is the warning
-  worth knowing: that closure makes the class **strongly** retain every enclosing-function local
-  its annotations name, deferred or not. That is the retention `_weak_scope` was built to avoid,
-  and it is outside h5t's control.
+- Accepted limitation: the retry of a deferred record no longer sees the decorating function's
+  locals. A function-scope `@h5t.group` record that defers on one name *and* uses a function-local
+  type must pass that type as `localns={...}`; otherwise load raises `SchemaError`. A non-deferred
+  record, and self-reference, need nothing. On 3.14 a *bare* annotation needs no `localns` either:
+  `__annotate__` closes over the defining function's cells. The flip side is a warning worth
+  knowing: that closure makes the class **strongly** retain every enclosing-function local its
+  annotations name, deferred or not, outside h5t's control. A *quoted* annotation has no closure
+  cell and does need `localns`.
 
 ### All internal state is prefixed `_h5t_`, and records have no reserved names
 
@@ -224,7 +219,7 @@ its dependency" tolerance: `_foreign_spec` lets `_UnresolvedAnnotation` propagat
 `_PendingRecord` instead of a `ForeignSpec`. `_record_kind(cls)` reads `.kind` directly off
 whichever of the two sits on `cls.__dict__["__h5t_record__"]`, so the DATASET-vs-GROUP dispatch in
 `_field_spec` needs no compilation at all — only `_ensure_record_compiled` (retrying a pending
-record against its snapshotted scope, and caching the result back onto `__h5t_record__`) forces
+record with its `localns`, and caching the result back onto `__h5t_record__`) forces
 that.
 
 **Why a `GROUP`-kind member resolves at load time, not compile time.** `_field_spec`'s `is_record`
@@ -271,21 +266,21 @@ pinned versions in `.venv`:
    traceback's presence or absence of a constructor frame is the fallback distinction.
 
 A record's annotations resolve only against its module globals and class dict by default —
-`_resolved_annotations(base)` is called with no `scope`. An `Annotated[T, Payload(...)]` use site
+`_resolved_annotations(base)` is called with no `localns`. An `Annotated[T, Payload(...)]` use site
 relies on exactly that default; the `@h5t.dataset`/`@h5t.group` decorators (below) are the callers
 that pass one, since they do have a defining frame to capture.
 
 ### The `@h5t.dataset` / `@h5t.group` decorators
 
-`h5t.dataset(data=..., attrs=..., extras=...)` is sugar for `Annotated[T, Payload(...)]` that
-validates against the record type's own definition instead of a distant owner field's. It calls
-`_foreign_spec(cls, cls, data, kind=RecordKind.DATASET, data=data, attrs=attrs, extras_raw=extras,
-scope=...)` immediately — `cls` is both the record type being compiled and the `owner` a
-`SchemaError` names, so a bad `data=` surfaces at the decorator's own call site. Passing the frame
-it captures (`inspect.currentframe().f_back.f_locals`) as `_foreign_spec`'s `scope` parameter lets
-a function-local record's annotations resolve against function locals, not just module globals. This scope is never retained as a weak snapshot for a later retry — it does
-not need to be, since a `DATASET`-kind `_foreign_spec` call always resolves-or-`SchemaError`s
-immediately (see above). `_field_spec` dispatches to a decorated record's compiled spec by checking
+`h5t.dataset(data=..., attrs=..., extras=..., localns=...)` is sugar for `Annotated[T, Payload(...)]`
+that validates against the record type's own definition instead of a distant owner field's. It
+calls `_foreign_spec(cls, cls, data, kind=RecordKind.DATASET, data=data, attrs=attrs,
+extras_raw=extras, localns=...)` immediately — `cls` is both the record type being compiled and the
+`owner` a `SchemaError` names, so a bad `data=` surfaces at the decorator's own call site. The
+`localns` it passes is `_transient_locals(localns)`: the caller's locals plus the explicit kwarg,
+used for this one compile and then dropped. A `DATASET`-kind `_foreign_spec` call always
+resolves-or-`SchemaError`s immediately (see above), so nothing is ever retained.
+`_field_spec` dispatches to a decorated record's compiled spec by checking
 `"__h5t_record__" in core.__dict__` (a per-class marker set by the decorator's `setattr`,
 deliberately not inherited, so a subclass of a decorated record is not accidentally one itself)
 rather than `getattr`, and only when no explicit `Payload(...)` is present at the use site — an
@@ -293,20 +288,18 @@ explicit marker there still overrides the decorator's own `data=`/`attrs=`/`extr
 `GROUP`-kind record (compiling a separate, throwaway `DATASET`-kind spec for it, which then fails
 `_field_spec`'s attributes-only check unless the record genuinely has no other child members).
 
-`h5t.group(attrs=..., extras=...)` is the `GROUP`-kind counterpart, with no `data=` since a group
-record has no single payload field. It captures the same defining frame, but — unlike `dataset()` —
-*does* retain it: on `_UnresolvedAnnotation` it stores a `_PendingRecord` (kind, data, attrs,
-extras_raw, py_name, and `_weak_scope(scope, _record_annotation_names(cls))`) on
-`cls.__h5t_record__` instead of a `ForeignSpec`. `_record_annotation_names` unions
-`_annotation_names` across the record's whole MRO rather than reading `cls` alone, since a
-record's bases never compile and snapshot a scope of their own. `_ensure_record_compiled` is the
-retry point: called from `_field_spec` (a `DATASET`-kind member) it returns a compiled
-`ForeignSpec` unchanged or retries a `_PendingRecord` against its unpacked scope, letting a
-renewed `_UnresolvedAnnotation` propagate uncaught so that a `GROUP`-kind owner record's own
-`_ensure_record_compiled` retry defers too. Load-time callers — `_load_group_values` for a nested
-`GROUP` member, and `h5t.load` for a top-level record — go through `_compiled_record`, which
-converts that renewed exception into `SchemaError`. `h5t check` only catches `SchemaError`, so
-leaving the private exception uncaught there would surface as an internal traceback.
+`h5t.group(attrs=..., extras=..., localns=...)` is the `GROUP`-kind counterpart, with no `data=`
+since a group record has no single payload field. It reads the caller's locals the same transient
+way for its first compile, but — unlike `dataset()` — may defer: on `_UnresolvedAnnotation` it
+leaves the `_PendingRecord` (kind, data, attrs, extras_raw, py_name, explicit `localns`) on
+`cls.__h5t_record__` instead of a `ForeignSpec`. `_ensure_record_compiled` is the retry point:
+called from `_field_spec` (a `DATASET`-kind member) it returns a compiled `ForeignSpec` unchanged
+or retries a `_PendingRecord` with its `localns`, letting a renewed `_UnresolvedAnnotation`
+propagate uncaught so that a `GROUP`-kind owner record's own `_ensure_record_compiled` retry defers
+too. Load-time callers — `_load_group_values` for a nested `GROUP` member, and `h5t.load` for a
+top-level record — go through `_compiled_record`, which converts that renewed exception into
+`SchemaError`. `h5t check` only catches `SchemaError`, so leaving the private exception uncaught
+there would surface as an internal traceback.
 
 ## Testing conventions
 

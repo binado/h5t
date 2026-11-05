@@ -14,7 +14,6 @@ import numpy.typing as npt
 import pytest
 
 import h5t
-from h5t._compile import _PendingRecord
 from h5t._spec import ForeignSpec, MemberKind
 
 
@@ -154,38 +153,46 @@ def test_eager_compilation_does_not_retain_the_defining_scope() -> None:
     assert compiled(record).spec.fields[0].py_name == "value"
 
 
-def test_deferred_path_snapshots_the_scope_weakly() -> None:
-    # Accepted limitation: a record that both lives in a function scope *and* forward-
-    # references a class defined later in that same function may find the referent
-    # collected before first use. That is the intersection of two rare cases, and the
-    # same tradeoff pydantic ships. Eager compilation makes it rarer than a lazy
-    # default would, since ordinary function-local records never defer.
+def test_deferred_record_with_function_local_dependency_needs_localns_to_resolve() -> None:
+    # Documented limitation: a deferred record keeps no scope, so a function-local type
+    # absent from the retry's namespace is unresolvable. `localns=` supplies it.
     @h5t.group()
     @dataclasses.dataclass
     class Dependency:
         value: int
 
-    label = "on-disk"
+    def declare(**kwargs: Any) -> type:
+        # Dependency is not in this frame, so the record defers at decoration.
+        @h5t.group(**kwargs)
+        @dataclasses.dataclass
+        class Deferred:
+            dependency: Dependency
 
+        return Deferred
+
+    plain = declare()
+    with_localns = declare(localns={"Dependency": Dependency})
+
+    with pytest.raises(h5t.SchemaError, match="Dependency"):
+        h5t.load(plain, "never-opened.h5")
+    fields = h5t._compile._compiled_record(with_localns).spec.fields
+    assert fields[0].member_type is Dependency
+
+
+def test_function_local_record_can_reference_itself() -> None:
     @h5t.group()
     @dataclasses.dataclass
-    class Deferred:
-        dependency: Dependency
-        renamed: Annotated[int, h5t.Name(label)]
-        undefined: _NeverDefined  # noqa: F821 -- forces the deferred path
+    class Node:
+        value: int
+        child: Node | None = None
 
-    pending = Deferred.__dict__["__h5t_record__"]
-    assert isinstance(pending, _PendingRecord)
-    assert isinstance(pending.scope["Dependency"], weakref.ref)
-    assert pending.scope["Dependency"]() is Dependency
-    # A str rejects weakref.ref, so it is the one kind of entry held strongly.
-    assert pending.scope["label"] == label
+    names = [f.py_name for f in h5t._compile._compiled_record(Node).spec.fields]
+    assert names == ["value", "child"]
 
 
-def test_deferred_path_does_not_retain_locals_the_annotations_never_name() -> None:
-    # The snapshot must hold no more than annotation resolution can ask for: a
-    # container rejects weakref.ref, so an unfiltered snapshot would pin whatever it
-    # holds for as long as the deferred record lives.
+def test_deferred_record_retains_no_locals_the_annotations_never_name() -> None:
+    # A deferred record retains no scope at all: the decorator's locals are read once for
+    # the immediate compile and dropped, so nothing in them is pinned by the record.
     class Tracked:  # object() cannot be weakly referenced; an instance can
         pass
 
@@ -203,7 +210,7 @@ def test_deferred_path_does_not_retain_locals_the_annotations_never_name() -> No
 
     record, ref = declare()
     gc.collect()
-    assert record.__dict__["__h5t_record__"].scope == {}
+    assert record.__dict__["__h5t_record__"].localns is None
     assert ref() is None
     # h5t.load is where a still-unresolved name becomes the user-visible SchemaError;
     # it retries the record before touching the filesystem.
