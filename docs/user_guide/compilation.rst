@@ -60,8 +60,8 @@ function-local type, pass the namespace explicitly as a class keyword argument:
 Notes
 -----
 
-- A ``NameError`` raised by a *function an annotation calls* is a bug in that function,
-  not a forward reference, and is reported as a :class:`h5t.SchemaError`.
-- A still-unresolved name at load time becomes a :class:`h5t.SchemaError`.
+- A still-unresolved name at load time becomes a :class:`h5t.SchemaError` naming it.
+- Pydantic cannot tell a forward reference from a ``NameError`` raised inside a function an
+  annotation calls, so the latter is deferred too and reported the same way on first use.
 - A group-kind member's target schema is resolved at load time, which is what makes
   ``child: Node | None`` possible without infinite recursion.
