@@ -30,13 +30,16 @@ groups are **detached**: every file handle is closed before `model_validate_hdf5
 demand. Both `Group[T]` and `Dataset[T]` are generic over `T` (defaulting to `Mapping[str, Any]`
 or accepting a `pydantic.BaseModel` subclass for strongly typed `.attrs: T`).
 
-Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_spec`/`_errors`. The one
+Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_spec`/`_errors` → `_h5view`
+(a leaf: imports only h5py/numpy). The one
 reverse edge is `Group.model_dump_hdf5`, which imports `_write` inside the method to avoid a
 real import cycle (the style guide allows deferred imports for that).
 
 - **`_spec.py`** — `Glob` marker and the compiled IR: `ArraySpec`, `AttrFieldSpec`, `AttrsSpec`,
   `FieldSpec`, `GroupSpec`, `MemberKind` (`ARRAY` / `DATASET` / `GROUP` / `COLLECTION`),
   `Extras`, plus error-path formatters.
+- **`_h5view.py`** — `_GroupView`, a read-only `Mapping` over an open `h5py.Group`, plus the raw
+  attribute helpers (`_raw_attrs`, `_normalized_attrs`) and `_ghost`.
 - **`_array.py`** — `Dataset[T]`, the detached lazily-read dataset with typed `.attrs: T`,
   `h5py`-style indexing (`ds[()]`, `ds[:]`, `ds[:10]`), `.data`, `.read()`, `.open()`, and
   `__array__()`.
@@ -80,8 +83,11 @@ jaxtyping does the checking; h5t never parses a shape string. `_unwrap_jaxtyping
 `AbstractArray` subclass to its backing `np.ndarray`/`Dataset[T]` early in compilation and keeps
 the original as an `ArraySpec`. `_check_array` calls the non-public `hint.__instancecheck_str__`
 on a metadata-only candidate (a zero-stride `_ghost` array, or a `Dataset`), so no data is read.
-A guard test fails if jaxtyping drops that method. Each `_load_group` / `_load_attrs` call opens
-its own `jaxtyped("context")` scope; the writer and `Group`'s wrap validator mirror this.
+A guard test fails if jaxtyping drops that method. Dimension bindings are scoped per group:
+`Group`'s wrap validator opens one `jaxtyped("context")` for the children, and the `attrs` field
+has its own scope (`_ATTRS_SCOPE`) so attribute dims never bind with child dims; the writer
+mirrors this. A jaxtyping `np.ndarray` field checks a `_ghost` of an `h5py.Dataset` *before*
+reading it; a `Dataset`-backed one builds the lazy `Dataset` and checks that.
 
 ### Array annotations see through type aliases
 
@@ -90,15 +96,35 @@ alias rather than `np.ndarray`. `_is_ndarray_annotation` expands `__value__` (de
 it reaches a real origin. numpy 2.5 needs Python ≥ 3.12, so a failure here that looks
 Python-version-dependent is really numpy-version-dependent.
 
-### Validation
+### Validation: one pass, type-owned readers
 
-Pydantic v2 `TypeAdapter` is built once per attribute/child field with
-`arbitrary_types_allowed=True`. Attribute fields use standard Pydantic `Field(alias=...)`,
-`BeforeValidator`, and `PlainSerializer`. Errors are fail-fast and path-aware.
+`Group.model_validate_hdf5` opens the file and calls `cls.model_validate(_GroupView(node))`
+once. The view hands Pydantic raw material: child groups as nested views, child datasets as the
+raw `h5py.Dataset`, and the attributes under `ATTRS_KEY` (`"/attrs"`, not a legal child name;
+`Group.attrs` has `validation_alias=ATTRS_KEY`, so in-memory `Group(attrs=...)` still works).
+Each *type* converts raw input itself:
+
+- `Dataset[T]` builds a lazy `Dataset` from an `h5py.Dataset` (typed attrs are validated in their
+  own jaxtyping scope; failures become `h5t.ValidationError("<path>@<attr>", ...)`).
+- jaxtyping arrays: see above.
+- plain `np.ndarray` fields (and collections of them) get a `BeforeValidator(_read_array)`
+  appended by `_inject_readers` after compilation, followed by one forced model rebuild
+  (`_finish_group`, from `_GroupMeta.__new__` and `_ensure_group_compiled`; eagerly for `G[A]`).
+- `Glob.__get_pydantic_core_schema__` filters only a `_GroupView` (`fnmatch.fnmatchcase`).
+- `Group._h5t_jaxtyping_scope` rejects any attribute on a `extra="forbid"` group with untyped
+  attrs, and freezes loaded untyped attrs into a `MappingProxyType`.
+
+Pydantic's semantics apply: `T | None` without a default is required, defaults are not
+re-validated unless `validate_default`, and under `extra="ignore"` only declared names are read.
+Pydantic's `ValidationError` is a `ValueError`, so anything raised inside a validator must be an
+`h5t.ValidationError` (not a `ValueError`) to propagate unchanged.
+
+Errors keep pydantic's wording; `_h5_error_path` walks the first error's `loc` through the
+`GroupSpec` to produce the HDF5 path (`/values: Field required`, `/@count: ...`,
+`/runs/r1/values: ...`). A `loc` part it cannot place goes into the message. Errors raised
+directly as `h5t.ValidationError` already carry their path. `_compile_closure` compiles every
+reachable group first so an unresolved name stays a `SchemaError`.
 Hierarchy: `H5TError` → `SchemaError`, `ValidationError`.
-
-Missing members go through `_missing_child_value` (children) and the attrs loop in `_load_attrs` (attributes): declared default
-(validated; `default_factory` called first), else `None` for `T | None`, else `ValidationError`.
 
 ## Testing
 

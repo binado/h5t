@@ -17,6 +17,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `overwrite=True` behaves like h5py: it deletes the target group's contents and then
   writes, so a failed overwrite leaves the group empty.
 - Attribute validators no longer run again when dumping.
+- **Breaking:** loading is a single Pydantic validation pass over a lazy view of the HDF5
+  group. Errors use Pydantic's wording with the location translated to an HDF5 path, e.g.
+  `/values: Field required` or `/@count: Input should be a valid integer`.
+- **Breaking:** Pydantic's field semantics apply on load: `T | None` without a default is
+  required (write `= None`), and a declared default is not re-validated unless
+  `validate_default=True`.
+- **Breaking:** a `mode="before"` model validator on a `Group` receives a read-only mapping
+  view of the HDF5 group instead of a dict. Attributes are looked up under the reserved key
+  `"/attrs"`; a *child* named `attrs` is never read as the attributes, and is reported as an
+  undeclared child under `extra="forbid"`.
 
 ### Fixed
 

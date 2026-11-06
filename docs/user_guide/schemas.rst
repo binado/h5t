@@ -98,11 +98,12 @@ accepted wherever ``np.ndarray`` is; for ``NDArray`` the dtype parameter is not 
 Missing members, defaults and optionals
 ---------------------------------------
 
-A child node or attribute absent from the file follows these rules, in order:
+A child node or attribute absent from the file follows Pydantic's rules:
 
-1. a declared default is used (and validated); a ``Field(default_factory=...)`` is called first;
-2. a ``T | None`` annotation gives ``None``;
-3. otherwise :class:`h5t.ValidationError` is raised.
+1. a declared default is used as written (it is validated only with
+   ``Field(validate_default=True)``); a ``Field(default_factory=...)`` is called instead;
+2. otherwise the field is required and :class:`h5t.ValidationError` is raised, even for
+   ``T | None``: write ``T | None = None`` for an optional member.
 
 Attribute conversion and validation
 -----------------------------------
@@ -134,4 +135,8 @@ All errors derive from :class:`h5t.H5TError`:
 - :class:`h5t.SchemaError`: a schema class declaration is invalid. Raised at class creation.
 - :class:`h5t.ValidationError`: the file or model does not conform. Fail-fast and
   path-aware, e.g. ``/fiducials: the size of dimension n is 4 which does not equal the
-  existing value of 3``.
+  existing value of 3``. Messages from Pydantic keep its wording with the location turned
+  into an HDF5 path: ``/values: Field required``, ``/@count: Input should be a valid integer``.
+
+A ``mode="before"`` model validator on a ``Group`` sees a read-only mapping over the HDF5
+group (children by name, attributes under ``"/attrs"``), not a ``dict``.

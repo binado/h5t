@@ -55,8 +55,8 @@ shell-style pattern (case-sensitive; it may not be empty or contain ``/``).
 Rules and limits
 ----------------
 
-- A missing group follows the usual rules (``| None``, a default or ``default_factory``,
-  else a :class:`h5t.ValidationError`).
+- A missing group follows the usual rules (a default or ``default_factory``, else a
+  :class:`h5t.ValidationError`; ``| None`` alone does not make it optional).
 - Keys must be ``str``. Items cannot be scalars, optional, nested collections, or carry
   ``Field(alias=...)`` / ``Glob``.
 - Array and ``Dataset`` items share the owner group's jaxtyping dimension bindings; nested
