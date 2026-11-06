@@ -273,7 +273,11 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
             )
         seen_h5_names[h5_name] = py_name
         if is_optional:
-            optional.add(h5_name)
+            optional.add(
+                field_info.serialization_alias
+                if field_info.serialization_alias is not None
+                else h5_name
+            )
 
         core = _unwrap_jaxtyping(model_type, py_name, core)
         if isinstance(core, type) and issubclass(core, (Group, Dataset)):
@@ -765,8 +769,8 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
             model = handler(values)
         if spec is not None and spec.attrs is None:
             # Untyped attributes of a loaded group are a read-only snapshot.
-            model.attrs = typing.cast(
-                T, MappingProxyType(dict(typing.cast(Mapping[str, Any], model.attrs)))
+            object.__setattr__(
+                model, "attrs", MappingProxyType(dict(typing.cast(Mapping[str, Any], model.attrs)))
             )
         return model
 

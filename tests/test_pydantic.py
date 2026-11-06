@@ -176,6 +176,38 @@ def test_frozen_attrs_model_loads_and_stays_frozen(attrs_file: Path) -> None:
         attrs.count = 4  # type: ignore[misc]
 
 
+def test_frozen_group_loads_read_only_untyped_attrs(attrs_file: Path) -> None:
+    class Schema(h5t.Group):
+        model_config = ConfigDict(frozen=True)
+
+    loaded = Schema.model_validate_hdf5(attrs_file)
+    assert loaded.attrs["count"] == 3
+    with pytest.raises(TypeError):
+        loaded.attrs["count"] = 4  # type: ignore[index]
+    with pytest.raises(PydanticValidationError, match="frozen"):
+        loaded.attrs = {}
+
+
+@pytest.mark.parametrize("value", [None, "hello"])
+def test_optional_attrs_use_serialization_alias_when_written(
+    tmp_path: Path, value: str | None
+) -> None:
+    class AliasedAttrs(BaseModel):
+        note: str | None = Field(default=None, alias="input", serialization_alias="out")
+
+    class Schema(h5t.Group[AliasedAttrs]):
+        pass
+
+    path = tmp_path / "aliased.h5"
+    Schema(attrs=AliasedAttrs(input=value)).model_dump_hdf5(path)
+    with h5py.File(path) as file:
+        assert "input" not in file.attrs
+        if value is None:
+            assert "out" not in file.attrs
+        else:
+            assert file.attrs["out"] == value
+
+
 def test_loaded_attrs_equal_in_memory_model(attrs_file: Path) -> None:
     class EqAttrs(BaseModel):
         name: str
