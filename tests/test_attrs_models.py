@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -99,3 +100,44 @@ def test_in_memory_group_construction_validates_dataset_attrs() -> None:
     owner = Owner(measurement=h5t.Dataset(np.arange(3), {"unit": "m"}))
     assert isinstance(owner.measurement.attrs, MeasurementAttrs)
     assert owner.measurement.attrs.unit == "m"
+
+
+class _GroupAttrs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(alias="stored-name")
+    count: int
+
+
+class _AttrGroup(h5t.Group[_GroupAttrs]):
+    pass
+
+
+@pytest.fixture
+def attr_group_file(tmp_path: Path) -> Path:
+    path = tmp_path / "group_attrs.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["stored-name"] = "ada"
+        file.attrs["count"] = 2
+    return path
+
+
+def test_group_attrs_alias_is_the_hdf5_attribute_name(attr_group_file: Path) -> None:
+    loaded = _AttrGroup.model_validate_hdf5(attr_group_file)
+    assert loaded.attrs.name == "ada"
+
+
+def test_group_attrs_extra_forbid_rejects_undeclared_attribute(attr_group_file: Path) -> None:
+    with h5py.File(attr_group_file, "a") as file:
+        file.attrs["surprise"] = 1
+    with pytest.raises(h5t.ValidationError) as caught:
+        _AttrGroup.model_validate_hdf5(attr_group_file)
+    assert caught.value.path == "/@surprise"
+
+
+def test_group_attrs_missing_required_field_reports_attribute_path(attr_group_file: Path) -> None:
+    with h5py.File(attr_group_file, "a") as file:
+        del file.attrs["count"]
+    with pytest.raises(h5t.ValidationError, match="required attribute") as caught:
+        _AttrGroup.model_validate_hdf5(attr_group_file)
+    assert caught.value.path == "/@count"

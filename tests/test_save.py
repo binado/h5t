@@ -425,3 +425,41 @@ def test_partial_file_removal_failure_is_attached_to_the_original_error(
     with pytest.raises(h5t.ValidationError) as info:
         unwritable_names.model_dump_hdf5(tmp_path / "doc.h5")
     assert any("partially written file" in note for note in info.value.__notes__)
+
+
+class _TypedDatasetGroup(h5t.Group):
+    measurement: h5t.Dataset[MeasurementAttrs]
+
+
+class _OtherDatasetAttrs(BaseModel):
+    note: str = "n"
+
+
+@pytest.mark.parametrize(
+    "value, match",
+    [
+        (np.arange(3), "instance of Dataset"),
+        (h5t.Dataset(np.arange(3), _OtherDatasetAttrs()), "MeasurementAttrs"),
+    ],
+    ids=["non-dataset", "wrong-specialization"],
+)
+def test_dump_rejects_bad_dataset_member(tmp_path: Path, value: Any, match: str) -> None:
+    group = _TypedDatasetGroup.model_construct(measurement=value)
+    target = tmp_path / "bad.h5"
+    with pytest.raises(h5t.ValidationError, match=match) as caught:
+        group.model_dump_hdf5(target)
+    assert caught.value.path.startswith("/measurement")
+    assert not target.exists()
+
+
+def test_dump_of_dataset_whose_source_file_was_deleted_leaves_no_file(tmp_path: Path) -> None:
+    source = tmp_path / "source.h5"
+    with h5py.File(source, "w") as file:
+        file.create_dataset("measurement", data=np.arange(3)).attrs["unit"] = "m"
+    loaded = _TypedDatasetGroup.model_validate_hdf5(source)
+    source.unlink()
+    target = tmp_path / "copy.h5"
+    with pytest.raises(h5t.ValidationError, match="cannot read dataset data") as caught:
+        loaded.model_dump_hdf5(target)
+    assert caught.value.path == "/measurement"
+    assert not target.exists()

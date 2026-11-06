@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import h5py
 import numpy as np
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, TypeAdapter
+from pydantic import ValidationError as PydanticValidationError
 
 import h5t
 
@@ -225,3 +228,85 @@ def test_equality_compares_metadata_before_reading_data(result_file: Path) -> No
     assert measurement != h5t.Dataset(np.arange(6), MeasurementAttrs(unit="m"))
     assert measurement != h5t.Dataset(np.arange(5.0), MeasurementAttrs(unit="m"))
     assert measurement != h5t.Dataset(np.arange(5), MeasurementAttrs(unit="m", scale=2.0))
+
+
+class _OtherAttrs(BaseModel):
+    note: str = "n"
+
+
+@pytest.fixture
+def typed_adapter() -> TypeAdapter[h5t.Dataset[MeasurementAttrs]]:
+    return TypeAdapter(h5t.Dataset[MeasurementAttrs])
+
+
+def test_dataset_schema_rejects_non_dataset_value(
+    typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]],
+) -> None:
+    with pytest.raises(PydanticValidationError, match="instance of Dataset"):
+        typed_adapter.validate_python(np.arange(3))
+
+
+def test_dataset_schema_rejects_wrong_attrs_model(
+    typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]],
+) -> None:
+    with pytest.raises(PydanticValidationError, match="MeasurementAttrs"):
+        typed_adapter.validate_python(h5t.Dataset(np.arange(3), _OtherAttrs()))
+
+
+def test_dataset_schema_rejects_invalid_attrs_mapping(
+    typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]],
+) -> None:
+    with pytest.raises(PydanticValidationError, match="unit"):
+        typed_adapter.validate_python(h5t.Dataset(np.arange(3), {"unit": "parsec"}))
+
+
+def test_dataset_schema_clone_of_lazy_dataset_stays_lazy(
+    result_file: Path, typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]]
+) -> None:
+    raw = Result.model_validate_hdf5(result_file).raw_measurement
+    clone = typed_adapter.validate_python(raw)
+    assert isinstance(clone, h5t.Dataset[MeasurementAttrs])
+    assert (clone.filename, clone.path) == (raw.filename, raw.path)
+    assert clone.attrs.unit == "m"
+    with h5py.File(result_file, "a") as file:
+        file["raw_measurement"][...] = np.arange(5) + 100
+    np.testing.assert_array_equal(clone[:2], [100, 101])  # still reads from the file
+
+
+def test_dataset_schema_clone_keeps_cached_data(
+    result_file: Path, typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]]
+) -> None:
+    raw = Result.model_validate_hdf5(result_file).raw_measurement
+    cached = raw.data
+    with h5py.File(result_file, "a") as file:
+        file["raw_measurement"][...] = np.arange(5) + 100
+    clone = typed_adapter.validate_python(raw)
+    assert clone.data is cached
+
+
+def test_dataset_deleted_from_a_live_file_fails_with_path(result_file: Path) -> None:
+    measurement = Result.model_validate_hdf5(result_file).measurement
+    with h5py.File(result_file, "a") as file:
+        del file["measurement"]
+    with pytest.raises(h5t.ValidationError, match="no longer exists") as caught:
+        measurement.read()
+    assert caught.value.path == "/measurement"
+
+
+def test_dataset_path_replaced_by_group_fails_with_path(result_file: Path) -> None:
+    measurement = Result.model_validate_hdf5(result_file).measurement
+    with h5py.File(result_file, "a") as file:
+        del file["measurement"]
+        file.create_group("measurement")
+    with pytest.raises(h5t.ValidationError, match="found a group"):
+        measurement.read()
+
+
+def test_dataset_subscript_with_mapping_returns_the_untyped_base() -> None:
+    assert h5t.Dataset[Mapping[str, Any]] is h5t.Dataset
+
+
+@pytest.mark.parametrize("bad", [int, 3, list[int]])
+def test_dataset_subscript_with_invalid_argument_is_schema_error(bad: Any) -> None:
+    with pytest.raises(h5t.SchemaError, match="type argument"):
+        h5t.Dataset[bad]

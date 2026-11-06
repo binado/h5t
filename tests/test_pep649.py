@@ -184,3 +184,19 @@ def test_bare_jaxtyping_annotation_inside_a_function(tmp_path: Path) -> None:
         f["y"] = np.zeros(4)
     with pytest.raises(h5t.ValidationError, match=r"/y: the size of dimension n is 4"):
         R.model_validate_hdf5(path)
+
+
+def test_dataset_forward_reference_to_attrs_defined_later(tmp_path: Path) -> None:
+    class Owner(h5t.Group):
+        measurement: h5t.Dataset[LaterAttrs]  # noqa: F821
+
+    assert isinstance(marker(Owner), _PendingGroup)
+
+    class LaterAttrs(BaseModel):
+        unit: Literal["m"]
+
+    path = tmp_path / "later.h5"
+    with h5py.File(path, "w") as file:
+        file.create_dataset("measurement", data=np.arange(3)).attrs["unit"] = "m"
+    loaded = Owner.model_validate_hdf5(path)
+    assert isinstance(loaded.measurement.attrs, LaterAttrs)

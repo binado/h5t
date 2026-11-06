@@ -68,3 +68,11 @@ unit: str = result.recording.attrs.unit
 payload: np.ndarray = result.recording[()]
 
 saved: None = result.model_dump_hdf5(Path("out.h5"), root="/run", mode="a", overwrite=True)
+
+
+# Negative cases: each line must stay a type error, so the ignores below fail
+# ``ty check`` (unused-ignore) if the public typing surface loosens.
+bad_unit: int = result.recording.attrs.unit  # ty: ignore[invalid-assignment]
+bad_version: str = result.attrs.version  # ty: ignore[invalid-assignment]
+bad_untyped: h5t.Dataset[RecordingAttrs] = result.samples  # ty: ignore[invalid-assignment]
+bad_mode: None = result.model_dump_hdf5(Path("out.h5"), mode="r")  # ty: ignore[invalid-argument-type]

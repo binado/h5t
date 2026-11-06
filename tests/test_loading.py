@@ -14,7 +14,7 @@ import h5t
 from .conftest import MeasurementAttrs, Nested, Result, write_result
 
 
-def test_materializes_detached_typed_record(result_file: Path) -> None:
+def test_model_validate_hdf5_loads_typed_attrs_and_children(result_file: Path) -> None:
     result = Result.model_validate_hdf5(result_file)
     assert isinstance(result, Result)
     assert result.attrs.version == 2
