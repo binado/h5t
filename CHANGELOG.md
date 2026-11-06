@@ -7,6 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** the API is rebuilt around generic Pydantic models: `h5t.Group[T]` and
+  `h5t.Dataset[T]` replace the `@h5t.group`/`@h5t.dataset` records. Load with
+  `Group.model_validate_hdf5(path)` and write with `group.model_dump_hdf5(path)`; the typed
+  attribute model is `.attrs: T`. Loaded groups are detached (all file handles are closed
+  before loading returns); a `Dataset` reads slices or the full array lazily.
+- `overwrite=True` behaves like h5py: it deletes the target group's contents and then
+  writes, so a failed overwrite leaves the group empty.
+- Attribute validators no longer run again when dumping.
+
+### Fixed
+
+- Generic groups with `Dataset[T]` fields compile.
+- An unresolved forward reference at load time raises `SchemaError`.
+- A failing rollback of any exception type can no longer mask the original write error.
+
 ### Documentation
 
 - Sphinx documentation site (getting started, user guide, API reference) for Read the Docs.

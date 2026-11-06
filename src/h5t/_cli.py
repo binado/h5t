@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run the command line interface and return its process exit code."""
     parser = argparse.ArgumentParser(
         prog="h5t",
-        description="Validate and materialize an HDF5 group schema.",
+        description="Validate an HDF5 file against a group schema.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     check = subparsers.add_parser("check", help="check an HDF5 file against a group schema")

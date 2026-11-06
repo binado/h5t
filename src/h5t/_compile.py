@@ -1154,7 +1154,7 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
         root : str
             Absolute group path to write under; missing intermediate groups are created.
         mode : {"w-", "x", "w", "a"}
-            ``"w-"``/``"x"`` fail if the file exists, ``"w"`` truncates (the previous
+            ``"w-"`` (default) and ``"x"`` fail if the file exists, ``"w"`` truncates (the previous
             file is discarded even if the write then fails), ``"a"`` writes into an
             existing file or creates one.
         overwrite : bool
@@ -1164,6 +1164,8 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
         ------
         ValidationError
             The model does not conform to its schema, or ``root`` is occupied.
+        SchemaError
+            The group class has an invalid declaration or an unresolved annotation.
         ValueError
             ``mode`` or ``root`` is invalid.
         OSError

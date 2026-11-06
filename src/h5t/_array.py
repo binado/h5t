@@ -49,7 +49,7 @@ class Dataset(Generic[T]):
 
     No file is kept open: a ``Dataset`` loaded via `Group.model_validate_hdf5` remembers
     where the dataset lives, along with its shape, dtype, and validated ``attrs``, and
-    reads array slices or the full array only when indexed (`ds[()]`, `ds[:10]`) or
+    reads array slices or the full array only when indexed (``ds[()]``, ``ds[:10]``) or
     accessed via `data`. You can also construct a ``Dataset`` in memory from a NumPy
     array to write out with `Group.model_dump_hdf5`.
 
@@ -225,9 +225,8 @@ class Dataset(Generic[T]):
         Raises
         ------
         ValidationError
-            The dataset is in-memory only, its source file cannot be opened, the dataset
-            no longer exists or is not a dataset, or its shape or dtype changed since it was
-            loaded.
+            The source file cannot be opened, the dataset no longer exists or is not a
+            dataset, or its shape or dtype changed since it was loaded.
         """
         if self._h5t_data is _DATA_NOT_LOADED:
             with self.open() as dataset:

@@ -14,8 +14,9 @@ Deferral for forward references
 -------------------------------
 
 A :class:`h5t.Group` subclass that names another ``Group`` defined later in its module, or
-references itself, compiles on first use (when it is loaded, dumped, or used as a field of
-another group).
+references itself, compiles at class definition when it can. A forward reference that is
+not yet defined defers compilation to first use (when the group is loaded or dumped);
+a self-reference resolves immediately.
 
 .. code-block:: python
 

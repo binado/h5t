@@ -97,7 +97,7 @@ Pydantic v2 `TypeAdapter` is built once per attribute/child field with
 `BeforeValidator`, and `PlainSerializer`. Errors are fail-fast and path-aware.
 Hierarchy: `H5TError` → `SchemaError`, `ValidationError`.
 
-Missing members go through `_missing_attr_value` / `_missing_child_value`: declared default
+Missing members go through `_missing_child_value` (children) and the attrs loop in `_load_attrs` (attributes): declared default
 (validated; `default_factory` called first), else `None` for `T | None`, else `ValidationError`.
 
 ## Testing

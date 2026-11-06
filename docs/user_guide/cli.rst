@@ -22,5 +22,5 @@ Code Meaning
 ==== ===========================================================================
 0    the file conforms to the schema
 1    the first file/schema mismatch (:class:`h5t.ValidationError`)
-2    import, schema declaration, usage, or I/O errors
+2    import, schema declaration, usage, or I/O errors, or any unexpected error
 ==== ===========================================================================
