@@ -101,7 +101,8 @@ class AttrsSpec:
     def model_type(self) -> type[BaseModel]:
         """The `BaseModel` subclass for this attributes spec."""
         cls = self.model_type_ref()
-        assert cls is not None
+        if cls is None:
+            raise RuntimeError("the attributes model was garbage-collected before use")
         return cls
 
 

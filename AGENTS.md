@@ -30,7 +30,9 @@ groups are **detached**: every file handle is closed before `model_validate_hdf5
 demand. Both `Group[T]` and `Dataset[T]` are generic over `T` (defaulting to `Mapping[str, Any]`
 or accepting a `pydantic.BaseModel` subclass for strongly typed `.attrs: T`).
 
-Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_spec`/`_errors`.
+Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_spec`/`_errors`. The one
+reverse edge is `Group.model_dump_hdf5`, which imports `_write` inside the method to avoid a
+real import cycle (the style guide allows deferred imports for that).
 
 - **`_spec.py`** — `Glob` marker and the compiled IR: `ArraySpec`, `AttrFieldSpec`, `AttrsSpec`,
   `FieldSpec`, `GroupSpec`, `MemberKind` (`ARRAY` / `DATASET` / `GROUP` / `COLLECTION`),

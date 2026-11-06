@@ -6,8 +6,10 @@ import gc
 import sys
 import typing
 import weakref
+from pathlib import Path
 from typing import Annotated, Any
 
+import h5py
 import numpy as np
 import numpy.typing as npt
 import pytest
@@ -288,3 +290,52 @@ def test_rebuild_model_unrelated_exceptions_propagate(
     monkeypatch.setattr(_Plain, "model_rebuild", interrupted)
     with pytest.raises(exc_type):
         _rebuild_model(_Plain, {})
+
+
+T_attrs = typing.TypeVar("T_attrs", bound=BaseModel)
+
+
+class _StrictAttrs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer: int
+
+
+class _GenericBase(h5t.Group[T_attrs], typing.Generic[T_attrs]):
+    pass
+
+
+class _StrictSubclass(_GenericBase[_StrictAttrs]):
+    pass
+
+
+def test_generic_group_subclass_compiles_typed_attrs(tmp_path: Path) -> None:
+    assert compiled(_StrictSubclass).attrs is not None
+
+
+def test_generic_group_subclass_enforces_attrs_extra_forbid(tmp_path: Path) -> None:
+    path = tmp_path / "generic.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["answer"] = 7
+        file.attrs["surprise"] = 1
+    with pytest.raises(h5t.ValidationError) as caught:
+        _StrictSubclass.model_validate_hdf5(path)
+    assert caught.value.path == "/@surprise"
+
+
+def test_unresolved_name_error_names_it_and_suggests_localns() -> None:
+    class Pending(h5t.Group):
+        child: _NeverResolved  # noqa: F821
+
+    with pytest.raises(h5t.SchemaError, match=r"'_NeverResolved'.*localns="):
+        Pending.model_validate_hdf5("never-opened.h5")
+
+
+def test_attrs_model_keeps_its_parent_namespace_after_compilation() -> None:
+    class Attrs(BaseModel):
+        value: int
+
+    class Holder(h5t.Group[Attrs]):
+        pass
+
+    assert Attrs.__pydantic_parent_namespace__ is not None

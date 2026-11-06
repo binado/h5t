@@ -130,7 +130,7 @@ def _raised_by_annotation(exc: NameError, cls: type) -> bool:
     if tb is None:
         return False
     code = tb.tb_frame.f_code
-    if code.co_filename in (_ANNOTATION_FILE, "<string>"):
+    if code.co_filename == _ANNOTATION_FILE:
         return True
     return code is getattr(getattr(cls, "__annotate__", None), "__code__", None)
 
@@ -408,7 +408,6 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
             )
         )
 
-    model_type.__pydantic_parent_namespace__ = None
     spec = AttrsSpec(
         model_type_ref=weakref.ref(model_type),
         fields=tuple(attr_fields),
@@ -582,9 +581,14 @@ def _resolve_group_attrs_type(
     if attrs_ann is None:
         for base in group_cls.__mro__:
             meta = base.__dict__.get("__pydantic_generic_metadata__")
-            if meta and meta.get("origin") is Group:
+            if not meta:
+                continue
+            origin = meta.get("origin")
+            if isinstance(origin, type) and issubclass(origin, Group):
+                # Any specialization counts (``Group[A]`` or ``G[A]`` for a generic
+                # ``G(Group[T], Generic[T])``); a still-open TypeVar says nothing yet.
                 args = meta.get("args", ())
-                if args:
+                if args and not isinstance(args[0], TypeVar):
                     attrs_ann = args[0]
                     break
             if base is not Group and issubclass(base, Group):
@@ -700,7 +704,12 @@ def _compiled_group(cls: type[Group[Any]]) -> GroupSpec:
     try:
         return _ensure_group_compiled(cls)
     except _UnresolvedAnnotation as exc:
-        raise SchemaError(f"{exc.owner.__name__}: could not resolve annotations: {exc}") from exc
+        name = f" {exc.name!r}" if exc.name else ""
+        raise SchemaError(
+            f"{exc.owner.__name__}: could not resolve annotation name{name}: {exc}. "
+            f"If it is defined in a function scope, declare the group with "
+            f"`localns={{...}}` as a class keyword argument."
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
