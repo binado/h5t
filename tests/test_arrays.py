@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 import h5t
-from h5t._spec import ArraySpec, MemberKind
+from h5t._spec import MemberKind
 
 
 def write(path: Path, **datasets: Any) -> Path:
@@ -35,23 +35,21 @@ def test_guard_jaxtyping_exposes_what_h5t_relies_on() -> None:
     assert cls.__instancecheck_str__(np.zeros(3)) == ""
 
 
-def test_compiles_to_array_spec() -> None:
+def test_jaxtyping_field_compiles_to_array_member() -> None:
     class R(h5t.Group):
         x: Float64[np.ndarray, "*batch n 3 _"]
-        y: Shaped[np.ndarray, ""]
 
-    x = spec_of(R)
-    assert x.kind is MemberKind.ARRAY
-    assert x.array == ArraySpec(Float64[np.ndarray, "*batch n 3 _"], Float64, "*batch n 3 _")
-    assert x.array != ArraySpec(Float64[np.ndarray, "n"], Float64, "n")
-    assert spec_of(R, "y").array.dim_str == ""
+    assert spec_of(R).kind is MemberKind.ARRAY
 
 
-def test_plain_ndarray_stays_unchecked() -> None:
+@pytest.mark.parametrize("value", [np.zeros(3), np.zeros((2, 2), dtype="int8")])
+def test_plain_ndarray_field_accepts_any_shape_and_dtype(tmp_path: Path, value: Any) -> None:
     class R(h5t.Group):
         x: np.ndarray
 
-    assert spec_of(R).array is None
+    loaded = R.model_validate_hdf5(write(tmp_path / "plain.h5", x=value))
+    assert loaded.x.shape == value.shape
+    assert loaded.x.dtype == value.dtype
 
 
 def test_float_accepts_any_width_float64_is_exact(tmp_path: Path) -> None:

@@ -54,7 +54,6 @@ def test_every_field_kind_and_markers_compile() -> None:
 
     spec = compiled(Schema)
     assert spec.attrs is not None
-    assert spec.attrs.fields[0].h5_name == "on-disk"
 
     fields = field_map(Schema)
     assert fields["aliased_arr"].kind is MemberKind.ARRAY

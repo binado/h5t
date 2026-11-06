@@ -1,9 +1,11 @@
 """Schema-validated writing of `Group` instances to HDF5, in two phases.
 
-Phase 1 (*plan*) walks the compiled spec over an in-memory `Group` and builds a tree of
-what to write, validating everything and reading the data of every lazy `Dataset`. It never
-touches the target file. Phase 2 (*apply*) opens the file and writes the tree, rolling
-back what it wrote if anything fails.
+Pydantic validated the `Group` when it was constructed (field types, jaxtyping shapes and
+dtypes, attribute models), so the writer does not check any of that again. Phase 1 (*plan*)
+walks the compiled spec over the instance and builds a tree of what to write, checking only
+what HDF5 itself imposes (child names, storable attribute values) and reading the data of
+every lazy `Dataset`. It never touches the target file. Phase 2 (*apply*) opens the file and
+writes the tree, rolling back what it wrote if anything fails.
 """
 
 from __future__ import annotations
@@ -17,28 +19,12 @@ from typing import Any, Literal
 
 import h5py
 import numpy as np
-from jaxtyping import jaxtyped
 from pydantic_core import PydanticSerializationError
 
 from h5t._array import _DATA_NOT_LOADED, Dataset
-from h5t._compile import (
-    Group,
-    _check_array,
-    _compiled_group,
-    _filesystem_path,
-    _normalize_root,
-    _validate_adapter,
-)
+from h5t._compile import Group, _compiled_group, _filesystem_path, _normalize_root
 from h5t._errors import SchemaError, ValidationError
-from h5t._spec import (
-    ArraySpec,
-    AttrsSpec,
-    FieldSpec,
-    GroupSpec,
-    MemberKind,
-    attr_path,
-    child_path,
-)
+from h5t._spec import AttrsSpec, FieldSpec, GroupSpec, MemberKind, attr_path, child_path
 
 
 @dataclasses.dataclass
@@ -80,6 +66,21 @@ def _check_storable(value: Any, path: str) -> None:
         )
 
 
+def _attr_values(attrs_spec: AttrsSpec | None, attrs_val: Any, path: str) -> Mapping[str, Any]:
+    """Return the attribute names and values to store, by their on-disk names."""
+    if attrs_spec is None:
+        return typing.cast(Mapping[str, Any], attrs_val)
+    # ``include`` limits the dump to declared fields, so computed fields are not stored.
+    declared = set(type(attrs_val).model_fields)
+    try:
+        return attrs_val.model_dump(mode="python", by_alias=True, include=declared)
+    except (PydanticSerializationError, TypeError) as exc:
+        cause = (
+            exc.__cause__ if isinstance(exc, PydanticSerializationError) and exc.__cause__ else exc
+        )
+        raise ValidationError(path, f"attribute serializer failed: {cause}") from cause
+
+
 def _plan_attrs(
     attrs_spec: AttrsSpec | None,
     attrs_val: Any,
@@ -88,61 +89,17 @@ def _plan_attrs(
     forbid_untyped_extras: bool = False,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    if attrs_spec is None:
-        if not isinstance(attrs_val, Mapping):
-            raise ValidationError(
-                path, f"expected Mapping for attrs, got {type(attrs_val).__name__}"
-            )
-        for raw_name, value in attrs_val.items():
-            name = str(raw_name)
-            apath = attr_path(path, name)
-            if forbid_untyped_extras:
-                raise ValidationError(apath, "unexpected attribute")
-            if isinstance(value, Enum):
-                value = value.value
-            _check_storable(value, apath)
-            out[name] = value
-        return out
-
-    if not isinstance(attrs_val, attrs_spec.model_type):
-        raise ValidationError(
-            path,
-            f"expected {attrs_spec.model_type.__name__} for attrs, got {type(attrs_val).__name__}",
-        )
-
-    extra_dict = getattr(attrs_val, "__pydantic_extra__", None) or {}
-    if attrs_spec.forbid_extras and extra_dict:
-        first_extra = str(next(iter(extra_dict)))
-        raise ValidationError(attr_path(path, first_extra), "unexpected attribute")
-
-    with jaxtyped("context"):
-        for field in attrs_spec.fields:
-            apath = attr_path(path, field.h5_name)
-            raw_val = _read_field(attrs_spec.model_type, attrs_val, field.py_name)
-            if raw_val is None and field.optional:
-                continue
-            if field.array is not None:
-                if not isinstance(raw_val, np.ndarray):
-                    raise ValidationError(apath, f"expected ndarray, got {type(raw_val).__name__}")
-                _check_array(field.array, raw_val, apath)
-            else:
-                # Type check only: ``save_adapter`` carries no validators, so values the
-                # model already validated are not transformed a second time.
-                _validate_adapter(field.save_adapter, raw_val, apath)
-            try:
-                serialized = field.save_adapter.dump_python(raw_val, mode="python")
-            except (PydanticSerializationError, TypeError) as exc:
-                cause = (
-                    exc.__cause__
-                    if isinstance(exc, PydanticSerializationError) and exc.__cause__
-                    else exc
-                )
-                raise ValidationError(apath, f"attribute serializer failed: {cause}") from cause
-            if isinstance(serialized, Enum):
-                serialized = serialized.value
-            _check_storable(serialized, apath)
-            out[field.h5_name] = serialized
-
+    for raw_name, value in _attr_values(attrs_spec, attrs_val, path).items():
+        name = str(raw_name)
+        if value is None and attrs_spec is not None and name in attrs_spec.optional:
+            continue
+        apath = attr_path(path, name)
+        if forbid_untyped_extras:
+            raise ValidationError(apath, "unexpected attribute")
+        if isinstance(value, Enum):
+            value = value.value
+        _check_storable(value, apath)
+        out[name] = value
     return out
 
 
@@ -159,42 +116,14 @@ def _materialize(dataset: Dataset[Any], path: str) -> np.ndarray:
         raise ValidationError(path, f"cannot read dataset data: {detail}") from exc
 
 
-def _plan_dataset(
-    value: Any,
-    attrs_spec: AttrsSpec | None,
-    array_spec: ArraySpec | None,
-    path: str,
-) -> _DatasetPlan:
-    if not isinstance(value, Dataset):
-        raise ValidationError(path, f"expected Dataset, got {type(value).__name__}")
-    if array_spec is not None:
-        _check_array(array_spec, value, path)
-    attrs = _plan_attrs(attrs_spec, value.attrs, path, forbid_untyped_extras=False)
-    data = _materialize(value, path)
-    return _DatasetPlan(data=data, attrs=attrs)
+def _plan_dataset(value: Dataset[Any], attrs_spec: AttrsSpec | None, path: str) -> _DatasetPlan:
+    attrs = _plan_attrs(attrs_spec, value.attrs, path)
+    return _DatasetPlan(data=_materialize(value, path), attrs=attrs)
 
 
-def _check_member_type(field: FieldSpec, value: Any, path: str) -> bool:
-    """Check a member's runtime type before planning it.
-
-    Returns ``False`` for an omitted optional member (``None``), which the caller
-    skips. The message mirrors the Pydantic isinstance wording used at load time.
-    """
-    if value is None and field.optional:
-        return False
-    if field.kind is MemberKind.COLLECTION:
-        target: type = dict
-        expected = "dict"
-    elif field.kind is MemberKind.ARRAY:
-        target = np.ndarray
-        expected = "ndarray"
-    else:
-        assert field.member_type is not None
-        target = field.member_type
-        expected = field.member_type.__name__
-    if not isinstance(value, target):
-        raise ValidationError(path, f"Input should be an instance of {expected}")
-    return True
+def _is_omitted(field: FieldSpec, value: Any) -> bool:
+    """Report whether ``value`` is an optional member left as ``None``."""
+    return value is None and field.optional
 
 
 def _plan_member(field: FieldSpec, value: Any, path: str) -> _GroupPlan | _DatasetPlan:
@@ -203,11 +132,7 @@ def _plan_member(field: FieldSpec, value: Any, path: str) -> _GroupPlan | _Datas
         group_cls = typing.cast("type[Group[Any]]", field.member_type)
         return _plan_group(_compiled_group(group_cls), value, path)
     if field.kind is MemberKind.DATASET:
-        return _plan_dataset(value, field.dataset_attrs, field.array, path)
-    if not isinstance(value, np.ndarray):
-        raise ValidationError(path, f"expected ndarray, got {type(value).__name__}")
-    if field.array is not None:
-        _check_array(field.array, value, path)
+        return _plan_dataset(value, field.dataset_attrs, path)
     return _DatasetPlan(data=np.asarray(value), attrs={})
 
 
@@ -222,33 +147,28 @@ def _plan_collection(field: FieldSpec, value: Mapping[str, Any], path: str) -> _
             )
         if field.glob is not None and field.glob.match(key) is None:
             raise ValidationError(item_path, "collection key does not match the field's Glob")
-        if _check_member_type(field.item, item, item_path):
+        if not _is_omitted(field.item, item):
             plan.children[key] = _plan_member(field.item, item, item_path)
     return plan
 
 
 def _plan_group(spec: GroupSpec, group: Any, path: str) -> _GroupPlan:
-    if not isinstance(group, spec.group_type):
-        raise ValidationError(
-            path, f"expected {spec.group_type.__name__}, got {type(group).__name__}"
-        )
-    with jaxtyped("context"):
-        plan = _GroupPlan()
-        plan.attrs = _plan_attrs(
-            spec.attrs,
-            _read_field(spec.group_type, group, "attrs"),
-            path,
-            forbid_untyped_extras=(spec.forbid_extras and spec.attrs is None),
-        )
-        for field in spec.fields:
-            member_path = child_path(path, field.h5_name)
-            raw_val = _read_field(spec.group_type, group, field.py_name)
-            if not _check_member_type(field, raw_val, member_path):
-                continue
-            if field.kind is MemberKind.COLLECTION:
-                plan.children[field.h5_name] = _plan_collection(field, raw_val, member_path)
-            else:
-                plan.children[field.h5_name] = _plan_member(field, raw_val, member_path)
+    plan = _GroupPlan()
+    plan.attrs = _plan_attrs(
+        spec.attrs,
+        _read_field(spec.group_type, group, "attrs"),
+        path,
+        forbid_untyped_extras=(spec.forbid_extras and spec.attrs is None),
+    )
+    for field in spec.fields:
+        member_path = child_path(path, field.h5_name)
+        raw_val = _read_field(spec.group_type, group, field.py_name)
+        if _is_omitted(field, raw_val):
+            continue
+        if field.kind is MemberKind.COLLECTION:
+            plan.children[field.h5_name] = _plan_collection(field, raw_val, member_path)
+        else:
+            plan.children[field.h5_name] = _plan_member(field, raw_val, member_path)
     return plan
 
 

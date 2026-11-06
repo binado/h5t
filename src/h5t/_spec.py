@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, GetCoreSchemaHandler, TypeAdapter
+from pydantic import BaseModel, GetCoreSchemaHandler
 from pydantic_core import core_schema
 
 from h5t._h5view import _GroupView
@@ -63,38 +63,15 @@ class MemberKind(Enum):
 
 
 @dataclass(frozen=True)
-class ArraySpec:
-    """A jaxtyping array annotation, kept whole so jaxtyping does the checking.
+class AttrsSpec:
+    """A typed attributes schema: the `BaseModel` subclass ``T`` of a group or dataset.
 
-    ``hint`` is the jaxtyping class itself (``Float[np.ndarray, "n n"]``); it is excluded
-    from comparison because jaxtyping builds a fresh class per subscript, so two
-    identical annotations would otherwise never compare equal. ``family`` (``Float``) and
-    ``dim_str`` carry the identity.
+    ``optional`` holds the on-disk names of the attributes declared ``X | None``; a ``None``
+    value is left out of the file instead of being stored.
     """
 
-    hint: type = field(compare=False, repr=False)
-    family: type
-    dim_str: str
-
-
-@dataclass(frozen=True)
-class AttrFieldSpec:
-    """Compiled instructions for one field of a `BaseModel` attributes schema."""
-
-    py_name: str
-    h5_name: str
-    save_adapter: TypeAdapter[Any] = field(compare=False, repr=False)
-    optional: bool = False
-    array: ArraySpec | None = None
-
-
-@dataclass(frozen=True)
-class AttrsSpec:
-    """Compiled instructions for a `BaseModel` attributes schema ``T``."""
-
     model_type_ref: weakref.ReferenceType[type[BaseModel]] = field(compare=False, repr=False)
-    fields: tuple[AttrFieldSpec, ...] = ()
-    forbid_extras: bool = False
+    optional: frozenset[str] = frozenset()
 
     @property
     def model_type(self) -> type[BaseModel]:
@@ -115,7 +92,6 @@ class FieldSpec:
     optional: bool = False
     member_type: type | None = None
     dataset_attrs: AttrsSpec | None = None
-    array: ArraySpec | None = None
     item: FieldSpec | None = None
     glob: re.Pattern[str] | None = field(default=None, compare=False)
 
@@ -141,11 +117,6 @@ class FieldSpec:
                 (
                     self.dataset_attrs is not None and self.kind is not MemberKind.DATASET,
                     "dataset_attrs is only valid on DATASET fields",
-                ),
-                (
-                    self.array is not None
-                    and self.kind not in (MemberKind.ARRAY, MemberKind.DATASET),
-                    "array is only valid on ARRAY and DATASET fields",
                 ),
             )
             if broken

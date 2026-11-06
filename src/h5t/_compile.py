@@ -25,13 +25,10 @@ from pydantic import (
     Field,
     GetCoreSchemaHandler,
     ModelWrapValidatorHandler,
-    PlainSerializer,
     PydanticSchemaGenerationError,
     PydanticUndefinedAnnotation,
     PydanticUserError,
-    TypeAdapter,
     ValidatorFunctionWrapHandler,
-    WrapSerializer,
     field_validator,
     model_validator,
 )
@@ -45,8 +42,6 @@ from h5t._array import Dataset, _is_mapping_type
 from h5t._errors import SchemaError, ValidationError
 from h5t._h5view import ATTRS_KEY, _ghost, _GroupView
 from h5t._spec import (
-    ArraySpec,
-    AttrFieldSpec,
     AttrsSpec,
     FieldSpec,
     Glob,
@@ -193,10 +188,10 @@ def _is_ndarray_annotation(core: Any) -> bool:
     return False
 
 
-def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> tuple[Any, ArraySpec | None]:
-    """Split a jaxtyping array type into its backing class and an ``ArraySpec``."""
+def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> Any:
+    """Replace a jaxtyping array type by its backing class; pass any other type through."""
     if not (isinstance(core, type) and issubclass(core, AbstractArray)):
-        return core, None
+        return core
     array_type = core.array_type
     if not _is_supported_array_type(array_type):
         raise _schema_error(
@@ -204,14 +199,7 @@ def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> tuple[Any, ArrayS
             py_name,
             f"jaxtyping array type {array_type!r} is not supported; use np.ndarray or Dataset",
         )
-    return array_type, ArraySpec(core, core.dtype, core.dim_str)
-
-
-def _check_array(spec: ArraySpec, candidate: Any, path: str) -> None:
-    """Ask jaxtyping whether ``candidate`` satisfies ``spec``; call inside a jaxtyping scope."""
-    reason = spec.hint.__instancecheck_str__(candidate)  # ty: ignore[unresolved-attribute]
-    if reason:
-        raise ValidationError(path, reason)
+    return array_type
 
 
 def _is_mapping_annotation(core: Any) -> bool:
@@ -227,13 +215,6 @@ def _compile_glob(owner: type, py_name: str, marker: Glob) -> re.Pattern[str]:
     if "/" in pattern:
         raise _schema_error(owner, py_name, "a Glob pattern cannot contain '/'")
     return re.compile(fnmatch.translate(pattern))
-
-
-def _build_adapter(owner: type, py_name: str, annotation: Any) -> TypeAdapter[Any]:
-    try:
-        return TypeAdapter(annotation, config=ConfigDict(arbitrary_types_allowed=True))
-    except Exception as exc:
-        raise _schema_error(owner, py_name, f"cannot construct a validator: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +238,9 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
     if cached is not None:
         return cached
 
-    forbid_extras = _extract_forbid_extras(model_type, model_type)
+    # Only the check matters here: Pydantic enforces the mode itself, and rejects extras when
+    # the instance is built, so a dumped attributes model never carries any.
+    _extract_forbid_extras(model_type, model_type)
     if not getattr(model_type, "__pydantic_complete__", True):
         try:
             module = sys.modules.get(model_type.__module__)
@@ -268,11 +251,12 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
                 f"{model_type.__name__}: could not resolve attribute annotations: {exc}"
             ) from exc
 
-    attr_fields: list[AttrFieldSpec] = []
+    # This loop only rejects declarations h5t cannot store or load; Pydantic does the rest.
     seen_h5_names: dict[str, str] = {}
+    optional: set[str] = set()
     for py_name, field_info in model_type.model_fields.items():
         raw_ann = field_info.annotation
-        core, meta, optional = _split_annotation(model_type, py_name, raw_ann)
+        core, meta, is_optional = _split_annotation(model_type, py_name, raw_ann)
         all_meta = [*meta, *field_info.metadata]
         if any(isinstance(m, Glob) for m in all_meta):
             raise _schema_error(
@@ -288,40 +272,18 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
                 f"{seen_h5_names[h5_name]!r} and {py_name!r}"
             )
         seen_h5_names[h5_name] = py_name
+        if is_optional:
+            optional.add(h5_name)
 
-        core, array_spec = _unwrap_jaxtyping(model_type, py_name, core)
+        core = _unwrap_jaxtyping(model_type, py_name, core)
         if isinstance(core, type) and issubclass(core, (Group, Dataset)):
             raise _schema_error(
                 model_type,
                 py_name,
                 f"attributes model cannot contain {core.__name__} fields",
             )
-        if _is_ndarray_annotation(core):
-            core = np.ndarray
 
-        # Dump-time adapter: type check plus serializers only. Validators already ran when
-        # the attrs model was built and must not run again on every save.
-        save_meta = [m for m in all_meta if isinstance(m, (PlainSerializer, WrapSerializer))]
-        save_ann: Any = Annotated[core, *save_meta] if save_meta else core
-        if optional:
-            save_ann = save_ann | None
-        save_adapter = _build_adapter(model_type, py_name, save_ann)
-
-        attr_fields.append(
-            AttrFieldSpec(
-                py_name=py_name,
-                h5_name=h5_name,
-                save_adapter=save_adapter,
-                optional=optional,
-                array=array_spec,
-            )
-        )
-
-    spec = AttrsSpec(
-        model_type_ref=weakref.ref(model_type),
-        fields=tuple(attr_fields),
-        forbid_extras=forbid_extras,
-    )
+    spec = AttrsSpec(model_type_ref=weakref.ref(model_type), optional=frozenset(optional))
     _ATTRS_CACHE[model_type] = spec
     return spec
 
@@ -390,7 +352,7 @@ def _field_spec(
     if "/" in h5_name:
         raise _schema_error(owner, py_name, "a child alias cannot contain '/'")
 
-    core, array_spec = _unwrap_jaxtyping(owner, py_name, core)
+    core = _unwrap_jaxtyping(owner, py_name, core)
 
     # Check if core is Dataset[T] or a Dataset subclass
     origin = typing.get_origin(core)
@@ -451,7 +413,6 @@ def _field_spec(
         optional=optional,
         member_type=member_type,
         dataset_attrs=dataset_attrs,
-        array=array_spec,
         item=item,
         glob=glob,
     )
@@ -588,20 +549,6 @@ def _first_error_parts(exc: PydanticValidationError) -> tuple[tuple[Any, ...], s
         return (), str(exc).splitlines()[0]
     first = errors[0]
     return tuple(first.get("loc", ())), str(first.get("msg", "invalid value"))
-
-
-def _short_pydantic_error(exc: PydanticValidationError) -> str:
-    loc, message = _first_error_parts(exc)
-    if not loc:
-        return message
-    return f"{_dotted(loc)}: {message}"
-
-
-def _validate_adapter(adapter: TypeAdapter[Any], value: Any, path: str) -> Any:
-    try:
-        return adapter.validate_python(value)
-    except PydanticValidationError as exc:
-        raise ValidationError(path, _short_pydantic_error(exc)) from exc
 
 
 def _h5_error_path(spec: GroupSpec, root: str, loc: tuple[Any, ...]) -> tuple[str, str]:
@@ -882,10 +829,14 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
         mode: Literal["w-", "x", "w", "a"] = "w-",
         overwrite: bool = False,
     ) -> None:
-        """Validate ``self`` against its schema and write it under ``root`` in ``path``.
+        """Write ``self`` under ``root`` in ``path``, following its schema.
 
-        The group tree is fully planned and validated before the file is opened, so an
-        invalid model never touches the target file. If writing fails midway, any
+        Field types, array shapes and attribute values were validated by Pydantic when
+        ``self`` was constructed and are not checked again here, so an instance built with
+        ``model_construct`` or modified afterwards is written as it is. Only what HDF5
+        itself imposes is checked: collection keys, `Glob` patterns, and attribute values
+        h5py can store. The group tree is fully planned before the file is opened, so a
+        failed check never touches the target file. If writing fails midway, any
         created groups or files are rolled back. ``overwrite=True`` deletes the existing
         content of ``root`` before writing, as ``del group[name]`` does in h5py; the old
         content is not restored if the write then fails. A problem during rollback itself
@@ -907,7 +858,8 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
         Raises
         ------
         ValidationError
-            The model does not conform to its schema, or ``root`` is occupied.
+            A value cannot be stored in HDF5 (an invalid collection key, a `Glob` mismatch,
+            an unstorable or unserializable attribute), or ``root`` is occupied.
         SchemaError
             The group class has an invalid declaration or an unresolved annotation.
         ValueError

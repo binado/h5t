@@ -13,7 +13,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from jaxtyping import Float
-from pydantic import BaseModel, BeforeValidator, ConfigDict, PlainSerializer
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer, computed_field
 
 import h5t
 from tests.conftest import (
@@ -214,16 +214,14 @@ def test_untyped_forbid_rejects_undeclared_attrs_on_dump(tmp_path: Path) -> None
 @pytest.mark.parametrize(
     ("overrides", "path"),
     [
-        ({"version": "nope"}, "/@version"),
-        ({"fisher": np.ones((2, 3))}, "/fisher"),
-        ({"fisher": np.ones((2, 2), dtype=int)}, "/fisher"),
         ({"items": {"a/b": Item(attrs=ItemAttrs(n=1))}}, "/items/a/b"),
         ({"items": {"": Item(attrs=ItemAttrs(n=1))}}, "/items/"),
-        ({"items": {"a": Nested(attrs=NestedAttrs(answer=1))}}, "/items/a"),
-        ({"nested": None}, "/nested"),
+        ({"items": {".": Item(attrs=ItemAttrs(n=1))}}, "/items/."),
     ],
 )
-def test_failures_leave_no_file(tmp_path: Path, overrides: dict[str, Any], path: str) -> None:
+def test_dump_of_invalid_collection_key_raises_and_leaves_no_file(
+    tmp_path: Path, overrides: dict[str, Any], path: str
+) -> None:
     target = tmp_path / "doc.h5"
     with pytest.raises(h5t.ValidationError) as info:
         make_doc(**overrides).model_dump_hdf5(target)
@@ -236,7 +234,9 @@ def test_failures_leave_existing_file_bytes_unchanged(tmp_path: Path) -> None:
     make_doc().model_dump_hdf5(target)
     before = target.read_bytes()
     with pytest.raises(h5t.ValidationError):
-        make_doc(fisher=np.ones((2, 3))).model_dump_hdf5(target, root="/other", mode="a")
+        make_doc(items={"a/b": Item(attrs=ItemAttrs(n=1))}).model_dump_hdf5(
+            target, root="/other", mode="a"
+        )
     assert target.read_bytes() == before
 
 
@@ -360,14 +360,14 @@ def test_serializer_failure_is_validation_error(tmp_path: Path) -> None:
 
     with pytest.raises(h5t.ValidationError, match="serializer failed") as info:
         Boom(attrs=BoomAttrs(x=1)).model_dump_hdf5(tmp_path / "boom.h5")
-    assert info.value.path == "/@x"
+    assert info.value.path == "/"
 
 
 def test_no_fd_leak(tmp_path: Path) -> None:
     before = open_fd_count()
     make_doc().model_dump_hdf5(tmp_path / "ok.h5")
     with pytest.raises(h5t.ValidationError):
-        make_doc(fisher=np.ones((2, 3))).model_dump_hdf5(tmp_path / "bad.h5")
+        make_doc(items={"a/b": Item(attrs=ItemAttrs(n=1))}).model_dump_hdf5(tmp_path / "bad.h5")
     Doc.model_validate_hdf5(tmp_path / "ok.h5")
     assert open_fd_count() == before
 
@@ -432,27 +432,6 @@ def test_partial_file_removal_failure_is_attached_to_the_original_error(
 
 class _TypedDatasetGroup(h5t.Group):
     measurement: h5t.Dataset[MeasurementAttrs]
-
-
-class _OtherDatasetAttrs(BaseModel):
-    note: str = "n"
-
-
-@pytest.mark.parametrize(
-    "value, match",
-    [
-        (np.arange(3), "instance of Dataset"),
-        (h5t.Dataset(np.arange(3), _OtherDatasetAttrs()), "MeasurementAttrs"),
-    ],
-    ids=["non-dataset", "wrong-specialization"],
-)
-def test_dump_rejects_bad_dataset_member(tmp_path: Path, value: Any, match: str) -> None:
-    group = _TypedDatasetGroup.model_construct(measurement=value)
-    target = tmp_path / "bad.h5"
-    with pytest.raises(h5t.ValidationError, match=match) as caught:
-        group.model_dump_hdf5(target)
-    assert caught.value.path.startswith("/measurement")
-    assert not target.exists()
 
 
 def test_dump_of_dataset_whose_source_file_was_deleted_leaves_no_file(tmp_path: Path) -> None:
@@ -521,3 +500,28 @@ def test_dump_required_any_attr_with_none_value_reports_attribute_path(tmp_path:
     with pytest.raises(h5t.ValidationError, match="cannot store NoneType") as info:
         h5t.Group[Attrs](attrs=Attrs(v=None)).model_dump_hdf5(target)
     assert info.value.path == "/@v"
+
+
+def test_dump_attr_alias_is_stored_under_the_on_disk_name(tmp_path: Path) -> None:
+    class Attrs(BaseModel):
+        renamed: str = Field(alias="on-disk")
+
+    target = tmp_path / "doc.h5"
+    h5t.Group[Attrs](attrs=Attrs(**{"on-disk": "x"})).model_dump_hdf5(target)
+    with h5py.File(target) as f:
+        assert list(f.attrs) == ["on-disk"]
+
+
+def test_dump_stores_declared_attrs_only_not_computed_fields(tmp_path: Path) -> None:
+    class Attrs(BaseModel):
+        n: int
+
+        @computed_field
+        @property
+        def doubled(self) -> int:
+            return 2 * self.n
+
+    target = tmp_path / "doc.h5"
+    h5t.Group[Attrs](attrs=Attrs(n=2)).model_dump_hdf5(target)
+    with h5py.File(target) as f:
+        assert list(f.attrs) == ["n"]

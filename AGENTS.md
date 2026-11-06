@@ -35,9 +35,9 @@ Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_spec`/`_erro
 reverse edge is `Group.model_dump_hdf5`, which imports `_write` inside the method to avoid a
 real import cycle (the style guide allows deferred imports for that).
 
-- **`_spec.py`** — `Glob` marker and the compiled IR: `ArraySpec`, `AttrFieldSpec`, `AttrsSpec`,
-  `FieldSpec`, `GroupSpec`, `MemberKind` (`ARRAY` / `DATASET` / `GROUP` / `COLLECTION`),
-  plus error-path formatters.
+- **`_spec.py`** — `Glob` marker and the compiled IR: `AttrsSpec`
+  (a typed attributes model plus its optional names), `FieldSpec`, `GroupSpec`, `MemberKind`
+  (`ARRAY` / `DATASET` / `GROUP` / `COLLECTION`), plus error-path formatters.
 - **`_h5view.py`** — `_GroupView`, a read-only `Mapping` over an open `h5py.Group`, plus the raw
   attribute helpers (`_raw_attrs`, `_normalized_attrs`) and `_ghost`.
 - **`_array.py`** — `Dataset[T]`, the detached lazily-read dataset with typed `.attrs: T`,
@@ -45,8 +45,9 @@ real import cycle (the style guide allows deferred imports for that).
   `__array__()`.
 - **`_compile.py`** — `Group[T]`, `_GroupMeta` metaclass, annotation → `FieldSpec` / `AttrsSpec`
   compilation, `jaxtyping` Pydantic core-schema hook, and the loader (`model_validate_hdf5`).
-- **`_write.py`** — `Group.model_dump_hdf5`: a *plan* phase that validates an in-memory `Group`
-  tree without touching the file, then an *apply* phase that writes and rolls back on failure.
+- **`_write.py`** — `Group.model_dump_hdf5`: a *plan* phase that walks an in-memory `Group`
+  tree without touching the file (it trusts construction-time validation and checks only what
+  HDF5 imposes), then an *apply* phase that writes and rolls back on failure.
 - **`_cli.py`** — `h5t check`: import `pkg.mod:Class`, call `Class.model_validate_hdf5`, exit 0
   (ok) / 1 (`ValidationError`) / 2 (import, schema, usage, or I/O error).
 
@@ -78,14 +79,14 @@ fields. Group fields represent child HDF5 nodes (attributes live on `.attrs: T`)
 ### jaxtyping arrays
 
 jaxtyping does the checking; h5t never parses a shape string. `_unwrap_jaxtyping` rewrites an
-`AbstractArray` subclass to its backing `np.ndarray`/`Dataset[T]` early in compilation and keeps
-the original as an `ArraySpec`. `_check_array` calls the non-public `hint.__instancecheck_str__`
-on a metadata-only candidate (a zero-stride `_ghost` array, or a `Dataset`), so no data is read.
-A guard test fails if jaxtyping drops that method. Dimension bindings are scoped per group:
-`Group`'s wrap validator opens one `jaxtyped("context")` for the children, and the `attrs` field
-has its own scope (`Group._h5t_attrs_scope`) so attribute dims never bind with child dims; the writer
-mirrors this. A jaxtyping `np.ndarray` field checks a `_ghost` of an `h5py.Dataset` *before*
-reading it; a `Dataset`-backed one builds the lazy `Dataset` and checks that.
+`AbstractArray` subclass to its backing `np.ndarray`/`Dataset[T]` early in compilation. The
+Pydantic core-schema hook (`_jaxtyping_pydantic_schema`) calls the non-public
+`hint.__instancecheck_str__` on a metadata-only candidate (a zero-stride `_ghost` array, or a
+`Dataset`), so no data is read. A guard test fails if jaxtyping drops that method. Dimension
+bindings are scoped per group: `Group`'s wrap validator opens one `jaxtyped("context")` for the
+children, and the `attrs` field has its own scope (`Group._h5t_attrs_scope`) so attribute dims
+never bind with child dims. A jaxtyping `np.ndarray` field checks a `_ghost` of an `h5py.Dataset`
+*before* reading it; a `Dataset`-backed one builds the lazy `Dataset` and checks that.
 
 ### Array annotations see through type aliases
 
@@ -117,6 +118,17 @@ Pydantic's semantics apply: `T | None` without a default is required, defaults a
 re-validated unless `validate_default`, and under `extra="ignore"` only declared names are read.
 Pydantic's `ValidationError` is a `ValueError`, so anything raised inside a validator must be an
 `h5t.ValidationError` (not a `ValueError`) to propagate unchanged.
+
+### Writing: trust construction
+
+`Group.model_dump_hdf5` does not re-validate. Field types, jaxtyping shapes and attribute models
+were checked when the instance was built, so `_write._plan_group` only walks the compiled spec.
+Typed attributes come from `model_dump(mode="python", by_alias=True, include=<declared fields>)`,
+so serializers and aliases are Pydantic's; `AttrsSpec.optional` names the attributes whose `None`
+is left out (a required `Any` attribute holding `None` is an error, not silently skipped). The
+writer still checks what Pydantic cannot know: collection keys, `Glob` patterns on in-memory
+dicts, untyped attributes on an `extra="forbid"` group, and values h5py cannot store. An instance
+built with `model_construct` or mutated after construction is written as it is.
 
 Errors keep pydantic's wording; `_h5_error_path` walks the first error's `loc` through the
 `GroupSpec` to produce the HDF5 path (`/values: Field required`, `/@count: ...`,
