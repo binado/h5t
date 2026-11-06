@@ -124,6 +124,44 @@ class FieldSpec:
     item: FieldSpec | None = None
     glob: re.Pattern[str] | None = field(default=None, compare=False)
 
+    def __post_init__(self) -> None:
+        # The compiler is the only producer; these checks make a bad combination fail
+        # where it is built instead of as a confusing error at load or dump time.
+        is_member = self.kind in (MemberKind.GROUP, MemberKind.DATASET)
+        problems = [
+            message
+            for broken, message in (
+                (
+                    self.has_default and self.default_factory is not None,
+                    "has both a default and a default_factory",
+                ),
+                (
+                    is_member != (self.member_type is not None),
+                    "member_type must be set exactly for GROUP and DATASET fields",
+                ),
+                (
+                    (self.kind is MemberKind.COLLECTION) != (self.item is not None),
+                    "item must be set exactly for COLLECTION fields",
+                ),
+                (
+                    self.glob is not None and self.kind is not MemberKind.COLLECTION,
+                    "glob is only valid on COLLECTION fields",
+                ),
+                (
+                    self.dataset_attrs is not None and self.kind is not MemberKind.DATASET,
+                    "dataset_attrs is only valid on DATASET fields",
+                ),
+                (
+                    self.array is not None
+                    and self.kind not in (MemberKind.ARRAY, MemberKind.DATASET),
+                    "array is only valid on ARRAY and DATASET fields",
+                ),
+            )
+            if broken
+        ]
+        if problems:
+            raise ValueError(f"invalid FieldSpec {self.py_name!r}: {'; '.join(problems)}")
+
     @property
     def has_default(self) -> bool:
         """Whether the class body supplied a default."""

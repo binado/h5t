@@ -1022,14 +1022,16 @@ class _GroupMeta(ModelMetaclass):
         setattr(cls, "__h5t_group__", pending)  # noqa: B010
         try:
             spec = _compile_group_fields(cls, localns=caller_locals)
+            if not getattr(cls, "__pydantic_complete__", True):
+                _rebuild_model(cls, caller_locals)
+                cls.__pydantic_parent_namespace__ = None
         except _UnresolvedAnnotation:
             return cls
         except BaseException:
-            delattr(cls, "__h5t_group__")
+            # Never leave the pending marker behind on a class whose definition failed.
+            with contextlib.suppress(AttributeError):
+                delattr(cls, "__h5t_group__")
             raise
-        if not getattr(cls, "__pydantic_complete__", True):
-            _rebuild_model(cls, caller_locals)
-            cls.__pydantic_parent_namespace__ = None
         setattr(cls, "__h5t_group__", spec)  # noqa: B010
         return cls
 

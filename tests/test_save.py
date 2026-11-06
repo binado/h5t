@@ -511,3 +511,13 @@ def test_dump_attr_h5py_rejects_reports_attribute_path_and_removes_file(
         h5t.Group[Attrs](attrs=Attrs(v=value)).model_dump_hdf5(target)
     assert info.value.path == "/@v"
     assert not target.exists()
+
+
+def test_dump_required_any_attr_with_none_value_reports_attribute_path(tmp_path: Path) -> None:
+    class Attrs(BaseModel):
+        v: Any
+
+    target = tmp_path / "doc.h5"
+    with pytest.raises(h5t.ValidationError, match="cannot store NoneType") as info:
+        h5t.Group[Attrs](attrs=Attrs(v=None)).model_dump_hdf5(target)
+    assert info.value.path == "/@v"

@@ -130,8 +130,6 @@ def _plan_attrs(
                 # Type check only: ``save_adapter`` carries no validators, so values the
                 # model already validated are not transformed a second time.
                 _validate_adapter(field.save_adapter, raw_val, apath)
-            if raw_val is None:
-                continue
             try:
                 serialized = field.save_adapter.dump_python(raw_val, mode="python")
             except (PydanticSerializationError, TypeError) as exc:

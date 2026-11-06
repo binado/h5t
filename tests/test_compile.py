@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import re
 import sys
 import typing
 import weakref
@@ -13,11 +14,11 @@ import h5py
 import numpy as np
 import numpy.typing as npt
 import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 import h5t
 from h5t._compile import _rebuild_model
-from h5t._spec import GroupSpec, MemberKind
+from h5t._spec import FieldSpec, GroupSpec, MemberKind
 
 
 def compiled(group_cls: type[h5t.Group[Any]]) -> GroupSpec:
@@ -357,3 +358,27 @@ def test_attrs_model_keeps_its_parent_namespace_after_compilation() -> None:
         pass
 
     assert Attrs.__pydantic_parent_namespace__ is not None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"default": 1, "default_factory": int}, "default_factory"),
+        ({"kind": MemberKind.GROUP}, "member_type"),
+        ({"kind": MemberKind.COLLECTION}, "item"),
+        ({"glob": re.compile("a")}, "glob"),
+        ({"member_type": int}, "member_type"),
+    ],
+)
+def test_field_spec_with_inconsistent_fields_is_rejected(
+    overrides: dict[str, Any], message: str
+) -> None:
+    fields: dict[str, Any] = {
+        "py_name": "x",
+        "h5_name": "x",
+        "kind": MemberKind.ARRAY,
+        "annotation": int,
+        "adapter": TypeAdapter(int),
+    }
+    with pytest.raises(ValueError, match=message):
+        FieldSpec(**{**fields, **overrides})

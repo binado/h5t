@@ -92,16 +92,22 @@ class Dataset(Generic[T]):
 
     _h5t_attrs_type: ClassVar[type[BaseModel] | None] = None
 
-    filename: str | None
-    path: str | None
-    shape: tuple[int, ...]
-    dtype: np.dtype[Any]
-    attrs: T
+    _h5t_filename: str | None
+    _h5t_path: str | None
+    _h5t_shape: tuple[int, ...]
+    _h5t_dtype: np.dtype[Any]
+    _h5t_attrs: T
 
     def __class_getitem__(cls, item: Any) -> Any:
         if isinstance(item, TypeVar):
             return super().__class_getitem__(item)
         if _is_mapping_type(item):
+            args = typing.get_args(item)
+            if args and args[1] is not Any:
+                raise SchemaError(
+                    "Dataset[...] accepts Mapping[str, Any] (or a bare mapping) for untyped "
+                    f"attributes; got {item!r}. Use a BaseModel subclass to type them."
+                )
             return cls
         if isinstance(item, (str, typing.ForwardRef)) or type(item).__name__ == "_Stringifier":
             # A not-yet-defined name (PEP 649 evaluates annotations with stand-ins). Raising
@@ -137,23 +143,23 @@ class Dataset(Generic[T]):
         attrs: T | Mapping[str, Any] | None = None,
     ) -> None:
         arr = np.asarray(data)
-        self.filename = None
-        self.path = None
-        self.shape = arr.shape
-        self.dtype = arr.dtype
+        self._h5t_filename = None
+        self._h5t_path = None
+        self._h5t_shape = arr.shape
+        self._h5t_dtype = arr.dtype
         self._h5t_data: object = _readonly(arr)
         attrs_type = self._h5t_attrs_type
         if attrs_type is not None:
             if isinstance(attrs, attrs_type):
-                self.attrs = typing.cast(T, attrs)
+                self._h5t_attrs = typing.cast(T, attrs)
             else:
                 raw = {} if attrs is None else attrs
-                self.attrs = typing.cast(T, attrs_type.model_validate(raw))
+                self._h5t_attrs = typing.cast(T, attrs_type.model_validate(raw))
         elif isinstance(attrs, BaseModel):
-            self.attrs = typing.cast(T, attrs)
+            self._h5t_attrs = typing.cast(T, attrs)
         else:
             raw_map = {} if attrs is None else dict(attrs)
-            self.attrs = typing.cast(T, MappingProxyType(raw_map))
+            self._h5t_attrs = typing.cast(T, MappingProxyType(raw_map))
 
     @classmethod
     def _build(
@@ -167,11 +173,11 @@ class Dataset(Generic[T]):
     ) -> Self:
         """Create an instance directly from its state (the one place that does so)."""
         instance = object.__new__(cls)
-        instance.filename = filename
-        instance.path = path
-        instance.shape = shape
-        instance.dtype = dtype
-        instance.attrs = attrs
+        instance._h5t_filename = filename
+        instance._h5t_path = path
+        instance._h5t_shape = shape
+        instance._h5t_dtype = dtype
+        instance._h5t_attrs = attrs
         instance._h5t_data = cached
         return instance
 
@@ -194,6 +200,31 @@ class Dataset(Generic[T]):
         return target_cls._build(
             self.filename, self.path, self.shape, self.dtype, attrs, self._h5t_data
         )
+
+    @property
+    def filename(self) -> str | None:
+        """The source HDF5 file, or ``None`` for an in-memory dataset."""
+        return self._h5t_filename
+
+    @property
+    def path(self) -> str | None:
+        """The dataset's absolute HDF5 path, or ``None`` for an in-memory dataset."""
+        return self._h5t_path
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """The dataset's shape."""
+        return self._h5t_shape
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        """The dataset's NumPy dtype."""
+        return self._h5t_dtype
+
+    @property
+    def attrs(self) -> T:
+        """The dataset's validated HDF5 attributes."""
+        return self._h5t_attrs
 
     @property
     def ndim(self) -> int:

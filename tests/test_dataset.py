@@ -310,3 +310,21 @@ def test_dataset_subscript_with_mapping_returns_the_untyped_base() -> None:
 def test_dataset_subscript_with_invalid_argument_is_schema_error(bad: Any) -> None:
     with pytest.raises(h5t.SchemaError, match="type argument"):
         h5t.Dataset[bad]
+
+
+@pytest.mark.parametrize("name", ["filename", "path", "shape", "dtype", "attrs"])
+def test_dataset_metadata_is_read_only(name: str) -> None:
+    dataset = h5t.Dataset(np.arange(3))
+    with pytest.raises(AttributeError):
+        setattr(dataset, name, None)
+
+
+@pytest.mark.parametrize("annotation", [Mapping, dict, Mapping[str, Any], dict[str, Any]])
+def test_dataset_accepts_untyped_mapping_attrs_argument(annotation: Any) -> None:
+    assert h5t.Dataset[annotation] is h5t.Dataset
+
+
+@pytest.mark.parametrize("annotation", [Mapping[str, int], dict[str, str]])
+def test_dataset_rejects_typed_mapping_attrs_argument(annotation: Any) -> None:
+    with pytest.raises(h5t.SchemaError, match="BaseModel"):
+        h5t.Dataset[annotation]
