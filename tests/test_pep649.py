@@ -49,7 +49,7 @@ def test_a_lazy_annotation_may_name_a_class_defined_later() -> None:
     class _DefinedLater(h5t.Group):
         value: np.ndarray
 
-    spec = h5t._compile._ensure_group_compiled(Deferred)
+    spec = h5t._compile._compiled_group(Deferred)
     fields = {field.py_name: field for field in spec.fields}
     assert fields["later"].kind is MemberKind.GROUP
     assert fields["later"].member_type is _DefinedLater
@@ -63,14 +63,17 @@ def test_a_lazy_forward_reference_still_unresolved_reports_a_schema_error() -> N
         Deferred.model_validate_hdf5("never-opened.h5")
 
 
-def test_a_broken_lazy_annotation_helper_is_not_a_forward_reference() -> None:
+def test_a_broken_lazy_annotation_helper_is_reported_on_first_load() -> None:
     def alias():
         return _typo_inside_the_helper  # noqa: F821
 
-    with pytest.raises(h5t.SchemaError, match="_typo_inside_the_helper"):
+    class Broken(h5t.Group):
+        value: alias()
 
-        class Broken(h5t.Group):
-            value: alias()
+    # Pydantic cannot tell a callee's NameError from a forward reference, so the group
+    # defers and the missing name is reported on first use.
+    with pytest.raises(h5t.SchemaError, match="_typo_inside_the_helper"):
+        Broken.model_validate_hdf5("never-opened.h5")
 
 
 def test_a_lazy_annotation_helper_that_raises_becomes_a_schema_error() -> None:
@@ -114,7 +117,7 @@ def test_a_group_whose_base_carries_the_unresolved_annotation_defers_too() -> No
     class _DefinedLater(h5t.Group):
         value: np.ndarray
 
-    spec = h5t._compile._ensure_group_compiled(Sub)
+    spec = h5t._compile._compiled_group(Sub)
     assert [field.py_name for field in spec.fields] == ["later", "also"]
 
 
@@ -131,7 +134,7 @@ def test_the_group_defers_under_pep_649() -> None:
     group_cls = declare()
     gc.collect()
     assert marker(group_cls).localns is None
-    spec = h5t._compile._ensure_group_compiled(group_cls)
+    spec = h5t._compile._compiled_group(group_cls)
     fields = {field.py_name: field for field in spec.fields}
     assert fields["later"].member_type.__name__ == "Later"
 

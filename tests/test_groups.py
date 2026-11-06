@@ -118,7 +118,7 @@ def test_untyped_dataset_and_group_expose_raw_attrs_mapping(result_file: Path) -
 
 def test_forward_reference_to_a_group_defined_later_in_the_module_resolves() -> None:
     assert isinstance(_ForwardA.__dict__["__h5t_group__"], h5t._compile._PendingGroup)
-    spec = h5t._compile._ensure_group_compiled(_ForwardA)
+    spec = h5t._compile._compiled_group(_ForwardA)
     fields = {field.py_name: field for field in spec.fields}
     assert fields["b"].member_type is _ForwardB
 

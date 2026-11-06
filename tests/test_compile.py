@@ -182,14 +182,17 @@ def test_deferred_group_retains_no_locals_the_annotations_never_name() -> None:
         group_cls.model_validate_hdf5("never-opened.h5")
 
 
-def test_a_broken_annotation_helper_is_not_a_forward_reference() -> None:
+def test_a_broken_annotation_helper_is_reported_on_first_load() -> None:
     def alias():
         return _typo_inside_the_helper  # noqa: F821
 
-    with pytest.raises(h5t.SchemaError, match="_typo_inside_the_helper"):
+    class Broken(h5t.Group, localns={"alias": alias}):
+        value: alias()
 
-        class Broken(h5t.Group):
-            value: alias()
+    # Pydantic cannot tell a callee's NameError from a forward reference, so the group
+    # defers and the missing name is reported on first use.
+    with pytest.raises(h5t.SchemaError, match="_typo_inside_the_helper"):
+        Broken.model_validate_hdf5("never-opened.h5")
 
 
 @pytest.mark.parametrize(

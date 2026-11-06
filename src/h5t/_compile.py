@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
-import inspect
 import os
 import posixpath
 import re
@@ -15,7 +14,7 @@ import typing
 import weakref
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Annotated, Any, ClassVar, Generic, Literal, Self
+from typing import Annotated, Any, Generic, Literal, Self
 
 import h5py
 import numpy as np
@@ -58,8 +57,6 @@ from h5t._spec import (
 )
 
 T = TypeVar("T", bound=BaseModel | Mapping[str, Any], default=Mapping[str, Any])
-
-_ANNOTATION_FILE = "<h5t annotation>"
 
 
 def _schema_error(owner: type, field: str, message: str) -> SchemaError:
@@ -132,66 +129,6 @@ setattr(  # noqa: B010
     "__get_pydantic_core_schema__",
     classmethod(_jaxtyping_pydantic_schema),
 )
-
-
-# ---------------------------------------------------------------------------
-# Annotation resolution & deferral
-# ---------------------------------------------------------------------------
-
-
-class _UnresolvedAnnotation(Exception):
-    """An annotation names something not defined yet, so compilation must defer."""
-
-    def __init__(self, owner: type, name: str | None, message: str) -> None:
-        super().__init__(message)
-        self.owner = owner
-        self.name = name
-
-
-def _raised_by_annotation(exc: NameError, cls: type) -> bool:
-    """Report whether ``exc`` came from the annotation expression itself, not a callee."""
-    tb = exc.__traceback__
-    while tb is not None and tb.tb_next is not None:
-        tb = tb.tb_next
-    if tb is None:
-        return False
-    code = tb.tb_frame.f_code
-    if code.co_filename == _ANNOTATION_FILE:
-        return True
-    return code is getattr(getattr(cls, "__annotate__", None), "__code__", None)
-
-
-def _annotation_failure(cls: type, exc: Exception) -> Exception:
-    """Classify a failure to resolve ``cls``'s annotations."""
-    if isinstance(exc, SchemaError):
-        return exc
-    if isinstance(exc, NameError) and _raised_by_annotation(exc, cls):
-        return _UnresolvedAnnotation(cls, exc.name, str(exc))
-    return SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}")
-
-
-def _resolved_annotations(cls: type, localns: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Return ``cls``'s own annotations with strings and lazy values evaluated."""
-    namespace: dict[str, Any] = {cls.__name__: cls}
-    if localns:
-        namespace.update(localns)
-    try:
-        if sys.version_info >= (3, 14):
-            import annotationlib
-
-            raw = annotationlib.get_annotations(cls, format=annotationlib.Format.VALUE)
-        else:
-            raw = inspect.get_annotations(cls)
-        module = sys.modules.get(cls.__module__)
-        globalns = vars(module) if module is not None else {}
-        return {
-            name: eval(compile(value, _ANNOTATION_FILE, "eval"), globalns, namespace)
-            if isinstance(value, str)
-            else value
-            for name, value in raw.items()
-        }
-    except Exception as exc:
-        raise _annotation_failure(cls, exc) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -520,36 +457,12 @@ def _field_spec(
     )
 
 
-def _resolve_group_attrs_type(
-    group_cls: type[Group[Any]],
-    own_annotations: Mapping[str, Any],
-) -> AttrsSpec | None:
-    """Determine the ``AttrsSpec`` for ``group_cls`` from ``Group[T]`` or ``attrs: T``."""
-    attrs_ann: Any = own_annotations.get("attrs")
-    if attrs_ann is None:
-        for base in group_cls.__mro__:
-            meta = base.__dict__.get("__pydantic_generic_metadata__")
-            if not meta:
-                continue
-            origin = meta.get("origin")
-            if isinstance(origin, type) and issubclass(origin, Group):
-                # Any specialization counts (``Group[A]`` or ``G[A]`` for a generic
-                # ``G(Group[T], Generic[T])``); a still-open TypeVar says nothing yet.
-                args = meta.get("args", ())
-                if args and not isinstance(args[0], TypeVar):
-                    attrs_ann = args[0]
-                    break
-            if base is not Group and issubclass(base, Group):
-                base_spec = base.__dict__.get("__h5t_group__")
-                if isinstance(base_spec, GroupSpec) and base_spec.attrs is not None:
-                    return base_spec.attrs
-
-    if (
-        attrs_ann is None
-        or attrs_ann is Any
-        or isinstance(attrs_ann, TypeVar)
-        or _is_mapping_type(attrs_ann)
-    ):
+def _resolve_group_attrs_type(group_cls: type[Group[Any]]) -> AttrsSpec | None:
+    """Determine the ``AttrsSpec`` for ``group_cls`` from its resolved ``attrs`` field."""
+    attrs_ann: Any = group_cls.model_fields["attrs"].annotation
+    if attrs_ann is None or attrs_ann is Any or isinstance(attrs_ann, TypeVar):
+        return None
+    if _is_mapping_type(attrs_ann):
         return None
     if isinstance(attrs_ann, type) and issubclass(attrs_ann, BaseModel):
         if issubclass(attrs_ann, Group):
@@ -564,50 +477,17 @@ def _resolve_group_attrs_type(
     )
 
 
-def _compile_group_fields(
-    group_cls: type[Group[Any]],
-    localns: Mapping[str, Any] | None = None,
-) -> GroupSpec:
+def _compile_group_fields(group_cls: type[Group[Any]]) -> GroupSpec:
+    """Compile a *complete* ``group_cls`` from the fields Pydantic has resolved."""
     forbid_extras = _extract_forbid_extras(group_cls, group_cls)
-
-    raw_fields: list[tuple[str, Any, Any]] = []
-    seen_py_names: dict[str, int] = {}
-    own_annotations: dict[str, Any] = {}
-    for base in reversed(group_cls.__mro__):
-        if base in (object, BaseModel, Generic, Group):
-            continue
-        meta = base.__dict__.get("__pydantic_generic_metadata__")
-        if meta and meta.get("origin") is Group and not base.__dict__.get("__annotations__"):
-            continue
-        base_annotations = _resolved_annotations(base, localns)
-        for field_name, field_annotation in base_annotations.items():
-            if field_name.startswith("_") or typing.get_origin(field_annotation) is ClassVar:
-                continue
-            own_annotations[field_name] = field_annotation
-
-    attrs_spec = _resolve_group_attrs_type(group_cls, own_annotations)
-    own_annotations.pop("attrs", None)
-
-    if getattr(group_cls, "__pydantic_complete__", False):
-        for field_name, field_info in group_cls.model_fields.items():
-            if field_name == "attrs":
-                continue
-            raw_fields.append((field_name, field_info.annotation, field_info))
-    else:
-        for field_name, field_annotation in own_annotations.items():
-            raw_default = group_cls.__dict__.get(field_name)
-            idx = seen_py_names.get(field_name)
-            entry = (field_name, field_annotation, raw_default)
-            if idx is None:
-                seen_py_names[field_name] = len(raw_fields)
-                raw_fields.append(entry)
-            else:
-                raw_fields[idx] = entry
+    attrs_spec = _resolve_group_attrs_type(group_cls)
 
     fields: dict[str, FieldSpec] = {}
     seen_h5_names: dict[str, str] = {}
-    for field_name, field_annotation, raw_default in raw_fields:
-        fspec = _field_spec(group_cls, field_name, field_annotation, raw_default)
+    for field_name, field_info in group_cls.model_fields.items():
+        if field_name == "attrs":
+            continue
+        fspec = _field_spec(group_cls, field_name, field_info.annotation, field_info)
         if fspec.h5_name in seen_h5_names:
             raise SchemaError(
                 f"{group_cls.__name__}: duplicate HDF5 name {fspec.h5_name!r} for fields "
@@ -631,13 +511,17 @@ class _PendingGroup:
     localns: Mapping[str, Any] | None
 
 
-def _rebuild_model(cls: type[BaseModel], namespace: dict[str, Any], *, force: bool = False) -> None:
-    """Rebuild ``cls``, tolerating only still-undefined forward references."""
+def _rebuild_model(
+    cls: type[BaseModel], namespace: dict[str, Any]
+) -> PydanticUndefinedAnnotation | None:
+    """Rebuild ``cls``; return the still-undefined forward reference, if there is one."""
     try:
-        with contextlib.suppress(PydanticUndefinedAnnotation):
-            cls.model_rebuild(force=force, _types_namespace=namespace)
+        cls.model_rebuild(_types_namespace=namespace)
+    except PydanticUndefinedAnnotation as exc:
+        return exc
     except (PydanticUserError, PydanticSchemaGenerationError) as exc:
         raise SchemaError(f"{cls.__name__}: could not build the Pydantic schema: {exc}") from exc
+    return None
 
 
 def _read_array(value: Any) -> Any:
@@ -672,36 +556,24 @@ def _group_namespace(cls: type, localns: Mapping[str, Any] | None) -> dict[str, 
     return ns
 
 
-def _ensure_group_compiled(cls: type[Group[Any]]) -> GroupSpec:
+def _compiled_group(cls: type[Group[Any]]) -> GroupSpec:
+    """Return ``cls``'s spec, finishing a deferred compilation first."""
     marker = cls.__dict__.get("__h5t_group__")
     if isinstance(marker, GroupSpec):
         return marker
-    localns = marker.localns if isinstance(marker, _PendingGroup) else None
     if not getattr(cls, "__pydantic_complete__", True):
-        _rebuild_model(cls, _group_namespace(cls, localns))
+        localns = marker.localns if isinstance(marker, _PendingGroup) else None
+        undefined = _rebuild_model(cls, _group_namespace(cls, localns))
         cls.__pydantic_parent_namespace__ = None
-    spec = _compile_group_fields(cls, localns=localns)
-    if not getattr(cls, "__pydantic_complete__", True):
-        raise SchemaError(
-            f"{cls.__name__}: the Pydantic model is still incomplete after resolving "
-            f"annotations; a forward reference could not be resolved. If it is defined "
-            f"in a function scope, declare the group with `localns={{...}}` as a class "
-            f"keyword argument."
-        )
+        if undefined is not None:
+            raise SchemaError(
+                f"{cls.__name__}: could not resolve annotation name {undefined.name!r}. If it "
+                f"is defined in a function scope, declare the group with "
+                f"`localns={{...}}` as a class keyword argument."
+            ) from undefined
+    spec = _compile_group_fields(cls)
     setattr(cls, "__h5t_group__", spec)  # noqa: B010
     return spec
-
-
-def _compiled_group(cls: type[Group[Any]]) -> GroupSpec:
-    try:
-        return _ensure_group_compiled(cls)
-    except _UnresolvedAnnotation as exc:
-        name = f" {exc.name!r}" if exc.name else ""
-        raise SchemaError(
-            f"{exc.owner.__name__}: could not resolve annotation name{name}: {exc}. "
-            f"If it is defined in a function scope, declare the group with "
-            f"`localns={{...}}` as a class keyword argument."
-        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -851,7 +723,7 @@ class _GroupMeta(ModelMetaclass):
         cls.__pydantic_parent_namespace__ = None
 
         if is_generic_sub and group_base is not None:
-            _resolve_group_attrs_type(cls, {})
+            _resolve_group_attrs_type(cls)
             return cls
 
         if not is_user_group:
@@ -862,15 +734,14 @@ class _GroupMeta(ModelMetaclass):
             caller_locals.update(localns)
         caller_locals[cls_name] = cls
 
-        pending = _PendingGroup(localns=localns)
-        setattr(cls, "__h5t_group__", pending)  # noqa: B010
+        setattr(cls, "__h5t_group__", _PendingGroup(localns=localns))  # noqa: B010
         try:
             if not getattr(cls, "__pydantic_complete__", True):
-                _rebuild_model(cls, caller_locals)
+                undefined = _rebuild_model(cls, caller_locals)
                 cls.__pydantic_parent_namespace__ = None
-            spec = _compile_group_fields(cls, localns=caller_locals)
-        except _UnresolvedAnnotation:
-            return cls
+                if undefined is not None:
+                    return cls  # a forward reference: retried when the group is first used
+            spec = _compile_group_fields(cls)
         except BaseException:
             # Never leave the pending marker behind on a class whose definition failed.
             with contextlib.suppress(AttributeError):

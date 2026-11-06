@@ -52,23 +52,21 @@ real import cycle (the style guide allows deferred imports for that).
 
 ### Compilation: eager, with deferral for `Group` forward references
 
-`_GroupMeta` compiles `Group` subclasses at class creation. Annotations resolve against the
-module globals, then a `localns` built from the defining caller's locals (used once, never
-stored), the explicit `localns=` class keyword argument, and the class's own name (so
-self-reference works).
+`_GroupMeta` compiles `Group` subclasses at class creation, from the fields Pydantic has
+resolved (`model_fields`); h5t never evaluates annotations itself. If Pydantic cannot complete
+the model yet, `_GroupMeta` retries once with a namespace built from the defining caller's
+locals (used once, never stored), the explicit `localns=` class keyword argument, and the
+class's own name (so self-reference works).
 
 - A bad declaration raises `SchemaError` at class definition.
-- A `Group` subclass whose annotation raises `NameError` is stored as a `_PendingGroup` on
-  `cls.__h5t_group__` and retried later. Retries see only the explicit `localns`, not the
-  defining function's locals — a function-scope group that defers *and* uses a local type must
-  pass `class MyGroup(h5t.Group, localns={...}):`.
-- A `NameError` raised by a *function the annotation calls* is a bug, not a forward reference
-  (`_raised_by_annotation` distinguishes them by the raising frame).
-- `_ensure_group_compiled` is the compile-time retry point; `_compiled_group` wraps it for load
-  time and turns a still-unresolved name into `SchemaError`.
-- On 3.14, use `annotationlib.get_annotations(cls, format=Format.VALUE)`. Do **not** use
-  `Format.STRING`/`FORWARDREF`: they run the user's annotation helper inside a swallowing handler,
-  hiding its `NameError`.
+- A `Group` subclass with a still-undefined name is stored as a `_PendingGroup` on
+  `cls.__h5t_group__` and retried by `_compiled_group` on first use. Retries see only the
+  explicit `localns`, not the defining function's locals — a function-scope group that defers
+  *and* uses a local type must pass `class MyGroup(h5t.Group, localns={...}):`. A still-unresolved
+  name becomes a `SchemaError` naming it.
+- Pydantic cannot tell a forward reference from a `NameError` raised inside a function the
+  annotation calls, so the latter also defers and is reported on first use.
+- `_compile_closure` compiles every reachable group before a load.
 
 ### Naming
 
@@ -108,9 +106,9 @@ Each *type* converts raw input itself:
   own jaxtyping scope via `handler.generate_schema(attrs_type)`; failures flow out in `loc` and
   are formatted by `_h5_error_path` as `<path>@<attr>`).
 - jaxtyping arrays: see above.
-- plain `np.ndarray` fields (and collections of them) get a `BeforeValidator(_read_array)`
-  appended by `_inject_readers` after compilation, followed by one forced model rebuild
-  (`_finish_group`, from `_GroupMeta.__new__` and `_ensure_group_compiled`; eagerly for `G[A]`).
+- plain `np.ndarray` fields (and collections of them): `Group.__get_pydantic_core_schema__`
+  rewrites every `np.ndarray` `is-instance` node in the generated core schema (`_with_array_readers`)
+  so `_read_array` runs first. No `FieldInfo` mutation or model rebuild.
 - `Glob.__get_pydantic_core_schema__` filters only a `_GroupView` (`fnmatch.fnmatchcase`).
 - `Group._h5t_jaxtyping_scope` rejects any attribute on a `extra="forbid"` group with untyped
   attrs, and freezes loaded untyped attrs into a `MappingProxyType`.
