@@ -13,7 +13,6 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 import h5t
-from h5t._spec import MemberKind
 
 
 def write(path: Path, **datasets: Any) -> Path:
@@ -21,10 +20,6 @@ def write(path: Path, **datasets: Any) -> Path:
         for name, value in datasets.items():
             f[name] = value
     return path
-
-
-def spec_of(group_cls: type[h5t.Group[Any]], name: str = "x") -> Any:
-    return next(f for f in group_cls.__dict__["__h5t_group__"].fields if f.py_name == name)
 
 
 def test_guard_jaxtyping_exposes_what_h5t_relies_on() -> None:
@@ -35,11 +30,13 @@ def test_guard_jaxtyping_exposes_what_h5t_relies_on() -> None:
     assert cls.__instancecheck_str__(np.zeros(3)) == ""
 
 
-def test_jaxtyping_field_compiles_to_array_member() -> None:
+def test_jaxtyping_field_loads_an_array(tmp_path: Path) -> None:
     class R(h5t.Group):
         x: Float64[np.ndarray, "*batch n 3 _"]
 
-    assert spec_of(R).kind is MemberKind.ARRAY
+    value = np.zeros((2, 3, 4))
+    loaded = R.model_validate_hdf5(write(tmp_path / "array.h5", x=value))
+    np.testing.assert_array_equal(loaded.x, value)
 
 
 @pytest.mark.parametrize("value", [np.zeros(3), np.zeros((2, 2), dtype="int8")])
@@ -292,8 +289,8 @@ def test_custom_jaxtyping_dtype_family(tmp_path: Path) -> None:
         R.model_validate_hdf5(write(tmp_path / "bad.h5", x=np.zeros(3, "int8"), y=np.zeros(3)))
 
 
-def test_invalid_shape_string_is_a_schema_error() -> None:
-    with pytest.raises(h5t.SchemaError, match=r"R: could not resolve annotations"):
+def test_invalid_shape_string_error_propagates() -> None:
+    with pytest.raises(ValueError, match="comma"):
 
         class R(h5t.Group):
             x: Float[np.ndarray, "n, m"]

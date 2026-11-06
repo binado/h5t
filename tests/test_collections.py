@@ -259,3 +259,5 @@ def test_schema_errors(annotation: Any, message: str) -> None:
 
         class Bad(h5t.Group):
             field: annotation  # ty: ignore[invalid-type-form]
+
+        Bad.model_validate_hdf5("never-opened.h5")

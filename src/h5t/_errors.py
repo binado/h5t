@@ -1,4 +1,4 @@
-"""Public exception types for schema compilation and detached HDF5 I/O."""
+"""Public exception types for declaration checks and detached HDF5 I/O."""
 
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ class H5TError(Exception):
 class SchemaError(H5TError):
     """A schema class declaration is incoherent or unsupported.
 
-    Usually raised right when the `Group` subclass is defined.
+    Raised during HDF5 operations, before opening the file. Type-owned schema hooks
+    may also raise this while Pydantic builds a model. Native Pydantic model-building
+    and unresolved-annotation errors propagate unchanged.
     """
 
 

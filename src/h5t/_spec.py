@@ -1,15 +1,12 @@
-"""Compiled schema specifications and public annotation markers."""
+"""Public annotation markers and HDF5 path helpers."""
 
 from __future__ import annotations
 
 import fnmatch
-import re
-import weakref
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel, GetCoreSchemaHandler
+from pydantic import GetCoreSchemaHandler
 from pydantic_core import core_schema
 
 from h5t._h5view import _GroupView
@@ -51,88 +48,6 @@ class Glob:
             return value
 
         return core_schema.no_info_before_validator_function(select, handler(source_type))
-
-
-class MemberKind(Enum):
-    """How a declared child field on a `Group` is represented in HDF5."""
-
-    ARRAY = "array"
-    DATASET = "dataset"
-    GROUP = "group"
-    COLLECTION = "collection"
-
-
-@dataclass(frozen=True)
-class AttrsSpec:
-    """A typed attributes schema: the `BaseModel` subclass ``T`` of a group or dataset.
-
-    ``optional`` holds the on-disk names of the attributes declared ``X | None``; a ``None``
-    value is left out of the file instead of being stored.
-    """
-
-    model_type_ref: weakref.ReferenceType[type[BaseModel]] = field(compare=False, repr=False)
-    optional: frozenset[str] = frozenset()
-
-    @property
-    def model_type(self) -> type[BaseModel]:
-        """The `BaseModel` subclass for this attributes spec."""
-        cls = self.model_type_ref()
-        if cls is None:
-            raise RuntimeError("the attributes model was garbage-collected before use")
-        return cls
-
-
-@dataclass(frozen=True)
-class FieldSpec:
-    """The compiled instructions for one child field of a `Group`."""
-
-    py_name: str
-    h5_name: str
-    kind: MemberKind
-    optional: bool = False
-    member_type: type | None = None
-    dataset_attrs: AttrsSpec | None = None
-    item: FieldSpec | None = None
-    glob: re.Pattern[str] | None = field(default=None, compare=False)
-
-    def __post_init__(self) -> None:
-        # The compiler is the only producer; these checks make a bad combination fail
-        # where it is built instead of as a confusing error at load or dump time.
-        is_member = self.kind in (MemberKind.GROUP, MemberKind.DATASET)
-        problems = [
-            message
-            for broken, message in (
-                (
-                    is_member != (self.member_type is not None),
-                    "member_type must be set exactly for GROUP and DATASET fields",
-                ),
-                (
-                    (self.kind is MemberKind.COLLECTION) != (self.item is not None),
-                    "item must be set exactly for COLLECTION fields",
-                ),
-                (
-                    self.glob is not None and self.kind is not MemberKind.COLLECTION,
-                    "glob is only valid on COLLECTION fields",
-                ),
-                (
-                    self.dataset_attrs is not None and self.kind is not MemberKind.DATASET,
-                    "dataset_attrs is only valid on DATASET fields",
-                ),
-            )
-            if broken
-        ]
-        if problems:
-            raise ValueError(f"invalid FieldSpec {self.py_name!r}: {'; '.join(problems)}")
-
-
-@dataclass(frozen=True)
-class GroupSpec:
-    """Compiled loading instructions for a `Group` subclass."""
-
-    group_type: type[BaseModel]
-    attrs: AttrsSpec | None
-    fields: tuple[FieldSpec, ...] = ()
-    forbid_extras: bool = False
 
 
 def child_path(parent: str, name: str) -> str:

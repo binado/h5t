@@ -6,7 +6,7 @@ User guide
 - :doc:`jaxtyping`: dtype and shape checks from file metadata.
 - :doc:`collections`: ``dict[str, T]`` fields and ``Glob``.
 - :doc:`writing`: ``Group.model_dump_hdf5``.
-- :doc:`compilation`: when schemas compile, forward references and ``localns``.
+- :doc:`compilation`: Pydantic model lifecycle, forward references and explicit rebuilding.
 - :doc:`cli`: the ``h5t check`` command.
 
 .. toctree::

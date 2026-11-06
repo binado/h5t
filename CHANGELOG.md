@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking:** Pydantic now owns the model lifecycle. HDF5 declaration checks run on
+  load/write before file access, rather than at class definition. Native Pydantic
+  model-building and unresolved-annotation errors propagate unchanged (CLI exit 2).
+  Removed `localns=`; use `Model.model_rebuild(_types_namespace={...})` instead.
+- Nested groups and typed attributes are written using their runtime model fields,
+  including subclass fields in direct children and collection items. Removed the
+  compiled schema IR, caches, and custom Group metaclass.
+
 - **Breaking:** the API is rebuilt around generic Pydantic models: `h5t.Group[T]` and
   `h5t.Dataset[T]` replace the `@h5t.group`/`@h5t.dataset` records. Load with
   `Group.model_validate_hdf5(path)` and write with `group.model_dump_hdf5(path)`; the typed
@@ -30,8 +38,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Plain ndarray aliases, including chained PEP 695 aliases, read HDF5 datasets through
+  the Pydantic schema reader hook.
+
 - Generic groups with `Dataset[T]` fields compile.
-- An unresolved forward reference at load time raises `SchemaError`.
 - A failing rollback of any exception type can no longer mask the original write error.
 
 ### Documentation

@@ -132,7 +132,8 @@ Errors
 
 All errors derive from :class:`h5t.H5TError`:
 
-- :class:`h5t.SchemaError`: a schema class declaration is invalid. Raised at class creation.
+- :class:`h5t.SchemaError`: an HDF5 declaration is invalid. Checked before file access on load or write.
+- Native Pydantic model-building and unresolved-annotation errors propagate unchanged.
 - :class:`h5t.ValidationError`: the file or model does not conform. Fail-fast and
   path-aware, e.g. ``/fiducials: the size of dimension n is 4 which does not equal the
   existing value of 3``. Messages from Pydantic keep its wording with the location turned

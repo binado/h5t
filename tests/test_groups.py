@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import gc
-import weakref
 from pathlib import Path
-from typing import Any
 
 import h5py
 import numpy as np
 import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PydanticUndefinedAnnotation
 
 import h5t
-from h5t._spec import MemberKind
 
 from .conftest import MeasurementAttrs, Nested, Result
 
@@ -38,41 +34,13 @@ class _RecursiveNode(h5t.Group[_NodeAttrs]):
     child: _RecursiveNode | None = None
 
 
-def test_group_validates_eagerly_at_definition() -> None:
+def test_group_declaration_is_checked_on_load() -> None:
     with pytest.raises(h5t.SchemaError, match=r"Bad\.missing:"):
 
         class Bad(h5t.Group):
             missing: int
 
-
-def test_attrs_cache_reuses_live_specs_without_retaining_models() -> None:
-    class RecordingAttrs(BaseModel):
-        unit: str
-
-    class First(h5t.Group):
-        measurement: h5t.Dataset[RecordingAttrs]
-
-    class Second(h5t.Group):
-        measurement: h5t.Dataset[RecordingAttrs]
-
-    def measurement_field(group_cls: type[h5t.Group[Any]]) -> Any:
-        spec = group_cls.__dict__["__h5t_group__"]
-        return {field.py_name: field for field in spec.fields}["measurement"]
-
-    assert measurement_field(First).dataset_attrs is measurement_field(Second).dataset_attrs
-
-    def make_transient() -> weakref.ReferenceType[type]:
-        class TransientAttrs(BaseModel):
-            unit: str
-
-        class Transient(h5t.Group):
-            measurement: h5t.Dataset[TransientAttrs]
-
-        return weakref.ref(TransientAttrs)
-
-    transient = make_transient()
-    gc.collect()
-    assert transient() is None
+        Bad.model_validate_hdf5("never-opened.h5")
 
 
 def test_group_defaults_are_validated_only_with_validate_default(result_file: Path) -> None:
@@ -116,11 +84,11 @@ def test_untyped_dataset_and_group_expose_raw_attrs_mapping(result_file: Path) -
     assert result.measurement.attrs["extra"] == "measurement"
 
 
-def test_forward_reference_to_a_group_defined_later_in_the_module_resolves() -> None:
-    assert isinstance(_ForwardA.__dict__["__h5t_group__"], h5t._compile._PendingGroup)
-    spec = h5t._compile._compiled_group(_ForwardA)
-    fields = {field.py_name: field for field in spec.fields}
-    assert fields["b"].member_type is _ForwardB
+def test_forward_reference_to_a_group_defined_later_in_the_module_resolves(tmp_path: Path) -> None:
+    path = tmp_path / "forward.h5"
+    with h5py.File(path, "w") as file:
+        file.create_group("b").attrs["value"] = 3
+    assert _ForwardA.model_validate_hdf5(path).b.attrs.value == 3
 
 
 def test_recursive_group_compiles_and_loads_a_nested_file(tmp_path: Path) -> None:
@@ -161,11 +129,9 @@ def test_a_group_from_another_module_is_usable_as_a_field(result_file: Path) -> 
     assert result.nested.attrs.answer == 42
 
 
-def test_still_unresolved_nested_group_is_a_schema_error(tmp_path: Path) -> None:
+def test_still_unresolved_nested_group_raises_pydantic_error(tmp_path: Path) -> None:
     class Inner(h5t.Group):
         later: _NeverDefined  # noqa: F821
-
-    assert isinstance(Inner.__dict__["__h5t_group__"], h5t._compile._PendingGroup)
 
     class Outer(h5t.Group):
         nested: Inner
@@ -178,7 +144,7 @@ def test_still_unresolved_nested_group_is_a_schema_error(tmp_path: Path) -> None
         lambda: Outer.model_validate_hdf5(path),
         lambda: Inner.model_validate_hdf5(path),
     ):
-        with pytest.raises(h5t.SchemaError, match="_NeverDefined"):
+        with pytest.raises(PydanticUndefinedAnnotation, match="_NeverDefined"):
             load()
 
 
@@ -216,11 +182,6 @@ def test_dataset_is_a_member_in_its_own_right(result_file: Path) -> None:
     class Owner(h5t.Group):
         measurement: h5t.Dataset
         absent: h5t.Dataset | None = None
-
-    spec = Owner.__dict__["__h5t_group__"]
-    field_kinds = {field.py_name: field.kind for field in spec.fields}
-    assert field_kinds["measurement"] is MemberKind.DATASET
-    assert field_kinds["absent"] is MemberKind.DATASET
 
     loaded = Owner.model_validate_hdf5(result_file)
     assert loaded.absent is None

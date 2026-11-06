@@ -35,51 +35,45 @@ Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_spec`/`_erro
 reverse edge is `Group.model_dump_hdf5`, which imports `_write` inside the method to avoid a
 real import cycle (the style guide allows deferred imports for that).
 
-- **`_spec.py`** — `Glob` marker and the compiled IR: `AttrsSpec`
-  (a typed attributes model plus its optional names), `FieldSpec`, `GroupSpec`, `MemberKind`
-  (`ARRAY` / `DATASET` / `GROUP` / `COLLECTION`), plus error-path formatters.
+- **`_spec.py`** — `Glob` marker and HDF5 path formatters.
 - **`_h5view.py`** — `_GroupView`, a read-only `Mapping` over an open `h5py.Group`, plus the raw
   attribute helpers (`_raw_attrs`, `_normalized_attrs`) and `_ghost`.
 - **`_array.py`** — `Dataset[T]`, the detached lazily-read dataset with typed `.attrs: T`,
   `h5py`-style indexing (`ds[()]`, `ds[:]`, `ds[:10]`), `.data`, `.read()`, `.open()`, and
   `__array__()`.
-- **`_compile.py`** — `Group[T]`, `_GroupMeta` metaclass, annotation → `FieldSpec` / `AttrsSpec`
-  compilation, `jaxtyping` Pydantic core-schema hook, and the loader (`model_validate_hdf5`).
+- **`_compile.py`** — `Group[T]`, stateless declaration checks over Pydantic metadata,
+  annotation helpers, jaxtyping core-schema hook, and the loader (`model_validate_hdf5`).
 - **`_write.py`** — `Group.model_dump_hdf5`: a *plan* phase that walks an in-memory `Group`
   tree without touching the file (it trusts construction-time validation and checks only what
   HDF5 imposes), then an *apply* phase that writes and rolls back on failure.
 - **`_cli.py`** — `h5t check`: import `pkg.mod:Class`, call `Class.model_validate_hdf5`, exit 0
   (ok) / 1 (`ValidationError`) / 2 (import, schema, usage, or I/O error).
 
-### Compilation: eager, with deferral for `Group` forward references
+### Model lifecycle: owned by Pydantic
 
-`_GroupMeta` compiles `Group` subclasses at class creation, from the fields Pydantic has
-resolved (`model_fields`); h5t never evaluates annotations itself. If Pydantic cannot complete
-the model yet, `_GroupMeta` retries once with a namespace built from the defining caller's
-locals (used once, never stored), the explicit `localns=` class keyword argument, and the
-class's own name (so self-reference works).
+`Group` is an ordinary Pydantic model with no custom metaclass, compiled schema IR,
+caches, or pending-model state. HDF5 operations check `model_fields` directly, rebuilding
+incomplete models with `model_rebuild()`. `_check_group` walks reachable declarations
+with an operation-local visited set before opening a file; recursive schemas terminate.
 
-- A bad declaration raises `SchemaError` at class definition.
-- A `Group` subclass with a still-undefined name is stored as a `_PendingGroup` on
-  `cls.__h5t_group__` and retried by `_compiled_group` on first use. Retries see only the
-  explicit `localns`, not the defining function's locals — a function-scope group that defers
-  *and* uses a local type must pass `class MyGroup(h5t.Group, localns={...}):`. A still-unresolved
-  name becomes a `SchemaError` naming it.
-- Pydantic cannot tell a forward reference from a `NameError` raised inside a function the
-  annotation calls, so the latter also defers and is reported on first use.
-- `_compile_closure` compiles every reachable group before a load.
+- HDF5 declaration restrictions raise `SchemaError` at load/write time.
+- Pydantic model-building and unresolved-annotation errors propagate unchanged.
+- Type-owned schema hooks may reject unsupported types during model construction.
+- `localns=` is removed. Resolve local dependencies explicitly with
+  `Model.model_rebuild(_types_namespace={...})`; do not inspect frames or clear namespaces.
+- The writer checks runtime group and attribute model declarations during planning,
+  including subclass fields in direct children and collection items.
 
 ### Naming
 
-Internal state is prefixed `_h5t_`; the compiled group spec is stored on `cls.__h5t_group__`
-(set via `setattr`, deliberately not inherited). Annotations starting with `_` are skipped as
+Internal state is prefixed `_h5t_`. Pydantic excludes annotations starting with `_` from
 fields. Group fields represent child HDF5 nodes (attributes live on `.attrs: T`); only repeated
 *HDF5* names within a group or attributes model are rejected.
 
 ### jaxtyping arrays
 
 jaxtyping does the checking; h5t never parses a shape string. `_unwrap_jaxtyping` rewrites an
-`AbstractArray` subclass to its backing `np.ndarray`/`Dataset[T]` early in compilation. The
+`AbstractArray` subclass to its backing `np.ndarray`/`Dataset[T]` during annotation inspection. The
 Pydantic core-schema hook (`_jaxtyping_pydantic_schema`) calls the non-public
 `hint.__instancecheck_str__` on a metadata-only candidate (a zero-stride `_ghost` array, or a
 `Dataset`), so no data is read. A guard test fails if jaxtyping drops that method. Dimension
@@ -109,7 +103,8 @@ Each *type* converts raw input itself:
 - jaxtyping arrays: see above.
 - plain `np.ndarray` fields (and collections of them): `Group.__get_pydantic_core_schema__`
   rewrites every `np.ndarray` `is-instance` node in the generated core schema (`_with_array_readers`)
-  so `_read_array` runs first. No `FieldInfo` mutation or model rebuild.
+  so `_read_array` runs first. Array alias references are resolved through the schema
+handler, including chained PEP 695 aliases. No `FieldInfo` mutation is needed.
 - `Glob.__get_pydantic_core_schema__` filters only a `_GroupView` (`fnmatch.fnmatchcase`).
 - `Group._h5t_jaxtyping_scope` rejects any attribute on a `extra="forbid"` group with untyped
   attrs, and freezes loaded untyped attrs into a `MappingProxyType`.
@@ -122,19 +117,19 @@ Pydantic's `ValidationError` is a `ValueError`, so anything raised inside a vali
 ### Writing: trust construction
 
 `Group.model_dump_hdf5` does not re-validate. Field types, jaxtyping shapes and attribute models
-were checked when the instance was built, so `_write._plan_group` only walks the compiled spec.
+were checked when the instance was built, so `_write._plan_group` walks runtime `model_fields`.
 Typed attributes come from `model_dump(mode="python", by_alias=True, include=<declared fields>)`,
-so serializers and aliases are Pydantic's; `AttrsSpec.optional` names the attributes whose `None`
-is left out (a required `Any` attribute holding `None` is an error, not silently skipped). The
+so serializers and aliases are Pydantic's; Nullable field annotations determine which attributes holding `None`
+are left out (a required `Any` attribute holding `None` is an error, not silently skipped). The
 writer still checks what Pydantic cannot know: collection keys, `Glob` patterns on in-memory
 dicts, untyped attributes on an `extra="forbid"` group, and values h5py cannot store. An instance
 built with `model_construct` or mutated after construction is written as it is.
 
 Errors keep pydantic's wording; `_h5_error_path` walks the first error's `loc` through the
-`GroupSpec` to produce the HDF5 path (`/values: Field required`, `/@count: ...`,
+model fields and annotations to produce the HDF5 path (`/values: Field required`, `/@count: ...`,
 `/runs/r1/values: ...`). A `loc` part it cannot place goes into the message. Errors raised
-directly as `h5t.ValidationError` already carry their path. `_compile_closure` compiles every
-reachable group first so an unresolved name stays a `SchemaError`.
+directly as `h5t.ValidationError` already carry their path. `_check_group` checks every
+reachable declaration first; unresolved names retain native Pydantic errors.
 Hierarchy: `H5TError` → `SchemaError`, `ValidationError`.
 
 ## Testing

@@ -63,3 +63,12 @@ removed on a best-effort basis.
 
 Lazy datasets are copied: an uncached ``Dataset`` is read from its source file at save time,
 without caching it on your instance.
+
+Runtime subclasses
+------------------
+
+Each nested group is written using its runtime class's ``model_fields``, so additional
+subclass fields are included even when the parent annotation names a base class. This
+also applies to collection items. Attribute models use their runtime declared fields
+and serializers; computed fields are excluded. HDF5 declaration checks happen during
+planning, before opening the destination, without revalidating instance values.

@@ -1,197 +1,18 @@
-"""Group compilation: field classification, deferral, and declaration errors."""
+"""Group declarations, Pydantic rebuilding, and observable HDF5 behavior."""
 
 from __future__ import annotations
 
-import gc
-import re
-import sys
 import typing
-import weakref
 from pathlib import Path
 from typing import Annotated, Any
 
 import h5py
 import numpy as np
-import numpy.typing as npt
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 import h5t
-from h5t._compile import _read_array, _rebuild_model
-from h5t._spec import FieldSpec, GroupSpec, MemberKind
-
-
-def compiled(group_cls: type[h5t.Group[Any]]) -> GroupSpec:
-    """Return ``group_cls``'s compiled spec without going through a load."""
-    marker = group_cls.__dict__["__h5t_group__"]
-    assert isinstance(marker, GroupSpec), "group is still pending"
-    return marker
-
-
-def field_map(group_cls: type[h5t.Group[Any]]) -> dict[str, Any]:
-    return {field.py_name: field for field in compiled(group_cls).fields}
-
-
-def test_every_field_kind_and_markers_compile() -> None:
-    class ChildAttrs(BaseModel):
-        value: int
-
-    class Child(h5t.Group[ChildAttrs]):
-        pass
-
-    class TypedAttrs(BaseModel):
-        unit: str
-
-    class SchemaAttrs(BaseModel):
-        renamed: str = Field(alias="on-disk")
-
-    class Schema(h5t.Group[SchemaAttrs]):
-        aliased_arr: np.ndarray = Field(alias="disk-arr")
-        array: np.ndarray
-        bare: h5t.Dataset
-        typed: h5t.Dataset[TypedAttrs]
-        child: Child
-
-    spec = compiled(Schema)
-    assert spec.attrs is not None
-
-    fields = field_map(Schema)
-    assert fields["aliased_arr"].kind is MemberKind.ARRAY
-    assert fields["aliased_arr"].h5_name == "disk-arr"
-    assert fields["array"].kind is MemberKind.ARRAY
-    assert fields["bare"].kind is MemberKind.DATASET
-    assert fields["bare"].dataset_attrs is None
-    assert fields["typed"].kind is MemberKind.DATASET
-    assert fields["typed"].dataset_attrs is not None
-    assert fields["child"].kind is MemberKind.GROUP
-    assert fields["child"].member_type is Child
-
-
-def test_ndarray_typing_aliases_classify_as_arrays() -> None:
-    class Aliased(h5t.Group):
-        payload: npt.NDArray[np.float64]
-        optional_payload: npt.NDArray[Any] | None
-
-    fields = field_map(Aliased)
-    assert fields["payload"].kind is MemberKind.ARRAY
-    assert fields["optional_payload"].kind is MemberKind.ARRAY
-    assert fields["optional_payload"].optional
-
-
-@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 aliases require Python 3.12")
-def test_pep695_aliases_of_ndarray_classify_as_arrays() -> None:
-    Coords = typing.TypeAliasType("Coords", npt.NDArray[np.float64])
-    Chained = typing.TypeAliasType("Chained", Coords)
-
-    class Aliased(h5t.Group):
-        direct: Coords
-        chained: Chained
-
-    fields = field_map(Aliased)
-    assert fields["direct"].kind is MemberKind.ARRAY
-    assert fields["chained"].kind is MemberKind.ARRAY
-    assert fields["direct"].optional is False
-
-
-def test_a_resolvable_group_compiles_at_class_definition() -> None:
-    class Eagerly(h5t.Group):
-        value: np.ndarray
-
-    assert [field.py_name for field in compiled(Eagerly).fields] == ["value"]
-
-
-def test_a_group_declared_in_a_function_compiles_before_it_returns() -> None:
-    def declare() -> type[h5t.Group[Any]]:
-        class PayloadAttrs(BaseModel):
-            unit: str
-
-        class Local(h5t.Group):
-            payload: h5t.Dataset[PayloadAttrs]
-
-        assert isinstance(Local.__dict__["__h5t_group__"], GroupSpec)
-        return Local
-
-    assert field_map(declare())["payload"].kind is MemberKind.DATASET
-
-
-def test_eager_compilation_does_not_retain_the_defining_scope() -> None:
-    class Tracked:
-        pass
-
-    def declare() -> tuple[type[h5t.Group[Any]], weakref.ref[Tracked]]:
-        unrelated = Tracked()
-
-        class Local(h5t.Group):
-            value: np.ndarray
-
-        return Local, weakref.ref(unrelated)
-
-    group_cls, ref = declare()
-    gc.collect()
-    assert ref() is None
-    assert compiled(group_cls).fields[0].py_name == "value"
-
-
-def test_deferred_group_with_function_local_dependency_needs_localns_to_resolve() -> None:
-    class Dependency(h5t.Group):
-        value: np.ndarray
-
-    def declare(**kwargs: Any) -> type[h5t.Group[Any]]:
-        class Deferred(h5t.Group, **kwargs):
-            dependency: Dependency
-
-        return Deferred
-
-    plain = declare()
-    with_localns = declare(localns={"Dependency": Dependency})
-
-    with pytest.raises(h5t.SchemaError, match="Dependency"):
-        plain.model_validate_hdf5("never-opened.h5")
-    fields = h5t._compile._compiled_group(with_localns).fields
-    assert fields[0].member_type is Dependency
-
-
-def test_function_local_group_can_reference_itself() -> None:
-    class Node(h5t.Group):
-        child: Node | None = None
-
-    names = [f.py_name for f in h5t._compile._compiled_group(Node).fields]
-    assert names == ["child"]
-
-
-def test_deferred_group_retains_no_locals_the_annotations_never_name() -> None:
-    class Tracked:
-        pass
-
-    def declare() -> tuple[type[h5t.Group[Any]], weakref.ref[Tracked]]:
-        tracked = Tracked()
-        unrelated = [tracked]
-        assert unrelated[0] is tracked
-
-        class Local(h5t.Group):
-            undefined: _NeverDefined  # noqa: F821
-
-        return Local, weakref.ref(tracked)
-
-    group_cls, ref = declare()
-    gc.collect()
-    assert group_cls.__dict__["__h5t_group__"].localns is None
-    assert ref() is None
-    with pytest.raises(h5t.SchemaError, match="_NeverDefined"):
-        group_cls.model_validate_hdf5("never-opened.h5")
-
-
-def test_a_broken_annotation_helper_is_reported_on_first_load() -> None:
-    def alias():
-        return _typo_inside_the_helper  # noqa: F821
-
-    class Broken(h5t.Group, localns={"alias": alias}):
-        value: alias()
-
-    # Pydantic cannot tell a callee's NameError from a forward reference, so the group
-    # defers and the missing name is reported on first use.
-    with pytest.raises(h5t.SchemaError, match="_typo_inside_the_helper"):
-        Broken.model_validate_hdf5("never-opened.h5")
+from h5t._compile import _read_array
 
 
 @pytest.mark.parametrize(
@@ -221,7 +42,8 @@ def test_invalid_declarations(declaration: str, match: str) -> None:
     source = "class Invalid(h5t.Group):\n    " + declaration + "\n"
     with pytest.raises(h5t.SchemaError, match=match):
         exec(source, namespace)
-    assert "Invalid" not in namespace
+        namespace["Invalid"].model_rebuild(_types_namespace=namespace)
+        namespace["Invalid"].model_validate_hdf5("never-opened.h5")
 
 
 def test_invalid_extra_config_raises_schema_error() -> None:
@@ -230,6 +52,8 @@ def test_invalid_extra_config_raises_schema_error() -> None:
         class Warn(h5t.Group):
             model_config = ConfigDict(extra="allow")
 
+        Warn.model_validate_hdf5("never-opened.h5")
+
 
 def test_duplicate_hdf5_names_fail() -> None:
     with pytest.raises(h5t.SchemaError, match="duplicate HDF5"):
@@ -237,6 +61,8 @@ def test_duplicate_hdf5_names_fail() -> None:
         class Duplicate(h5t.Group):
             first: np.ndarray = Field(alias="same")
             second: h5t.Dataset = Field(alias="same")
+
+        Duplicate.model_validate_hdf5("never-opened.h5")
 
 
 def test_removed_api_is_absent() -> None:
@@ -261,40 +87,6 @@ class _Plain(BaseModel):
     value: int = 0
 
 
-def test_rebuild_model_unresolved_annotation_is_tolerated(monkeypatch: pytest.MonkeyPatch) -> None:
-    from pydantic import PydanticUndefinedAnnotation
-
-    def undefined(*args: object, **kwargs: object) -> None:
-        raise PydanticUndefinedAnnotation("Later", "name 'Later' is not defined")
-
-    monkeypatch.setattr(_Plain, "model_rebuild", undefined)
-    _rebuild_model(_Plain, {})
-
-
-def test_rebuild_model_schema_failure_raises_schema_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    from pydantic import PydanticUserError
-
-    def broken(*args: object, **kwargs: object) -> None:
-        raise PydanticUserError("bad schema", code=None)
-
-    monkeypatch.setattr(_Plain, "model_rebuild", broken)
-    with pytest.raises(h5t.SchemaError, match="_Plain.*bad schema") as caught:
-        _rebuild_model(_Plain, {})
-    assert isinstance(caught.value.__cause__, PydanticUserError)
-
-
-@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, RuntimeError])
-def test_rebuild_model_unrelated_exceptions_propagate(
-    monkeypatch: pytest.MonkeyPatch, exc_type: type[BaseException]
-) -> None:
-    def interrupted(*args: object, **kwargs: object) -> None:
-        raise exc_type()
-
-    monkeypatch.setattr(_Plain, "model_rebuild", interrupted)
-    with pytest.raises(exc_type):
-        _rebuild_model(_Plain, {})
-
-
 T_attrs = typing.TypeVar("T_attrs", bound=BaseModel)
 
 
@@ -310,10 +102,6 @@ class _GenericBase(h5t.Group[T_attrs], typing.Generic[T_attrs]):
 
 class _StrictSubclass(_GenericBase[_StrictAttrs]):
     pass
-
-
-def test_generic_group_subclass_compiles_typed_attrs(tmp_path: Path) -> None:
-    assert compiled(_StrictSubclass).attrs is not None
 
 
 def test_generic_group_subclass_enforces_attrs_extra_forbid(tmp_path: Path) -> None:
@@ -342,45 +130,6 @@ def test_generic_group_with_open_typevar_dataset_compiles_and_loads(tmp_path: Pa
     loaded = _OpenDatasetGeneric[_OpenDatasetAttrs].model_validate_hdf5(path)
     assert loaded.ds.shape == (3,)
     assert loaded.ds.attrs.answer == 2
-
-
-def test_unresolved_name_error_names_it_and_suggests_localns() -> None:
-    class Pending(h5t.Group):
-        child: _NeverResolved  # noqa: F821
-
-    with pytest.raises(h5t.SchemaError, match=r"'_NeverResolved'.*localns="):
-        Pending.model_validate_hdf5("never-opened.h5")
-
-
-def test_attrs_model_keeps_its_parent_namespace_after_compilation() -> None:
-    class Attrs(BaseModel):
-        value: int
-
-    class Holder(h5t.Group[Attrs]):
-        pass
-
-    assert Attrs.__pydantic_parent_namespace__ is not None
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"kind": MemberKind.GROUP}, "member_type"),
-        ({"kind": MemberKind.COLLECTION}, "item"),
-        ({"glob": re.compile("a")}, "glob"),
-        ({"member_type": int}, "member_type"),
-    ],
-)
-def test_field_spec_with_inconsistent_fields_is_rejected(
-    overrides: dict[str, Any], message: str
-) -> None:
-    fields: dict[str, Any] = {
-        "py_name": "x",
-        "h5_name": "x",
-        "kind": MemberKind.ARRAY,
-    }
-    with pytest.raises(ValueError, match=message):
-        FieldSpec(**{**fields, **overrides})
 
 
 def test_plain_array_fields_are_read_from_raw_datasets(tmp_path: Path) -> None:
@@ -421,3 +170,83 @@ def test_glob_filters_only_a_live_group_view(tmp_path: Path) -> None:
     with h5py.File(path, "r") as f:
         assert sorted(adapter.validate_python(_GroupView(f))) == ["a1", "a2"]
     assert sorted(adapter.validate_python({"a1": 1, "b1": 2})) == ["a1", "b1"]
+
+
+def test_explicit_namespace_rebuild_and_self_reference(tmp_path: Path) -> None:
+    def declare():
+        class Deferred(h5t.Group):
+            child: LocalDependency
+
+        return Deferred
+
+    deferred = declare()
+
+    class LocalDependency(h5t.Group):
+        child: LocalDependency | None = None
+        values: np.ndarray
+
+    deferred.model_rebuild(_types_namespace={"LocalDependency": LocalDependency})
+    path = tmp_path / "local.h5"
+    deferred(child=LocalDependency(values=np.arange(3))).model_dump_hdf5(path)
+    loaded = deferred.model_validate_hdf5(path)
+    assert loaded.child.child is None
+    np.testing.assert_array_equal(loaded.child.values, np.arange(3))
+
+
+def test_localns_keyword_is_removed() -> None:
+    with pytest.raises(TypeError):
+
+        class Invalid(h5t.Group, localns={}):
+            pass
+
+
+@pytest.mark.parametrize("collection", [False, True])
+def test_nested_invalid_declaration_precedes_file_access(
+    tmp_path: Path, collection: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Bad(h5t.Group):
+        value: int
+
+    annotation = dict[str, Bad] if collection else Bad
+
+    class Outer(h5t.Group):
+        child: annotation
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("declaration checking opened a file")
+
+    monkeypatch.setattr(h5py, "File", forbidden)
+    with pytest.raises(h5t.SchemaError, match="Bad.value"):
+        Outer.model_validate_hdf5(tmp_path / "absent.h5")
+    child = Bad(value=1)
+    value = Outer(child={"one": child} if collection else child)
+    with pytest.raises(h5t.SchemaError, match="Bad.value"):
+        value.model_dump_hdf5(tmp_path / "absent.h5")
+
+
+def test_ndarray_aliases_roundtrip(tmp_path: Path) -> None:
+    import numpy.typing as npt
+
+    class Arrays(h5t.Group):
+        data: npt.NDArray[np.float64]
+        optional: npt.NDArray[Any] | None = None
+
+    path = tmp_path / "aliases.h5"
+    Arrays(data=np.zeros(3)).model_dump_hdf5(path)
+    assert Arrays.model_validate_hdf5(path).data.shape == (3,)
+    assert Arrays.model_validate_hdf5(path).optional is None
+
+
+@pytest.mark.skipif(not hasattr(typing, "TypeAliasType"), reason="requires Python 3.12")
+def test_chained_pep695_array_aliases_roundtrip(tmp_path: Path) -> None:
+    import numpy.typing as npt
+
+    Coords = typing.TypeAliasType("Coords", npt.NDArray[np.float64])
+    Chained = typing.TypeAliasType("Chained", Coords)
+
+    class Arrays(h5t.Group):
+        data: Chained
+
+    path = tmp_path / "chained.h5"
+    Arrays(data=np.zeros(3)).model_dump_hdf5(path)
+    assert Arrays.model_validate_hdf5(path).data.shape == (3,)

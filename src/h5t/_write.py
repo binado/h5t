@@ -2,7 +2,7 @@
 
 Pydantic validated the `Group` when it was constructed (field types, jaxtyping shapes and
 dtypes, attribute models), so the writer does not check any of that again. Phase 1 (*plan*)
-walks the compiled spec over the instance and builds a tree of what to write, checking only
+walks runtime model fields on the instance and builds a tree of what to write, checking only
 what HDF5 itself imposes (child names, storable attribute values) and reading the data of
 every lazy `Dataset`. It never touches the target file. Phase 2 (*apply*) opens the file and
 writes the tree, rolling back what it wrote if anything fails.
@@ -19,12 +19,24 @@ from typing import Any, Literal
 
 import h5py
 import numpy as np
+from pydantic import BaseModel
 from pydantic_core import PydanticSerializationError
 
 from h5t._array import _DATA_NOT_LOADED, Dataset
-from h5t._compile import Group, _compiled_group, _filesystem_path, _normalize_root
+from h5t._compile import (
+    Group,
+    _check_attrs,
+    _check_group,
+    _extract_alias,
+    _extract_forbid_extras,
+    _field_glob,
+    _filesystem_path,
+    _normalize_root,
+    _resolve_group_attrs_type,
+    _split_annotation,
+)
 from h5t._errors import SchemaError, ValidationError
-from h5t._spec import AttrsSpec, FieldSpec, GroupSpec, MemberKind, attr_path, child_path
+from h5t._spec import attr_path, child_path
 
 
 @dataclasses.dataclass
@@ -66,9 +78,9 @@ def _check_storable(value: Any, path: str) -> None:
         )
 
 
-def _attr_values(attrs_spec: AttrsSpec | None, attrs_val: Any, path: str) -> Mapping[str, Any]:
+def _attr_values(attrs_val: Any, path: str) -> Mapping[str, Any]:
     """Return the attribute names and values to store, by their on-disk names."""
-    if attrs_spec is None:
+    if not isinstance(attrs_val, BaseModel):
         return typing.cast(Mapping[str, Any], attrs_val)
     # ``include`` limits the dump to declared fields, so computed fields are not stored.
     declared = set(type(attrs_val).model_fields)
@@ -82,16 +94,26 @@ def _attr_values(attrs_spec: AttrsSpec | None, attrs_val: Any, path: str) -> Map
 
 
 def _plan_attrs(
-    attrs_spec: AttrsSpec | None,
     attrs_val: Any,
     path: str,
     *,
     forbid_untyped_extras: bool = False,
 ) -> dict[str, Any]:
+    optional: set[str] = set()
+    if isinstance(attrs_val, BaseModel):
+        model = type(attrs_val)
+        _check_attrs(model)
+        for name, field in model.model_fields.items():
+            if _split_annotation(model, name, field.annotation)[2]:
+                optional.add(
+                    field.serialization_alias
+                    if field.serialization_alias is not None
+                    else _extract_alias(model, name, field)
+                )
     out: dict[str, Any] = {}
-    for raw_name, value in _attr_values(attrs_spec, attrs_val, path).items():
+    for raw_name, value in _attr_values(attrs_val, path).items():
         name = str(raw_name)
-        if value is None and attrs_spec is not None and name in attrs_spec.optional:
+        if value is None and name in optional:
             continue
         apath = attr_path(path, name)
         if forbid_untyped_extras:
@@ -116,28 +138,17 @@ def _materialize(dataset: Dataset[Any], path: str) -> np.ndarray:
         raise ValidationError(path, f"cannot read dataset data: {detail}") from exc
 
 
-def _plan_dataset(value: Dataset[Any], attrs_spec: AttrsSpec | None, path: str) -> _DatasetPlan:
-    attrs = _plan_attrs(attrs_spec, value.attrs, path)
-    return _DatasetPlan(data=_materialize(value, path), attrs=attrs)
-
-
-def _is_omitted(field: FieldSpec, value: Any) -> bool:
-    """Report whether ``value`` is an optional member left as ``None``."""
-    return value is None and field.optional
-
-
-def _plan_member(field: FieldSpec, value: Any, path: str) -> _GroupPlan | _DatasetPlan:
-    if field.kind is MemberKind.GROUP:
-        assert field.member_type is not None
-        group_cls = typing.cast("type[Group[Any]]", field.member_type)
-        return _plan_group(_compiled_group(group_cls), value, path)
-    if field.kind is MemberKind.DATASET:
-        return _plan_dataset(value, field.dataset_attrs, path)
+def _plan_member(value: Any, path: str) -> _GroupPlan | _DatasetPlan:
+    if isinstance(value, Group):
+        return _plan_group(value, path)
+    if isinstance(value, Dataset):
+        return _DatasetPlan(data=_materialize(value, path), attrs=_plan_attrs(value.attrs, path))
+    if isinstance(value, Mapping):
+        return _plan_collection(value, path)
     return _DatasetPlan(data=np.asarray(value), attrs={})
 
 
-def _plan_collection(field: FieldSpec, value: Mapping[str, Any], path: str) -> _GroupPlan:
-    assert field.item is not None
+def _plan_collection(value: Mapping[str, Any], path: str, pattern: Any = None) -> _GroupPlan:
     plan = _GroupPlan()
     for key, item in value.items():
         item_path = child_path(path, str(key))
@@ -145,30 +156,38 @@ def _plan_collection(field: FieldSpec, value: Mapping[str, Any], path: str) -> _
             raise ValidationError(
                 item_path, "collection key must be a non-empty str without '/' and not '.' or '..'"
             )
-        if field.glob is not None and field.glob.match(key) is None:
+        if pattern is not None and pattern.match(key) is None:
             raise ValidationError(item_path, "collection key does not match the field's Glob")
-        if not _is_omitted(field.item, item):
-            plan.children[key] = _plan_member(field.item, item, item_path)
+        plan.children[key] = _plan_member(item, item_path)
     return plan
 
 
-def _plan_group(spec: GroupSpec, group: Any, path: str) -> _GroupPlan:
+def _plan_group(group: Group[Any], path: str) -> _GroupPlan:
+    owner = type(group)
+    _check_group(owner)
     plan = _GroupPlan()
+    attrs = _read_field(owner, group, "attrs")
     plan.attrs = _plan_attrs(
-        spec.attrs,
-        _read_field(spec.group_type, group, "attrs"),
+        attrs,
         path,
-        forbid_untyped_extras=(spec.forbid_extras and spec.attrs is None),
+        forbid_untyped_extras=(
+            _extract_forbid_extras(owner, owner) and _resolve_group_attrs_type(owner) is None
+        ),
     )
-    for field in spec.fields:
-        member_path = child_path(path, field.h5_name)
-        raw_val = _read_field(spec.group_type, group, field.py_name)
-        if _is_omitted(field, raw_val):
+    for name, field in owner.model_fields.items():
+        if name == "attrs":
             continue
-        if field.kind is MemberKind.COLLECTION:
-            plan.children[field.h5_name] = _plan_collection(field, raw_val, member_path)
+        h5_name = _extract_alias(owner, name, field)
+        member_path = child_path(path, h5_name)
+        value = _read_field(owner, group, name)
+        if value is None and _split_annotation(owner, name, field.annotation)[2]:
+            continue
+        if isinstance(value, Mapping):
+            plan.children[h5_name] = _plan_collection(
+                value, member_path, _field_glob(owner, name, field)
+            )
         else:
-            plan.children[field.h5_name] = _plan_member(field, raw_val, member_path)
+            plan.children[h5_name] = _plan_member(value, member_path)
     return plan
 
 
@@ -310,9 +329,8 @@ def _dump_group(
 ) -> None:
     if mode not in ("w-", "x", "w", "a"):
         raise ValueError(f"mode must be 'w-', 'x', 'w' or 'a', got {mode!r}")
-    spec = _compiled_group(type(group))
     normalized_root = _normalize_root(root)
     filename = _filesystem_path(path)
 
-    plan = _plan_group(spec, group, normalized_root)
+    plan = _plan_group(group, normalized_root)
     _apply(filename, "w-" if mode == "x" else mode, normalized_root, plan, overwrite)

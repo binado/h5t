@@ -94,6 +94,8 @@ def test_invalid_group_attrs_type_argument_is_schema_error() -> None:
         class BadGroup(h5t.Group[OtherGroup]):
             pass
 
+        BadGroup.model_validate_hdf5("never-opened.h5")
+
 
 def test_in_memory_group_construction_validates_dataset_attrs() -> None:
     class Owner(h5t.Group):
@@ -199,4 +201,4 @@ def test_attrs_model_with_extra_allow_is_schema_error() -> None:
         declared: int
 
     with pytest.raises(h5t.SchemaError, match="ignore.*forbid"):
-        h5t.Group[OpenAttrs]
+        h5t.Group[OpenAttrs].model_validate_hdf5("never-opened.h5")

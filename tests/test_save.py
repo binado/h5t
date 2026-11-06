@@ -525,3 +525,94 @@ def test_dump_stores_declared_attrs_only_not_computed_fields(tmp_path: Path) -> 
     h5t.Group[Attrs](attrs=Attrs(n=2)).model_dump_hdf5(target)
     with h5py.File(target) as f:
         assert list(f.attrs) == ["n"]
+
+
+@pytest.mark.parametrize("collection", [False, True])
+def test_runtime_group_subclass_fields_are_written(tmp_path: Path, collection: bool) -> None:
+    class Base(h5t.Group):
+        values: np.ndarray
+
+    class Sub(Base):
+        extra_values: np.ndarray = Field(alias="extra-values")
+
+    annotation = dict[str, Base] if collection else Base
+
+    class Outer(h5t.Group):
+        child: annotation
+
+    child = Sub(values=np.arange(2), extra_values=np.arange(3))
+    value = Outer(child={"one": child} if collection else child)
+    path = tmp_path / "subclass.h5"
+    value.model_dump_hdf5(path)
+    with h5py.File(path) as file:
+        node = file["child/one" if collection else "child"]
+        np.testing.assert_array_equal(node["extra-values"][()], np.arange(3))
+
+
+def test_runtime_attrs_subclass_optional_alias_and_serializer(tmp_path: Path) -> None:
+    from pydantic import computed_field, field_serializer
+
+    class BaseAttrs(BaseModel):
+        version: int
+
+    class SubAttrs(BaseAttrs):
+        omitted: int | None = Field(default=None, serialization_alias="missing")
+        label: int = Field(serialization_alias="label-on-disk")
+
+        @field_serializer("label")
+        def label_string(self, value: int) -> str:
+            return f"v{value}"
+
+        @computed_field
+        @property
+        def derived(self) -> int:
+            return 1
+
+    class Owner(h5t.Group[BaseAttrs]):
+        dataset: h5t.Dataset[BaseAttrs]
+
+    attrs = SubAttrs(version=1, label=2)
+    value = Owner(attrs=attrs, dataset=h5t.Dataset[BaseAttrs](np.zeros(2), attrs))
+    path = tmp_path / "attrs-subclass.h5"
+    value.model_dump_hdf5(path)
+    with h5py.File(path) as file:
+        for node in (file, file["dataset"]):
+            assert dict(node.attrs) == {"version": 1, "label-on-disk": "v2"}
+
+
+def test_invalid_runtime_subclass_leaves_existing_file_unchanged(tmp_path: Path) -> None:
+    class Base(h5t.Group):
+        pass
+
+    class Bad(Base):
+        invalid: int
+
+    class Outer(h5t.Group):
+        child: Base
+
+    path = tmp_path / "existing.h5"
+    with h5py.File(path, "w") as file:
+        file["original"] = np.arange(3)
+    before = path.read_bytes()
+    with pytest.raises(h5t.SchemaError, match="Bad.invalid"):
+        Outer(child=Bad(invalid=1)).model_dump_hdf5(path, mode="w")
+    assert path.read_bytes() == before
+
+
+def test_invalid_runtime_attrs_leave_existing_file_unchanged(tmp_path: Path) -> None:
+    class BaseAttrs(BaseModel):
+        version: int
+
+    class BadAttrs(BaseAttrs):
+        first: int = Field(alias="same")
+        second: int = Field(alias="same")
+
+    class Owner(h5t.Group[BaseAttrs]):
+        pass
+
+    value = Owner(attrs=BadAttrs(version=1, same=2))
+    path = tmp_path / "unchanged.h5"
+    path.write_bytes(b"untouched")
+    with pytest.raises(h5t.SchemaError, match="duplicate HDF5 attribute"):
+        value.model_dump_hdf5(path, mode="w")
+    assert path.read_bytes() == b"untouched"
