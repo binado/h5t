@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import typing
 import weakref
 from collections.abc import Iterator, Mapping
@@ -240,7 +241,7 @@ class Dataset(Generic[T]):
     @property
     def size(self) -> int:
         """Total number of elements in the dataset."""
-        return int(np.prod(self.shape, dtype=np.intp))
+        return math.prod(self.shape)
 
     @property
     def nbytes(self) -> int:

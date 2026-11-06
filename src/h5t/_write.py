@@ -284,10 +284,8 @@ def _write_plan(group: h5py.Group, plan: _GroupPlan, path: str) -> None:
 
 
 def _clear(node: h5py.Group) -> None:
-    for name in list(node.keys()):
-        del node[name]
-    for name in list(node.attrs.keys()):
-        del node.attrs[name]
+    node.clear()
+    node.attrs.clear()
 
 
 @dataclasses.dataclass

@@ -17,7 +17,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 import h5t
-from h5t._compile import _rebuild_model
+from h5t._compile import _read_array, _rebuild_model
 from h5t._spec import FieldSpec, GroupSpec, MemberKind
 
 
@@ -381,22 +381,30 @@ def test_field_spec_with_inconsistent_fields_is_rejected(
         FieldSpec(**{**fields, **overrides})
 
 
-def test_plain_array_fields_get_one_reader_each() -> None:
-    from h5t._compile import _READ_ARRAY, _read_array
-
+def test_plain_array_fields_are_read_from_raw_datasets(tmp_path: Path) -> None:
     class Plain(h5t.Group):
         values: np.ndarray
         runs: Annotated[dict[str, np.ndarray], h5t.Glob("r*")]
 
-    fields = Plain.model_fields
-    assert [m for m in fields["values"].metadata if m is _READ_ARRAY] == [_READ_ARRAY]
-    assert "BeforeValidator" in repr(fields["runs"].annotation)
-
-    # Injection is idempotent: a subclass does not stack a second reader.
     class Sub(Plain):
         pass
 
-    assert sum(m is _READ_ARRAY for m in Sub.model_fields["values"].metadata) == 1
+    class Attrs(BaseModel):
+        n: int
+
+    class Generic(h5t.Group[Attrs]):
+        values: np.ndarray
+
+    path = tmp_path / "plain.h5"
+    with h5py.File(path, "w") as f:
+        f.attrs["n"] = 1
+        f["values"] = np.arange(3)
+        f.create_group("runs")["r1"] = np.ones(2)
+    for cls in (Plain, Sub, Generic):
+        loaded = cls.model_validate_hdf5(path)
+        assert isinstance(loaded.values, np.ndarray)
+        assert loaded.values.tolist() == [0, 1, 2]
+    assert isinstance(Plain.model_validate_hdf5(path).runs["r1"], np.ndarray)
     assert _read_array(np.zeros(2)).shape == (2,)
 
 

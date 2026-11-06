@@ -22,7 +22,6 @@ import numpy as np
 from jaxtyping import AbstractArray, jaxtyped
 from pydantic import (
     BaseModel,
-    BeforeValidator,
     ConfigDict,
     Field,
     GetCoreSchemaHandler,
@@ -45,7 +44,7 @@ from typing_extensions import TypeVar
 
 from h5t._array import Dataset, _is_mapping_type
 from h5t._errors import SchemaError, ValidationError
-from h5t._h5view import ATTRS_KEY, _ghost, _GroupView, _raw_attrs
+from h5t._h5view import ATTRS_KEY, _ghost, _GroupView
 from h5t._spec import (
     ArraySpec,
     AttrFieldSpec,
@@ -108,7 +107,7 @@ def _jaxtyping_pydantic_schema(
             reason = cls.__instancecheck_str__(_ghost(value))
             if reason:
                 raise ValidationError(value.name, reason)
-            return np.asarray(value[()])
+            return _read_array(value)
         # Attribute values arrive as Python scalars; a jaxtyping field wants an array.
         if reads_ndarray and isinstance(value, _SCALAR_TYPES):
             return np.asarray(value)
@@ -648,64 +647,20 @@ def _read_array(value: Any) -> Any:
     return value
 
 
-_READ_ARRAY = BeforeValidator(_read_array)
+def _with_array_readers(schema: Any) -> Any:
+    """Return ``schema`` with every ``np.ndarray`` instance check preceded by `_read_array`.
 
-
-def _with_item_reader(annotation: Any) -> Any | None:
-    """Return a ``dict[str, T]`` annotation whose items read h5py datasets, or ``None``."""
-    optional = False
-    inner = annotation
-    if typing.get_origin(inner) in (typing.Union, types.UnionType):
-        members = [arg for arg in typing.get_args(inner) if arg is not type(None)]
-        optional = len(members) != len(typing.get_args(inner))
-        inner = members[0]
-    origin, args = typing.get_origin(inner), typing.get_args(inner)
-    if origin is None or len(args) != 2:
-        return None
-    item = args[1]
-    if typing.get_origin(item) is Annotated and any(
-        m is _READ_ARRAY for m in typing.get_args(item)[1:]
-    ):
-        return None
-    rebuilt = origin[args[0], Annotated[item, _READ_ARRAY]]
-    return rebuilt | None if optional else rebuilt
-
-
-def _inject_readers(cls: type[Group[Any]], spec: GroupSpec) -> bool:
-    """Teach Pydantic to read raw HDF5 input for plain ``np.ndarray`` fields.
-
-    Plain ``np.ndarray`` fields (and collections of them) are ordinary Pydantic types that
-    know nothing about h5py, so they get a ``BeforeValidator`` appended after the model is
-    built. Returns whether the model needs a rebuild.
+    Pydantic knows ``np.ndarray`` only as an ``isinstance`` check, so a raw ``h5py.Dataset``
+    would be rejected. Rewriting those nodes where the schema is generated covers plain
+    arrays, collections of them and any other nesting, without touching the built model.
     """
-    fields = cls.model_fields
-    changed = False
-    for fspec in spec.fields:
-        field_info = fields.get(fspec.py_name)
-        if field_info is None:
-            continue
-        if fspec.kind is MemberKind.ARRAY and fspec.array is None:
-            if not any(m is _READ_ARRAY for m in field_info.metadata):
-                field_info.metadata = [*field_info.metadata, _READ_ARRAY]
-                changed = True
-        elif (
-            fspec.kind is MemberKind.COLLECTION
-            and fspec.item is not None
-            and fspec.item.kind is MemberKind.ARRAY
-            and fspec.item.array is None
-        ):
-            rebuilt = _with_item_reader(field_info.annotation)
-            if rebuilt is not None:
-                field_info.annotation = rebuilt
-                changed = True
-    return changed
-
-
-def _finish_group(cls: type[Group[Any]], spec: GroupSpec, namespace: dict[str, Any]) -> None:
-    """Inject h5py readers into a compiled group and rebuild its model once."""
-    if getattr(cls, "__pydantic_complete__", True) and _inject_readers(cls, spec):
-        _rebuild_model(cls, namespace, force=True)
-        cls.__pydantic_parent_namespace__ = None
+    if isinstance(schema, dict):
+        if schema.get("type") == "is-instance" and schema.get("cls") is np.ndarray:
+            return core_schema.no_info_before_validator_function(_read_array, schema)
+        return {key: _with_array_readers(value) for key, value in schema.items()}
+    if isinstance(schema, list):
+        return [_with_array_readers(item) for item in schema]
+    return schema
 
 
 def _group_namespace(cls: type, localns: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -733,7 +688,6 @@ def _ensure_group_compiled(cls: type[Group[Any]]) -> GroupSpec:
             f"in a function scope, declare the group with `localns={{...}}` as a class "
             f"keyword argument."
         )
-    _finish_group(cls, spec, _group_namespace(cls, localns))
     setattr(cls, "__h5t_group__", spec)  # noqa: B010
     return spec
 
@@ -768,7 +722,7 @@ def _short_pydantic_error(exc: PydanticValidationError) -> str:
     loc, message = _first_error_parts(exc)
     if not loc:
         return message
-    return f"{'.'.join(str(part) for part in loc)}: {message}"
+    return f"{_dotted(loc)}: {message}"
 
 
 def _validate_adapter(adapter: TypeAdapter[Any], value: Any, path: str) -> Any:
@@ -898,12 +852,6 @@ class _GroupMeta(ModelMetaclass):
 
         if is_generic_sub and group_base is not None:
             _resolve_group_attrs_type(cls, {})
-            origin = cls.__pydantic_generic_metadata__.get("origin")
-            if isinstance(origin, type) and origin is not group_base and issubclass(origin, Group):
-                # ``G[A]`` is rebuilt from ``G``'s annotations, so it needs its own readers.
-                # Anything unresolvable now is retried when the class is first loaded.
-                with contextlib.suppress(SchemaError, _UnresolvedAnnotation):
-                    _ensure_group_compiled(cls)
             return cls
 
         if not is_user_group:
@@ -921,7 +869,6 @@ class _GroupMeta(ModelMetaclass):
                 _rebuild_model(cls, caller_locals)
                 cls.__pydantic_parent_namespace__ = None
             spec = _compile_group_fields(cls, localns=caller_locals)
-            _finish_group(cls, spec, caller_locals)
         except _UnresolvedAnnotation:
             return cls
         except BaseException:
@@ -974,6 +921,12 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
 
     attrs: T = Field(default_factory=dict, validate_default=True, validation_alias=ATTRS_KEY)  # type: ignore[assignment]
 
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: Any, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        return _with_array_readers(handler(source))
+
     @field_validator("attrs", mode="wrap", check_fields=False)
     @classmethod
     def _h5t_attrs_scope(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
@@ -986,8 +939,10 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
     def _h5t_jaxtyping_scope(cls, values: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
         spec = _compiled_group(cls) if isinstance(values, _GroupView) else None
         if spec is not None and spec.attrs is None and spec.forbid_extras:
-            for name in _raw_attrs(values.node):
-                raise ValidationError(attr_path(values.node.name, name), "unexpected attribute")
+            name = next(iter(values.node.attrs), None)
+            if name is not None:
+                path = attr_path(values.node.name, str(name))
+                raise ValidationError(path, "unexpected attribute")
         with jaxtyped("context"):
             model = handler(values)
         if spec is not None and spec.attrs is None:
