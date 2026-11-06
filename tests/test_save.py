@@ -370,3 +370,58 @@ def test_no_fd_leak(tmp_path: Path) -> None:
         make_doc(fisher=np.ones((2, 3))).model_dump_hdf5(tmp_path / "bad.h5")
     Doc.model_validate_hdf5(tmp_path / "ok.h5")
     assert open_fd_count() == before
+
+
+class _Names(h5t.Group):
+    names: np.ndarray
+
+
+@pytest.fixture
+def unwritable_names() -> _Names:
+    """A valid plan whose apply phase fails: unicode arrays are not HDF5-writable."""
+    return _Names(names=np.array(["a", "b"]))
+
+
+@pytest.mark.parametrize("root", ["/", "/a/b"])
+def test_failed_overwrite_leaves_old_data_intact(
+    tmp_path: Path, root: str, unwritable_names: _Names
+) -> None:
+    target = tmp_path / "doc.h5"
+    _Names(names=np.arange(3)).model_dump_hdf5(target, root=root)
+    with h5py.File(target, "a") as f:
+        f[root].attrs["marker"] = "old"
+    with pytest.raises(h5t.ValidationError) as info:
+        unwritable_names.model_dump_hdf5(target, root=root, mode="a", overwrite=True)
+    assert info.value.path == f"{root.rstrip('/')}/names"
+    with h5py.File(target) as f:
+        assert list(f[root].keys()) == ["names"]
+        np.testing.assert_array_equal(f[root]["names"][()], np.arange(3))
+        assert f[root].attrs["marker"] == "old"
+
+
+def test_rollback_failure_is_attached_to_the_original_error(
+    tmp_path: Path, unwritable_names: _Names, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from h5t import _write
+
+    def broken_rollback(self: _write._Undo, file: h5py.File) -> None:
+        raise KeyError("cannot undo")
+
+    target = tmp_path / "doc.h5"
+    make_doc().model_dump_hdf5(target)
+    monkeypatch.setattr(_write._Undo, "rollback", broken_rollback)
+    with pytest.raises(h5t.ValidationError) as info:
+        unwritable_names.model_dump_hdf5(target, root="/a/b", mode="a")
+    assert any("rollback failed" in note for note in info.value.__notes__)
+
+
+def test_partial_file_removal_failure_is_attached_to_the_original_error(
+    tmp_path: Path, unwritable_names: _Names, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_remove(path: object) -> None:
+        raise PermissionError("read-only directory")
+
+    monkeypatch.setattr("os.remove", broken_remove)
+    with pytest.raises(h5t.ValidationError) as info:
+        unwritable_names.model_dump_hdf5(tmp_path / "doc.h5")
+    assert any("partially written file" in note for note in info.value.__notes__)

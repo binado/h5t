@@ -1118,7 +1118,10 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
 
         The group tree is fully planned and validated before the file is opened, so an
         invalid model never touches the target file. If writing fails midway, any
-        created groups or files are rolled back.
+        created groups or files are rolled back. With ``overwrite=True`` the new content
+        is written to a staging group first and swapped in only on success, so a failed
+        overwrite keeps the old content. A problem during rollback itself is attached to
+        the raised exception as a note.
 
         Parameters
         ----------

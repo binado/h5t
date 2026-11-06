@@ -8,10 +8,10 @@ back what it wrote if anything fails.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import os
 import typing
+import uuid
 from collections.abc import Mapping
 from enum import Enum
 from typing import Any, Literal
@@ -134,7 +134,7 @@ def _plan_attrs(
                 continue
             try:
                 serialized = field.save_adapter.dump_python(value, mode="python")
-            except (PydanticSerializationError, Exception) as exc:
+            except (PydanticSerializationError, TypeError) as exc:
                 cause = (
                     exc.__cause__
                     if isinstance(exc, PydanticSerializationError) and exc.__cause__
@@ -255,22 +255,33 @@ def _write_attrs(node: h5py.Group | h5py.Dataset, attrs: Mapping[str, Any], path
     for name, value in attrs.items():
         try:
             node.attrs[name] = value
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OSError) as exc:
             raise ValidationError(attr_path(path, name), f"cannot write attribute: {exc}") from exc
+
+
+def _write_children(group: h5py.Group, plan: _GroupPlan, path: str) -> None:
+    for name, child in plan.children.items():
+        cpath = child_path(path, name)
+        try:
+            if isinstance(child, _GroupPlan):
+                node = group.create_group(name)
+            else:
+                node = group.create_dataset(name, data=child.data)
+        except (TypeError, ValueError, OSError) as exc:
+            raise ValidationError(cpath, f"cannot write {_kind(child)}: {exc}") from exc
+        if isinstance(child, _GroupPlan):
+            _write_plan(node, child, cpath)
+        else:
+            _write_attrs(node, child.attrs, cpath)
+
+
+def _kind(plan: _GroupPlan | _DatasetPlan) -> str:
+    return "group" if isinstance(plan, _GroupPlan) else "dataset"
 
 
 def _write_plan(group: h5py.Group, plan: _GroupPlan, path: str) -> None:
     _write_attrs(group, plan.attrs, path)
-    for name, child in plan.children.items():
-        cpath = child_path(path, name)
-        if isinstance(child, _GroupPlan):
-            _write_plan(group.create_group(name), child, cpath)
-            continue
-        try:
-            dataset = group.create_dataset(name, data=child.data)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError(cpath, f"cannot write dataset: {exc}") from exc
-        _write_attrs(dataset, child.attrs, cpath)
+    _write_children(group, plan, path)
 
 
 def _clear(node: h5py.Group) -> None:
@@ -280,17 +291,19 @@ def _clear(node: h5py.Group) -> None:
         del node.attrs[name]
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class _Undo:
+    """What to remove if writing fails; filled in *before* the file is mutated."""
+
     delete: str | None = None
     clear: str | None = None
 
     def rollback(self, file: h5py.File) -> None:
-        with contextlib.suppress(Exception):
-            if self.delete is not None:
+        if self.delete is not None:
+            if self.delete in file:
                 del file[self.delete]
-            elif self.clear is not None:
-                _clear(typing.cast(h5py.Group, file[self.clear]))
+        elif self.clear is not None:
+            _clear(typing.cast(h5py.Group, file[self.clear]))
 
 
 def _first_missing(file: h5py.File, root: str) -> str:
@@ -302,7 +315,13 @@ def _first_missing(file: h5py.File, root: str) -> str:
     return root
 
 
-def _prepare_target(file: h5py.File, root: str, overwrite: bool) -> _Undo:
+def _prepare_target(file: h5py.File, root: str, overwrite: bool, undo: _Undo) -> bool:
+    """Make ``root`` writable; return whether its existing content must be replaced.
+
+    ``undo`` is updated before each mutation so a failure midway can still be rolled
+    back. Replacing existing content is *not* done here: `_replace_contents` swaps it in
+    only after the new content has been written successfully.
+    """
     try:
         node = file.get(root)
     except (TypeError, ValueError, KeyError) as exc:
@@ -313,14 +332,39 @@ def _prepare_target(file: h5py.File, root: str, overwrite: bool) -> _Undo:
         if len(node) or len(node.attrs):
             if not overwrite:
                 raise ValidationError(root, "group already exists and is not empty")
-            _clear(node)
-        return _Undo(clear=root)
-    first_missing = _first_missing(file, root)
+            return True
+        undo.clear = root
+        return False
+    undo.delete = _first_missing(file, root)
     try:
         file.require_group(root)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OSError) as exc:
         raise ValidationError(root, f"cannot create root: {exc}") from exc
-    return _Undo(delete=first_missing)
+    return False
+
+
+def _replace_contents(node: h5py.Group, plan: _GroupPlan, path: str) -> None:
+    """Replace ``node``'s content with ``plan`` without losing the old data on failure.
+
+    The children are written into a staging group first; only once that succeeded is the
+    old content removed and the staged children moved into place.
+    """
+    staging_name = f".h5t-staging-{uuid.uuid4().hex}"
+    staging = node.create_group(staging_name)
+    try:
+        _write_children(staging, plan, path)
+    except BaseException:
+        del node[staging_name]
+        raise
+    for name in list(node.keys()):
+        if name != staging_name:
+            del node[name]
+    for name in list(node.attrs.keys()):
+        del node.attrs[name]
+    _write_attrs(node, plan.attrs, path)
+    for name in list(staging.keys()):
+        node.move(f"{staging_name}/{name}", name)
+    del node[staging_name]
 
 
 def _apply(
@@ -332,19 +376,45 @@ def _apply(
 ) -> None:
     created_file = mode != "a" or not os.path.exists(filename)
     h5file = h5py.File(filename, mode)
-    ok = False
     undo = _Undo()
     try:
-        undo = _prepare_target(h5file, root, overwrite)
-        _write_plan(typing.cast(h5py.Group, h5file[root]), plan, root)
-        ok = True
+        try:
+            replace = _prepare_target(h5file, root, overwrite, undo)
+            target = typing.cast(h5py.Group, h5file[root])
+            if replace:
+                _replace_contents(target, plan, root)
+            else:
+                _write_plan(target, plan, root)
+        except BaseException as exc:
+            _roll_back(h5file, filename, undo, created_file, exc)
+            raise
     finally:
-        if not ok and not created_file:
-            undo.rollback(h5file)
         h5file.close()
-        if not ok and created_file:
-            with contextlib.suppress(OSError):
-                os.remove(filename)
+
+
+def _roll_back(
+    h5file: h5py.File,
+    filename: str,
+    undo: _Undo,
+    created_file: bool,
+    exc: BaseException,
+) -> None:
+    """Undo a failed write, attaching any rollback problem to ``exc`` as a note."""
+    if created_file:
+        h5file.close()
+        try:
+            os.remove(filename)
+        except OSError as remove_exc:
+            exc.add_note(
+                f"h5t: could not remove the partially written file {filename!r}: {remove_exc}"
+            )
+        return
+    try:
+        undo.rollback(h5file)
+    except (KeyError, OSError, ValueError) as rollback_exc:
+        exc.add_note(
+            f"h5t: rollback failed, {filename!r} may contain partially written data: {rollback_exc}"
+        )
 
 
 def _dump_group(
