@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import weakref
 from collections.abc import Callable
@@ -9,7 +10,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, GetCoreSchemaHandler, TypeAdapter
+from pydantic_core import core_schema
+
+from h5t._h5view import _GroupView
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,20 @@ class Glob:
     """
 
     pattern: str = "*"
+
+    def __get_pydantic_core_schema__(
+        self, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        pattern = self.pattern
+
+        def select(value: Any) -> Any:
+            # Only the live HDF5 view is filtered; an in-memory dict is left as given (the
+            # writer checks it against the pattern itself).
+            if isinstance(value, _GroupView):
+                return {name: value[name] for name in value if fnmatch.fnmatchcase(name, pattern)}
+            return value
+
+        return core_schema.no_info_before_validator_function(select, handler(source_type))
 
 
 class Extras(Enum):

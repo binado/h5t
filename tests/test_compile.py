@@ -382,3 +382,35 @@ def test_field_spec_with_inconsistent_fields_is_rejected(
     }
     with pytest.raises(ValueError, match=message):
         FieldSpec(**{**fields, **overrides})
+
+
+def test_plain_array_fields_get_one_reader_each() -> None:
+    from h5t._compile import _READ_ARRAY, _read_array
+
+    class Plain(h5t.Group):
+        values: np.ndarray
+        runs: Annotated[dict[str, np.ndarray], h5t.Glob("r*")]
+
+    fields = Plain.model_fields
+    assert [m for m in fields["values"].metadata if m is _READ_ARRAY] == [_READ_ARRAY]
+    assert "BeforeValidator" in repr(fields["runs"].annotation)
+
+    # Injection is idempotent: a subclass does not stack a second reader.
+    class Sub(Plain):
+        pass
+
+    assert sum(m is _READ_ARRAY for m in Sub.model_fields["values"].metadata) == 1
+    assert _read_array(np.zeros(2)).shape == (2,)
+
+
+def test_glob_filters_only_a_live_group_view(tmp_path: Path) -> None:
+    from h5t._h5view import _GroupView
+
+    path = tmp_path / "g.h5"
+    with h5py.File(path, "w") as f:
+        for name in ("a1", "a2", "b1"):
+            f[name] = np.zeros(1)
+    adapter = TypeAdapter(Annotated[dict[str, Any], h5t.Glob("a*")])
+    with h5py.File(path, "r") as f:
+        assert sorted(adapter.validate_python(_GroupView(f))) == ["a1", "a2"]
+    assert sorted(adapter.validate_python({"a1": 1, "b1": 2})) == ["a1", "b1"]
