@@ -37,6 +37,13 @@ def _is_mapping_type(tp: Any) -> bool:
     return False
 
 
+def _readonly(array: np.ndarray) -> np.ndarray:
+    """Return a read-only view, leaving the caller's own array untouched."""
+    view = array.view()
+    view.flags.writeable = False
+    return view
+
+
 class Dataset(Generic[T]):
     """A detached HDF5 dataset: metadata and typed attributes, with lazy array slicing.
 
@@ -134,7 +141,7 @@ class Dataset(Generic[T]):
         self.path = None
         self.shape = arr.shape
         self.dtype = arr.dtype
-        self._h5t_data: object = arr
+        self._h5t_data: object = _readonly(arr)
         attrs_type = self._h5t_attrs_type
         if attrs_type is not None:
             if isinstance(attrs, attrs_type):
@@ -149,6 +156,26 @@ class Dataset(Generic[T]):
             self.attrs = typing.cast(T, MappingProxyType(raw_map))
 
     @classmethod
+    def _build(
+        cls,
+        filename: str | None,
+        path: str | None,
+        shape: tuple[int, ...],
+        dtype: np.dtype[Any],
+        attrs: Any,
+        cached: object,
+    ) -> Self:
+        """Create an instance directly from its state (the one place that does so)."""
+        instance = object.__new__(cls)
+        instance.filename = filename
+        instance.path = path
+        instance.shape = shape
+        instance.dtype = dtype
+        instance.attrs = attrs
+        instance._h5t_data = cached
+        return instance
+
+    @classmethod
     def _from_hdf5(
         cls,
         filename: str,
@@ -159,14 +186,14 @@ class Dataset(Generic[T]):
         *,
         data: np.ndarray | None = None,
     ) -> Self:
-        instance = object.__new__(cls)
-        instance.filename = filename
-        instance.path = path
-        instance.shape = shape
-        instance.dtype = dtype
-        instance.attrs = attrs
-        instance._h5t_data = _DATA_NOT_LOADED if data is None else data
-        return instance
+        cached = _DATA_NOT_LOADED if data is None else _readonly(data)
+        return cls._build(filename, path, shape, dtype, attrs, cached)
+
+    def _clone_with(self, target_cls: type[Dataset[Any]], attrs: Any) -> Dataset[Any]:
+        """Copy this dataset's location and cached data into ``target_cls`` with ``attrs``."""
+        return target_cls._build(
+            self.filename, self.path, self.shape, self.dtype, attrs, self._h5t_data
+        )
 
     @property
     def ndim(self) -> int:
@@ -202,7 +229,7 @@ class Dataset(Generic[T]):
         """
         if self._h5t_data is _DATA_NOT_LOADED:
             with self.open() as dataset:
-                value = np.asarray(dataset[()])
+                value = _readonly(np.asarray(dataset[()]))
             self._h5t_data = value
         return typing.cast(np.ndarray, self._h5t_data)
 
@@ -254,12 +281,24 @@ class Dataset(Generic[T]):
         """
         if self.filename is None or self.path is None:
             raise ValidationError("<in-memory>", "dataset is not backed by an HDF5 file")
-        with h5py.File(self.filename, mode="r") as h5file:
+        try:
+            h5file = h5py.File(self.filename, mode="r")
+        except OSError as exc:
+            raise ValidationError(
+                self.path, f"cannot open the source file ({type(exc).__name__}): {exc}"
+            ) from exc
+        with h5file:
             node = h5file.get(self.path)
             if node is None:
                 raise ValidationError(self.path, "dataset no longer exists")
             if not isinstance(node, h5py.Dataset):
                 raise ValidationError(self.path, "expected a dataset, found a group")
+            if node.shape != self.shape or node.dtype != self.dtype:
+                raise ValidationError(
+                    self.path,
+                    f"dataset changed since it was loaded: recorded shape {self.shape} dtype "
+                    f"{self.dtype}, file has shape {node.shape} dtype {node.dtype}",
+                )
             yield node
 
     def __eq__(self, other: object) -> bool:
@@ -267,7 +306,10 @@ class Dataset(Generic[T]):
             return True
         if not isinstance(other, Dataset):
             return NotImplemented
-        return self.attrs == other.attrs and np.array_equal(self.data, other.data)
+        # Cheap metadata first: only equal-looking datasets pay for reading both arrays.
+        if self.shape != other.shape or self.dtype != other.dtype or self.attrs != other.attrs:
+            return False
+        return bool(np.array_equal(self.data, other.data))
 
     def __repr__(self) -> str:
         loc = f"path={self.path!r}, " if self.path is not None else ""
@@ -313,24 +355,10 @@ class Dataset(Generic[T]):
             if isinstance(value.attrs, attrs_type):
                 if isinstance(value, target_cls):
                     return value
-                clone = object.__new__(target_cls)
-                clone.filename = value.filename
-                clone.path = value.path
-                clone.shape = value.shape
-                clone.dtype = value.dtype
-                clone.attrs = value.attrs
-                clone._h5t_data = value._h5t_data
-                return clone
+                return value._clone_with(target_cls, value.attrs)
             if isinstance(value.attrs, Mapping):
                 validated_attrs = attrs_type.model_validate(dict(value.attrs))
-                clone = object.__new__(target_cls)
-                clone.filename = value.filename
-                clone.path = value.path
-                clone.shape = value.shape
-                clone.dtype = value.dtype
-                clone.attrs = typing.cast(Any, validated_attrs)
-                clone._h5t_data = value._h5t_data
-                return clone
+                return value._clone_with(target_cls, validated_attrs)
             raise PydanticCustomError(
                 "dataset_attrs",
                 "Expected {expected} for dataset attrs, got {actual}",

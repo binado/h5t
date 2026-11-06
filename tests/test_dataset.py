@@ -126,8 +126,9 @@ def test_deleted_source_preserves_snapshot_but_live_access_fails(result_file: Pa
     os.unlink(result_file)
     assert measurement.shape == (5,)
     assert measurement.attrs.unit == "m"
-    with pytest.raises(OSError):
+    with pytest.raises(h5t.ValidationError, match="cannot open the source file") as caught:
         measurement.read()
+    assert caught.value.path == "/measurement"
 
 
 @pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="requires POSIX descriptors")
@@ -183,3 +184,44 @@ def test_dataset_getitem_numpy_keys_match_ndarray_indexing(
     indexed_dataset: h5t.Dataset, key: object
 ) -> None:
     np.testing.assert_array_equal(indexed_dataset[key], np.arange(5)[key])
+
+
+def test_open_detects_shape_change_since_load(result_file: Path) -> None:
+    measurement = Result.model_validate_hdf5(result_file).measurement
+    with h5py.File(result_file, "a") as file:
+        del file["measurement"]
+        file.create_dataset("measurement", data=np.arange(7))
+    with pytest.raises(h5t.ValidationError, match="changed since it was loaded"):
+        measurement.read()
+
+
+def test_open_detects_dtype_change_since_load(result_file: Path) -> None:
+    measurement = Result.model_validate_hdf5(result_file).measurement
+    with h5py.File(result_file, "a") as file:
+        del file["measurement"]
+        file.create_dataset("measurement", data=np.arange(5.0))
+    with pytest.raises(h5t.ValidationError, match="changed since it was loaded"):
+        measurement.read()
+
+
+@pytest.mark.parametrize("access", [lambda ds: ds.data, lambda ds: ds[()], lambda ds: ds[:]])
+def test_full_reads_are_read_only(indexed_dataset: h5t.Dataset, access) -> None:
+    array = access(indexed_dataset)
+    assert not array.flags.writeable
+    with pytest.raises(ValueError, match="read-only"):
+        array[0] = 99
+
+
+def test_in_memory_dataset_does_not_freeze_the_callers_array() -> None:
+    source = np.arange(3)
+    dataset = h5t.Dataset(source)
+    assert not dataset.data.flags.writeable
+    assert source.flags.writeable
+
+
+def test_equality_compares_metadata_before_reading_data(result_file: Path) -> None:
+    measurement = Result.model_validate_hdf5(result_file).measurement
+    os.unlink(result_file)  # reading the data would now fail
+    assert measurement != h5t.Dataset(np.arange(6), MeasurementAttrs(unit="m"))
+    assert measurement != h5t.Dataset(np.arange(5.0), MeasurementAttrs(unit="m"))
+    assert measurement != h5t.Dataset(np.arange(5), MeasurementAttrs(unit="m", scale=2.0))

@@ -167,8 +167,9 @@ def _materialize(dataset: Dataset[Any], path: str) -> np.ndarray:
     try:
         with dataset.open() as h5ds:
             return np.asarray(h5ds[()])
-    except OSError as exc:
-        raise ValidationError(path, f"cannot read lazy payload: {exc}") from exc
+    except (ValidationError, OSError) as exc:
+        detail = exc.message if isinstance(exc, ValidationError) else str(exc)
+        raise ValidationError(path, f"cannot read dataset data: {detail}") from exc
 
 
 def _plan_dataset(
