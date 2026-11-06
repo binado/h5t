@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
 import h5py
 import numpy as np
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 import h5t
 
@@ -141,3 +142,22 @@ def test_group_attrs_missing_required_field_reports_attribute_path(attr_group_fi
     with pytest.raises(h5t.ValidationError, match="required attribute") as caught:
         _AttrGroup.model_validate_hdf5(attr_group_file)
     assert caught.value.path == "/@count"
+
+
+class _CountedAttrs(BaseModel):
+    n: Annotated[int, AfterValidator(lambda v: v + 1)]
+
+
+class _CountedGroup(h5t.Group[_CountedAttrs]):
+    pass
+
+
+def test_dump_attrs_with_non_idempotent_validator_does_not_revalidate(tmp_path: Path) -> None:
+    target = tmp_path / "counted.h5"
+    group = _CountedGroup(attrs=_CountedAttrs(n=1))
+    assert group.attrs.n == 2
+
+    group.model_dump_hdf5(target)
+
+    with h5py.File(target) as f:
+        assert f.attrs["n"] == 2

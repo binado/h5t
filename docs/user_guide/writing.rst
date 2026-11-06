@@ -36,7 +36,8 @@ Options
 ``root`` and ``overwrite``
     Missing intermediate groups are created. A ``root`` group that already has members or
     attributes raises :class:`h5t.ValidationError` unless ``overwrite=True``, which
-    replaces its contents (destructive, and not undone if the write then fails).
+    deletes its contents first and writes over them, as ``del group[name]`` does in h5py
+    (destructive, and not undone if the write then fails).
 
 Attribute serialization
 -----------------------

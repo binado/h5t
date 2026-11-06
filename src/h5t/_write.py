@@ -11,7 +11,6 @@ from __future__ import annotations
 import dataclasses
 import os
 import typing
-import uuid
 from collections.abc import Mapping
 from enum import Enum
 from typing import Any, Literal
@@ -127,13 +126,14 @@ def _plan_attrs(
                 if not isinstance(raw_val, np.ndarray):
                     raise ValidationError(apath, f"expected ndarray, got {type(raw_val).__name__}")
                 _check_array(field.array, raw_val, apath)
-                value = raw_val
             else:
-                value = _validate_adapter(field.save_adapter, raw_val, apath)
-            if value is None:
+                # Type check only: ``save_adapter`` carries no validators, so values the
+                # model already validated are not transformed a second time.
+                _validate_adapter(field.save_adapter, raw_val, apath)
+            if raw_val is None:
                 continue
             try:
-                serialized = field.save_adapter.dump_python(value, mode="python")
+                serialized = field.save_adapter.dump_python(raw_val, mode="python")
             except (PydanticSerializationError, TypeError) as exc:
                 cause = (
                     exc.__cause__
@@ -316,12 +316,12 @@ def _first_missing(file: h5py.File, root: str) -> str:
     return root
 
 
-def _prepare_target(file: h5py.File, root: str, overwrite: bool, undo: _Undo) -> bool:
-    """Make ``root`` writable; return whether its existing content must be replaced.
+def _prepare_target(file: h5py.File, root: str, overwrite: bool, undo: _Undo) -> None:
+    """Make ``root`` writable, clearing it first when ``overwrite`` is set.
 
     ``undo`` is updated before each mutation so a failure midway can still be rolled
-    back. Replacing existing content is *not* done here: `_replace_contents` swaps it in
-    only after the new content has been written successfully.
+    back. Like ``del group[name]`` in h5py, clearing existing content is destructive and
+    is not undone if the write then fails; rollback only empties the group again.
     """
     try:
         node = file.get(root)
@@ -330,42 +330,16 @@ def _prepare_target(file: h5py.File, root: str, overwrite: bool, undo: _Undo) ->
     if node is not None:
         if not isinstance(node, h5py.Group):
             raise ValidationError(root, "expected a group, found a dataset")
-        if len(node) or len(node.attrs):
-            if not overwrite:
-                raise ValidationError(root, "group already exists and is not empty")
-            return True
+        if (len(node) or len(node.attrs)) and not overwrite:
+            raise ValidationError(root, "group already exists and is not empty")
         undo.clear = root
-        return False
+        _clear(node)
+        return
     undo.delete = _first_missing(file, root)
     try:
         file.require_group(root)
     except (TypeError, ValueError, OSError) as exc:
         raise ValidationError(root, f"cannot create root: {exc}") from exc
-    return False
-
-
-def _replace_contents(node: h5py.Group, plan: _GroupPlan, path: str) -> None:
-    """Replace ``node``'s content with ``plan`` without losing the old data on failure.
-
-    The children are written into a staging group first; only once that succeeded is the
-    old content removed and the staged children moved into place.
-    """
-    staging_name = f".h5t-staging-{uuid.uuid4().hex}"
-    staging = node.create_group(staging_name)
-    try:
-        _write_children(staging, plan, path)
-    except BaseException:
-        del node[staging_name]
-        raise
-    for name in list(node.keys()):
-        if name != staging_name:
-            del node[name]
-    for name in list(node.attrs.keys()):
-        del node.attrs[name]
-    _write_attrs(node, plan.attrs, path)
-    for name in list(staging.keys()):
-        node.move(f"{staging_name}/{name}", name)
-    del node[staging_name]
 
 
 def _apply(
@@ -380,12 +354,8 @@ def _apply(
     undo = _Undo()
     try:
         try:
-            replace = _prepare_target(h5file, root, overwrite, undo)
-            target = typing.cast(h5py.Group, h5file[root])
-            if replace:
-                _replace_contents(target, plan, root)
-            else:
-                _write_plan(target, plan, root)
+            _prepare_target(h5file, root, overwrite, undo)
+            _write_plan(typing.cast(h5py.Group, h5file[root]), plan, root)
         except BaseException as exc:
             _roll_back(h5file, filename, undo, created_file, exc)
             raise

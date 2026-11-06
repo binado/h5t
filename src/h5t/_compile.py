@@ -23,15 +23,16 @@ import numpy as np
 from jaxtyping import AbstractArray, jaxtyped
 from pydantic import (
     BaseModel,
-    BeforeValidator,
     ConfigDict,
     Field,
     GetCoreSchemaHandler,
     ModelWrapValidatorHandler,
+    PlainSerializer,
     PydanticSchemaGenerationError,
     PydanticUndefinedAnnotation,
     PydanticUserError,
     TypeAdapter,
+    WrapSerializer,
     model_validator,
 )
 from pydantic import ValidationError as PydanticValidationError
@@ -382,7 +383,9 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
             adapter_ann = adapter_ann | None
         adapter = _build_adapter(model_type, py_name, adapter_ann)
 
-        save_meta = [m for m in all_meta if not isinstance(m, BeforeValidator)]
+        # Dump-time adapter: type check plus serializers only. Validators already ran when
+        # the attrs model was built and must not run again on every save.
+        save_meta = [m for m in all_meta if isinstance(m, (PlainSerializer, WrapSerializer))]
         save_ann: Any = Annotated[core, *save_meta] if save_meta else core
         if optional:
             save_ann = save_ann | None
@@ -1130,10 +1133,10 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
 
         The group tree is fully planned and validated before the file is opened, so an
         invalid model never touches the target file. If writing fails midway, any
-        created groups or files are rolled back. With ``overwrite=True`` the new content
-        is written to a staging group first and swapped in only on success, so a failed
-        overwrite keeps the old content. A problem during rollback itself is attached to
-        the raised exception as a note.
+        created groups or files are rolled back. ``overwrite=True`` deletes the existing
+        content of ``root`` before writing, as ``del group[name]`` does in h5py; the old
+        content is not restored if the write then fails. A problem during rollback itself
+        is attached to the raised exception as a note.
 
         Parameters
         ----------
@@ -1142,10 +1145,11 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
         root : str
             Absolute group path to write under; missing intermediate groups are created.
         mode : {"w-", "x", "w", "a"}
-            ``"w-"``/``"x"`` fail if the file exists, ``"w"`` truncates, ``"a"`` writes
-            into an existing file or creates one.
+            ``"w-"``/``"x"`` fail if the file exists, ``"w"`` truncates (the previous
+            file is discarded even if the write then fails), ``"a"`` writes into an
+            existing file or creates one.
         overwrite : bool
-            Allow replacing the contents of a non-empty ``root`` group.
+            Delete the contents of a non-empty ``root`` group and write over it.
 
         Raises
         ------

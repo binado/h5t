@@ -383,7 +383,7 @@ def unwritable_names() -> _Names:
 
 
 @pytest.mark.parametrize("root", ["/", "/a/b"])
-def test_failed_overwrite_leaves_old_data_intact(
+def test_failed_overwrite_is_destructive_like_h5py(
     tmp_path: Path, root: str, unwritable_names: _Names
 ) -> None:
     target = tmp_path / "doc.h5"
@@ -394,9 +394,8 @@ def test_failed_overwrite_leaves_old_data_intact(
         unwritable_names.model_dump_hdf5(target, root=root, mode="a", overwrite=True)
     assert info.value.path == f"{root.rstrip('/')}/names"
     with h5py.File(target) as f:
-        assert list(f[root].keys()) == ["names"]
-        np.testing.assert_array_equal(f[root]["names"][()], np.arange(3))
-        assert f[root].attrs["marker"] == "old"
+        assert list(f[root].keys()) == []
+        assert list(f[root].attrs) == []
 
 
 def test_rollback_failure_is_attached_to_the_original_error(
