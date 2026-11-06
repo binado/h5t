@@ -85,7 +85,7 @@ the original as an `ArraySpec`. `_check_array` calls the non-public `hint.__inst
 on a metadata-only candidate (a zero-stride `_ghost` array, or a `Dataset`), so no data is read.
 A guard test fails if jaxtyping drops that method. Dimension bindings are scoped per group:
 `Group`'s wrap validator opens one `jaxtyped("context")` for the children, and the `attrs` field
-has its own scope (`_ATTRS_SCOPE`) so attribute dims never bind with child dims; the writer
+has its own scope (`Group._h5t_attrs_scope`) so attribute dims never bind with child dims; the writer
 mirrors this. A jaxtyping `np.ndarray` field checks a `_ghost` of an `h5py.Dataset` *before*
 reading it; a `Dataset`-backed one builds the lazy `Dataset` and checks that.
 
@@ -105,7 +105,8 @@ raw `h5py.Dataset`, and the attributes under `ATTRS_KEY` (`"/attrs"`, not a lega
 Each *type* converts raw input itself:
 
 - `Dataset[T]` builds a lazy `Dataset` from an `h5py.Dataset` (typed attrs are validated in their
-  own jaxtyping scope; failures become `h5t.ValidationError("<path>@<attr>", ...)`).
+  own jaxtyping scope via `handler.generate_schema(attrs_type)`; failures flow out in `loc` and
+  are formatted by `_h5_error_path` as `<path>@<attr>`).
 - jaxtyping arrays: see above.
 - plain `np.ndarray` fields (and collections of them) get a `BeforeValidator(_read_array)`
   appended by `_inject_readers` after compilation, followed by one forced model rebuild

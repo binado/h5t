@@ -13,7 +13,7 @@ import sys
 import types
 import typing
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Annotated, Any, ClassVar, Generic, Literal, Self
 
@@ -34,20 +34,19 @@ from pydantic import (
     TypeAdapter,
     ValidatorFunctionWrapHandler,
     WrapSerializer,
-    WrapValidator,
+    field_validator,
     model_validator,
 )
 from pydantic import ValidationError as PydanticValidationError
 from pydantic._internal._model_construction import ModelMetaclass
 from pydantic.fields import FieldInfo
-from pydantic_core import PydanticCustomError, PydanticUndefined, core_schema
+from pydantic_core import PydanticCustomError, core_schema
 from typing_extensions import TypeVar
 
 from h5t._array import Dataset, _is_mapping_type
 from h5t._errors import SchemaError, ValidationError
 from h5t._h5view import ATTRS_KEY, _ghost, _GroupView, _raw_attrs
 from h5t._spec import (
-    _NO_DEFAULT,
     ArraySpec,
     AttrFieldSpec,
     AttrsSpec,
@@ -397,11 +396,6 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
         if _is_ndarray_annotation(core):
             core = np.ndarray
 
-        adapter_ann: Any = Annotated[core, *all_meta] if all_meta else core
-        if optional:
-            adapter_ann = adapter_ann | None
-        adapter = _build_adapter(model_type, py_name, adapter_ann)
-
         # Dump-time adapter: type check plus serializers only. Validators already ran when
         # the attrs model was built and must not run again on every save.
         save_meta = [m for m in all_meta if isinstance(m, (PlainSerializer, WrapSerializer))]
@@ -410,22 +404,12 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
             save_ann = save_ann | None
         save_adapter = _build_adapter(model_type, py_name, save_ann)
 
-        default: Any = _NO_DEFAULT
-        default_factory: Callable[[], Any] | None = None
-        if field_info.default is not PydanticUndefined:
-            default = field_info.default
-        elif field_info.default_factory is not None:
-            default_factory = field_info.default_factory  # type: ignore[assignment]
-
         attr_fields.append(
             AttrFieldSpec(
                 py_name=py_name,
                 h5_name=h5_name,
-                adapter=adapter,
                 save_adapter=save_adapter,
                 optional=optional,
-                default=default,
-                default_factory=default_factory,
                 array=array_spec,
             )
         )
@@ -444,34 +428,23 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
 # ---------------------------------------------------------------------------
 
 
-def _extract_alias_and_default(
+def _extract_alias(
     owner: type,
     py_name: str,
     metadata: list[Any],
     raw_default: Any,
-) -> tuple[str, Any, Callable[[], Any] | None]:
+) -> str:
     alias: str | None = None
-    default: Any = _NO_DEFAULT
-    default_factory: Callable[[], Any] | None = None
-
     field_infos = [m for m in metadata if isinstance(m, FieldInfo)]
     if isinstance(raw_default, FieldInfo):
         field_infos.append(raw_default)
-        if raw_default.default is not PydanticUndefined:
-            default = raw_default.default
-        elif raw_default.default_factory is not None:
-            default_factory = raw_default.default_factory  # type: ignore[assignment]
-    elif raw_default is not _NO_DEFAULT and raw_default is not PydanticUndefined:
-        default = raw_default
-
     for fi in field_infos:
         if fi.alias is not None:
             alias = fi.alias
-
     h5_name = alias if alias is not None else py_name
     if not isinstance(h5_name, str) or not h5_name:
         raise _schema_error(owner, py_name, "alias requires a non-empty string")
-    return h5_name, default, default_factory
+    return h5_name
 
 
 def _collection_item(owner: type, py_name: str, core: Any) -> FieldSpec:
@@ -494,7 +467,7 @@ def _collection_item(owner: type, py_name: str, core: Any) -> FieldSpec:
         raise _schema_error(owner, py_name, "Glob cannot annotate a collection item")
     if any(isinstance(m, FieldInfo) and m.alias is not None for m in item_metadata):
         raise _schema_error(owner, py_name, "alias cannot annotate a collection item")
-    item = _field_spec(owner, py_name, item_annotation, _NO_DEFAULT)
+    item = _field_spec(owner, py_name, item_annotation, None)
     if item.kind is MemberKind.COLLECTION:
         raise _schema_error(owner, py_name, "nested collections are not supported")
     return item
@@ -507,10 +480,10 @@ def _field_spec(
     raw_default: Any,
 ) -> FieldSpec:
     core, metadata, optional = _split_annotation(owner, py_name, annotation)
+    if isinstance(raw_default, FieldInfo):
+        metadata = [*metadata, *raw_default.metadata]
     glob_marker = _marker(metadata, Glob, owner, py_name)
-    h5_name, default, default_factory = _extract_alias_and_default(
-        owner, py_name, metadata, raw_default
-    )
+    h5_name = _extract_alias(owner, py_name, metadata, raw_default)
     if "/" in h5_name:
         raise _schema_error(owner, py_name, "a child alias cannot contain '/'")
 
@@ -586,8 +559,6 @@ def _field_spec(
         annotation=adapter_ann,
         adapter=adapter,
         optional=optional,
-        default=default,
-        default_factory=default_factory,
         member_type=member_type,
         dataset_attrs=dataset_attrs,
         array=array_spec,
@@ -646,8 +617,9 @@ def _compile_group_fields(
 ) -> GroupSpec:
     extras = _extract_extras(group_cls, group_cls)
 
-    annotations: dict[str, Any] = {}
-    raw_defaults: dict[str, Any] = {}
+    raw_fields: list[tuple[str, Any, Any]] = []
+    seen_py_names: dict[str, int] = {}
+    own_annotations: dict[str, Any] = {}
     for base in reversed(group_cls.__mro__):
         if base in (object, BaseModel, Generic, Group):
             continue
@@ -658,21 +630,30 @@ def _compile_group_fields(
         for field_name, field_annotation in base_annotations.items():
             if field_name.startswith("_") or typing.get_origin(field_annotation) is ClassVar:
                 continue
-            annotations[field_name] = field_annotation
-            if field_name in base.__dict__:
-                raw_defaults[field_name] = base.__dict__[field_name]
-            else:
-                base_fields = getattr(base, "model_fields", None)
-                if base_fields is not None and field_name in base_fields:
-                    raw_defaults[field_name] = base_fields[field_name]
+            own_annotations[field_name] = field_annotation
 
-    attrs_spec = _resolve_group_attrs_type(group_cls, annotations)
-    annotations.pop("attrs", None)
+    attrs_spec = _resolve_group_attrs_type(group_cls, own_annotations)
+    own_annotations.pop("attrs", None)
+
+    if getattr(group_cls, "__pydantic_complete__", False):
+        for field_name, field_info in group_cls.model_fields.items():
+            if field_name == "attrs":
+                continue
+            raw_fields.append((field_name, field_info.annotation, field_info))
+    else:
+        for field_name, field_annotation in own_annotations.items():
+            raw_default = group_cls.__dict__.get(field_name)
+            idx = seen_py_names.get(field_name)
+            entry = (field_name, field_annotation, raw_default)
+            if idx is None:
+                seen_py_names[field_name] = len(raw_fields)
+                raw_fields.append(entry)
+            else:
+                raw_fields[idx] = entry
 
     fields: dict[str, FieldSpec] = {}
     seen_h5_names: dict[str, str] = {}
-    for field_name, field_annotation in annotations.items():
-        raw_default = raw_defaults.get(field_name, _NO_DEFAULT)
+    for field_name, field_annotation, raw_default in raw_fields:
         fspec = _field_spec(group_cls, field_name, field_annotation, raw_default)
         if fspec.h5_name in seen_h5_names:
             raise SchemaError(
@@ -716,15 +697,6 @@ def _read_array(value: Any) -> Any:
 _READ_ARRAY = BeforeValidator(_read_array)
 
 
-def _attrs_scope(value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
-    # Attribute dims must not bind together with the dims of the group's children.
-    with jaxtyped("context"):
-        return handler(value)
-
-
-_ATTRS_SCOPE = WrapValidator(_attrs_scope)
-
-
 def _with_item_reader(annotation: Any) -> Any | None:
     """Return a ``dict[str, T]`` annotation whose items read h5py datasets, or ``None``."""
     optional = False
@@ -746,22 +718,14 @@ def _with_item_reader(annotation: Any) -> Any | None:
 
 
 def _inject_readers(cls: type[Group[Any]], spec: GroupSpec) -> bool:
-    """Teach Pydantic to read raw HDF5 input for the fields it cannot read by itself.
+    """Teach Pydantic to read raw HDF5 input for plain ``np.ndarray`` fields.
 
     Plain ``np.ndarray`` fields (and collections of them) are ordinary Pydantic types that
     know nothing about h5py, so they get a ``BeforeValidator`` appended after the model is
-    built. ``attrs`` is looked up under `ATTRS_KEY` when validating. Returns whether the
-    model needs a rebuild.
+    built. Returns whether the model needs a rebuild.
     """
     fields = cls.model_fields
     changed = False
-    attrs_field = fields.get("attrs")
-    if attrs_field is not None and attrs_field.validation_alias != ATTRS_KEY:
-        attrs_field.validation_alias = ATTRS_KEY
-        changed = True
-    if attrs_field is not None and not any(m is _ATTRS_SCOPE for m in attrs_field.metadata):
-        attrs_field.metadata = [*attrs_field.metadata, _ATTRS_SCOPE]
-        changed = True
     for fspec in spec.fields:
         field_info = fields.get(fspec.py_name)
         if field_info is None:
@@ -804,17 +768,17 @@ def _ensure_group_compiled(cls: type[Group[Any]]) -> GroupSpec:
     if isinstance(marker, GroupSpec):
         return marker
     localns = marker.localns if isinstance(marker, _PendingGroup) else None
-    spec = _compile_group_fields(cls, localns=localns)
     if not getattr(cls, "__pydantic_complete__", True):
         _rebuild_model(cls, _group_namespace(cls, localns))
-        if not getattr(cls, "__pydantic_complete__", True):
-            raise SchemaError(
-                f"{cls.__name__}: the Pydantic model is still incomplete after resolving "
-                f"annotations; a forward reference could not be resolved. If it is defined "
-                f"in a function scope, declare the group with `localns={{...}}` as a class "
-                f"keyword argument."
-            )
         cls.__pydantic_parent_namespace__ = None
+    spec = _compile_group_fields(cls, localns=localns)
+    if not getattr(cls, "__pydantic_complete__", True):
+        raise SchemaError(
+            f"{cls.__name__}: the Pydantic model is still incomplete after resolving "
+            f"annotations; a forward reference could not be resolved. If it is defined "
+            f"in a function scope, declare the group with `localns={{...}}` as a class "
+            f"keyword argument."
+        )
     _finish_group(cls, spec, _group_namespace(cls, localns))
     setattr(cls, "__h5t_group__", spec)  # noqa: B010
     return spec
@@ -859,9 +823,10 @@ def _h5_error_path(spec: GroupSpec, root: str, loc: tuple[Any, ...]) -> tuple[st
 
     Walks ``loc`` down the compiled specs: a field alias becomes a child path, `ATTRS_KEY`
     followed by a name becomes an attribute path, and a collection key becomes the item's
-    path. Whatever cannot be placed (a field inside a dataset's attributes, an index into an
-    array, ...) is returned as a dotted remainder for the message. A name no field claims
-    is an undeclared child, so it is reported at that child.
+    path. For a typed `Dataset[T]`, a field name on ``T`` becomes ``/dataset@attr``.
+    Whatever cannot be placed (an index into an array, a nested dict key inside an
+    attribute, ...) is returned as a dotted remainder for the message. A name no field
+    claims is an undeclared child, so it is reported at that child.
     """
     path = root
     current: GroupSpec | None = spec
@@ -885,6 +850,10 @@ def _h5_error_path(spec: GroupSpec, root: str, loc: tuple[Any, ...]) -> tuple[st
             member = field.item
         if member.kind is MemberKind.GROUP and member.member_type is not None:
             current = _compiled_group(typing.cast("type[Group[Any]]", member.member_type))
+        elif (
+            member.kind is MemberKind.DATASET and member.dataset_attrs is not None and i < len(loc)
+        ):
+            return attr_path(path, str(loc[i])), _dotted(loc[i + 1 :])
     return path, _dotted(loc[i:])
 
 
@@ -992,10 +961,10 @@ class _GroupMeta(ModelMetaclass):
         pending = _PendingGroup(localns=localns)
         setattr(cls, "__h5t_group__", pending)  # noqa: B010
         try:
-            spec = _compile_group_fields(cls, localns=caller_locals)
             if not getattr(cls, "__pydantic_complete__", True):
                 _rebuild_model(cls, caller_locals)
                 cls.__pydantic_parent_namespace__ = None
+            spec = _compile_group_fields(cls, localns=caller_locals)
             _finish_group(cls, spec, caller_locals)
         except _UnresolvedAnnotation:
             return cls
@@ -1048,6 +1017,13 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
     )
 
     attrs: T = Field(default_factory=dict, validate_default=True, validation_alias=ATTRS_KEY)  # type: ignore[assignment]
+
+    @field_validator("attrs", mode="wrap", check_fields=False)
+    @classmethod
+    def _h5t_attrs_scope(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
+        # Attribute dims must not bind together with the dims of the group's children.
+        with jaxtyped("context"):
+            return handler(value)
 
     @model_validator(mode="wrap")
     @classmethod

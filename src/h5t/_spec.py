@@ -5,7 +5,6 @@ from __future__ import annotations
 import fnmatch
 import re
 import weakref
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -70,9 +69,6 @@ class MemberKind(Enum):
     COLLECTION = "collection"
 
 
-_NO_DEFAULT = object()
-
-
 @dataclass(frozen=True)
 class ArraySpec:
     """A jaxtyping array annotation, kept whole so jaxtyping does the checking.
@@ -90,26 +86,18 @@ class ArraySpec:
 
 @dataclass(frozen=True)
 class AttrFieldSpec:
-    """Compiled loading instructions for one field of a `BaseModel` attributes schema."""
+    """Compiled instructions for one field of a `BaseModel` attributes schema."""
 
     py_name: str
     h5_name: str
-    adapter: TypeAdapter[Any] = field(compare=False, repr=False)
     save_adapter: TypeAdapter[Any] = field(compare=False, repr=False)
     optional: bool = False
-    default: Any = _NO_DEFAULT
-    default_factory: Callable[[], Any] | None = None
     array: ArraySpec | None = None
-
-    @property
-    def has_default(self) -> bool:
-        """Whether the field declared a default value."""
-        return self.default is not _NO_DEFAULT
 
 
 @dataclass(frozen=True)
 class AttrsSpec:
-    """Compiled loading instructions for a `BaseModel` attributes schema ``T``."""
+    """Compiled instructions for a `BaseModel` attributes schema ``T``."""
 
     model_type_ref: weakref.ReferenceType[type[BaseModel]] = field(compare=False, repr=False)
     fields: tuple[AttrFieldSpec, ...] = ()
@@ -126,7 +114,7 @@ class AttrsSpec:
 
 @dataclass(frozen=True)
 class FieldSpec:
-    """The compiled loading instructions for one child field of a `Group`."""
+    """The compiled instructions for one child field of a `Group`."""
 
     py_name: str
     h5_name: str
@@ -134,8 +122,6 @@ class FieldSpec:
     annotation: Any
     adapter: TypeAdapter[Any] = field(compare=False, repr=False)
     optional: bool = False
-    default: Any = _NO_DEFAULT
-    default_factory: Callable[[], Any] | None = None
     member_type: type | None = None
     dataset_attrs: AttrsSpec | None = None
     array: ArraySpec | None = None
@@ -149,10 +135,6 @@ class FieldSpec:
         problems = [
             message
             for broken, message in (
-                (
-                    self.has_default and self.default_factory is not None,
-                    "has both a default and a default_factory",
-                ),
                 (
                     is_member != (self.member_type is not None),
                     "member_type must be set exactly for GROUP and DATASET fields",
@@ -179,11 +161,6 @@ class FieldSpec:
         ]
         if problems:
             raise ValueError(f"invalid FieldSpec {self.py_name!r}: {'; '.join(problems)}")
-
-    @property
-    def has_default(self) -> bool:
-        """Whether the class body supplied a default."""
-        return self.default is not _NO_DEFAULT
 
 
 @dataclass(frozen=True)

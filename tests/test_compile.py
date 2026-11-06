@@ -363,7 +363,6 @@ def test_attrs_model_keeps_its_parent_namespace_after_compilation() -> None:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"default": 1, "default_factory": int}, "default_factory"),
         ({"kind": MemberKind.GROUP}, "member_type"),
         ({"kind": MemberKind.COLLECTION}, "item"),
         ({"glob": re.compile("a")}, "glob"),

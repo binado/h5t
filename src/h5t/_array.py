@@ -12,8 +12,7 @@ from typing import Any, ClassVar, Generic, Self
 import h5py
 import numpy as np
 from jaxtyping import jaxtyped
-from pydantic import BaseModel, GetCoreSchemaHandler
-from pydantic import ValidationError as PydanticValidationError
+from pydantic import BaseModel, GetCoreSchemaHandler, ValidatorFunctionWrapHandler
 from pydantic_core import PydanticCustomError, core_schema
 from typing_extensions import TypeVar
 
@@ -45,23 +44,6 @@ def _readonly(array: np.ndarray) -> np.ndarray:
     view = array.view()
     view.flags.writeable = False
     return view
-
-
-def _validate_node_attrs(attrs_type: type[BaseModel], node: h5py.Dataset) -> BaseModel:
-    """Validate ``node``'s attributes as ``attrs_type``, reporting failures at the attribute."""
-    try:
-        # Its own jaxtyping scope: attribute dims must not bind with other fields' dims.
-        with jaxtyped("context"):
-            return attrs_type.model_validate(_normalized_attrs(node))
-    except PydanticValidationError as exc:
-        errors = exc.errors(include_url=False, include_context=False, include_input=False)
-        if not errors:
-            raise ValidationError(node.name, str(exc).splitlines()[0]) from exc
-        loc, msg = tuple(errors[0].get("loc", ())), str(errors[0].get("msg", "invalid value"))
-        if not loc:
-            raise ValidationError(node.name, msg) from exc
-        rest = ".".join(str(part) for part in loc[1:])
-        raise ValidationError(f"{node.name}@{loc[0]}", f"{rest}: {msg}" if rest else msg) from exc
 
 
 class Dataset(Generic[T]):
@@ -404,30 +386,29 @@ class Dataset(Generic[T]):
             if args and isinstance(args[0], type) and issubclass(args[0], BaseModel):
                 attrs_type = args[0]
 
-        def from_node(node: h5py.Dataset) -> Dataset[Any]:
-            """Build a lazy dataset from an open node; no array data is read."""
-            if attrs_type is None:
-                attrs: Any = MappingProxyType(_raw_attrs(node))
-                target_cls: type[Dataset[Any]] = cls
-            else:
-                target_cls = cls if cls._h5t_attrs_type is not None else cls[attrs_type]
-                attrs = _validate_node_attrs(attrs_type, node)
-            return target_cls._from_hdf5(
-                node.file.filename, node.name, tuple(node.shape), np.dtype(node.dtype), attrs
-            )
+        target_cls: type[Dataset[Any]] = (
+            cls if attrs_type is None or cls._h5t_attrs_type is not None else cls[attrs_type]
+        )
 
-        def validate_dataset(value: Any) -> Dataset[Any]:
-            if isinstance(value, h5py.Dataset):
-                return from_node(value)
-            if isinstance(value, _GroupView):
-                raise PydanticCustomError("dataset_type", "expected a dataset, found a group")
-            if not isinstance(value, Dataset):
-                raise PydanticCustomError(
-                    "dataset_type",
-                    "Input should be an instance of Dataset, got {actual}",
-                    {"actual": type(value).__name__},
-                )
-            if cls._h5t_attrs_type is None and attrs_type is None:
+        if attrs_type is None:
+
+            def validate_untyped(value: Any) -> Dataset[Any]:
+                if isinstance(value, h5py.Dataset):
+                    return target_cls._from_hdf5(
+                        value.file.filename,
+                        value.name,
+                        tuple(value.shape),
+                        np.dtype(value.dtype),
+                        MappingProxyType(_raw_attrs(value)),
+                    )
+                if isinstance(value, _GroupView):
+                    raise PydanticCustomError("dataset_type", "expected a dataset, found a group")
+                if not isinstance(value, Dataset):
+                    raise PydanticCustomError(
+                        "dataset_type",
+                        "Input should be an instance of Dataset, got {actual}",
+                        {"actual": type(value).__name__},
+                    )
                 if not isinstance(value, cls):
                     raise PydanticCustomError(
                         "dataset_type",
@@ -442,14 +423,38 @@ class Dataset(Generic[T]):
                     )
                 return value
 
-            assert attrs_type is not None
-            target_cls = cls if cls._h5t_attrs_type is not None else cls[attrs_type]
+            return core_schema.no_info_plain_validator_function(validate_untyped)
+
+        attrs_schema = handler.generate_schema(attrs_type)
+
+        def validate_typed(
+            value: Any, validate_attrs: ValidatorFunctionWrapHandler
+        ) -> Dataset[Any]:
+            if isinstance(value, h5py.Dataset):
+                with jaxtyped("context"):
+                    attrs = validate_attrs(_normalized_attrs(value))
+                return target_cls._from_hdf5(
+                    value.file.filename,
+                    value.name,
+                    tuple(value.shape),
+                    np.dtype(value.dtype),
+                    attrs,
+                )
+            if isinstance(value, _GroupView):
+                raise PydanticCustomError("dataset_type", "expected a dataset, found a group")
+            if not isinstance(value, Dataset):
+                raise PydanticCustomError(
+                    "dataset_type",
+                    "Input should be an instance of Dataset, got {actual}",
+                    {"actual": type(value).__name__},
+                )
             if isinstance(value.attrs, attrs_type):
                 if isinstance(value, target_cls):
                     return value
                 return value._clone_with(target_cls, value.attrs)
             if isinstance(value.attrs, Mapping):
-                validated_attrs = attrs_type.model_validate(dict(value.attrs))
+                with jaxtyped("context"):
+                    validated_attrs = validate_attrs(dict(value.attrs))
                 return value._clone_with(target_cls, validated_attrs)
             raise PydanticCustomError(
                 "dataset_attrs",
@@ -457,4 +462,4 @@ class Dataset(Generic[T]):
                 {"expected": attrs_type.__name__, "actual": type(value.attrs).__name__},
             )
 
-        return core_schema.no_info_plain_validator_function(validate_dataset)
+        return core_schema.no_info_wrap_validator_function(validate_typed, attrs_schema)
