@@ -53,13 +53,6 @@ class Glob:
         return core_schema.no_info_before_validator_function(select, handler(source_type))
 
 
-class Extras(Enum):
-    """Policy for undeclared immediate HDF5 members or attributes."""
-
-    IGNORE = "ignore"
-    FORBID = "forbid"
-
-
 class MemberKind(Enum):
     """How a declared child field on a `Group` is represented in HDF5."""
 
@@ -101,7 +94,7 @@ class AttrsSpec:
 
     model_type_ref: weakref.ReferenceType[type[BaseModel]] = field(compare=False, repr=False)
     fields: tuple[AttrFieldSpec, ...] = ()
-    extras: Extras = Extras.IGNORE
+    forbid_extras: bool = False
 
     @property
     def model_type(self) -> type[BaseModel]:
@@ -119,8 +112,6 @@ class FieldSpec:
     py_name: str
     h5_name: str
     kind: MemberKind
-    annotation: Any
-    adapter: TypeAdapter[Any] = field(compare=False, repr=False)
     optional: bool = False
     member_type: type | None = None
     dataset_attrs: AttrsSpec | None = None
@@ -170,7 +161,7 @@ class GroupSpec:
     group_type: type[BaseModel]
     attrs: AttrsSpec | None
     fields: tuple[FieldSpec, ...] = ()
-    extras: Extras = Extras.IGNORE
+    forbid_extras: bool = False
 
 
 def child_path(parent: str, name: str) -> str:

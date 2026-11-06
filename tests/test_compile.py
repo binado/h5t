@@ -91,7 +91,7 @@ def test_pep695_aliases_of_ndarray_classify_as_arrays() -> None:
     fields = field_map(Aliased)
     assert fields["direct"].kind is MemberKind.ARRAY
     assert fields["chained"].kind is MemberKind.ARRAY
-    assert fields["direct"].annotation is np.ndarray
+    assert fields["direct"].optional is False
 
 
 def test_a_resolvable_group_compiles_at_class_definition() -> None:
@@ -376,8 +376,6 @@ def test_field_spec_with_inconsistent_fields_is_rejected(
         "py_name": "x",
         "h5_name": "x",
         "kind": MemberKind.ARRAY,
-        "annotation": int,
-        "adapter": TypeAdapter(int),
     }
     with pytest.raises(ValueError, match=message):
         FieldSpec(**{**fields, **overrides})

@@ -50,7 +50,6 @@ from h5t._spec import (
     ArraySpec,
     AttrFieldSpec,
     AttrsSpec,
-    Extras,
     FieldSpec,
     Glob,
     GroupSpec,
@@ -73,14 +72,18 @@ def _schema_error(owner: type, field: str, message: str) -> SchemaError:
 # ---------------------------------------------------------------------------
 
 
+def _is_supported_array_type(array_type: Any) -> bool:
+    """Report whether jaxtyping may back an array with ``array_type``."""
+    return array_type is np.ndarray or (
+        isinstance(array_type, type) and issubclass(array_type, Dataset)
+    )
+
+
 def _jaxtyping_pydantic_schema(
     cls: type[AbstractArray], source_type: Any, handler: GetCoreSchemaHandler
 ) -> core_schema.CoreSchema:
     array_type = cls.array_type
-    if not (
-        array_type is np.ndarray
-        or (isinstance(array_type, type) and issubclass(array_type, Dataset))
-    ):
+    if not _is_supported_array_type(array_type):
         raise SchemaError(
             f"jaxtyping array type {array_type!r} is not supported; use np.ndarray or Dataset"
         )
@@ -178,24 +181,16 @@ def _resolved_annotations(cls: type, localns: Mapping[str, Any] | None = None) -
             import annotationlib
 
             raw = annotationlib.get_annotations(cls, format=annotationlib.Format.VALUE)
-            module = sys.modules.get(cls.__module__)
-            globalns = vars(module) if module is not None else {}
-            return {
-                name: eval(compile(value, _ANNOTATION_FILE, "eval"), globalns, namespace)
-                if isinstance(value, str)
-                else value
-                for name, value in raw.items()
-            }
-        own = inspect.get_annotations(cls)
+        else:
+            raw = inspect.get_annotations(cls)
         module = sys.modules.get(cls.__module__)
         globalns = vars(module) if module is not None else {}
-        resolved: dict[str, Any] = {}
-        for name, value in own.items():
-            if isinstance(value, str):
-                resolved[name] = eval(compile(value, _ANNOTATION_FILE, "eval"), globalns, namespace)
-            else:
-                resolved[name] = value
-        return resolved
+        return {
+            name: eval(compile(value, _ANNOTATION_FILE, "eval"), globalns, namespace)
+            if isinstance(value, str)
+            else value
+            for name, value in raw.items()
+        }
     except Exception as exc:
         raise _annotation_failure(cls, exc) from exc
 
@@ -267,10 +262,7 @@ def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> tuple[Any, ArrayS
     if not (isinstance(core, type) and issubclass(core, AbstractArray)):
         return core, None
     array_type = core.array_type
-    if not (
-        array_type is np.ndarray
-        or (isinstance(array_type, type) and issubclass(array_type, Dataset))
-    ):
+    if not _is_supported_array_type(array_type):
         raise _schema_error(
             owner,
             py_name,
@@ -308,31 +300,6 @@ def _build_adapter(owner: type, py_name: str, annotation: Any) -> TypeAdapter[An
         raise _schema_error(owner, py_name, f"cannot construct a validator: {exc}") from exc
 
 
-class _IsInstance:
-    __slots__ = ("optional", "target_type")
-
-    def __init__(self, target_type: type, optional: bool) -> None:
-        self.target_type = target_type
-        self.optional = optional
-
-    def __get_pydantic_core_schema__(
-        self, source_type: Any, handler: GetCoreSchemaHandler
-    ) -> core_schema.CoreSchema:
-        schema = core_schema.is_instance_schema(self.target_type)
-        if self.optional:
-            return core_schema.nullable_schema(schema)
-        return schema
-
-
-def _build_instance_adapter(
-    owner: type, py_name: str, target_type: type, optional: bool
-) -> TypeAdapter[Any]:
-    try:
-        return TypeAdapter(_IsInstance(target_type, optional))
-    except Exception as exc:
-        raise _schema_error(owner, py_name, f"cannot construct a validator: {exc}") from exc
-
-
 # ---------------------------------------------------------------------------
 # AttrsSpec compilation (for T in Group[T] and Dataset[T])
 # ---------------------------------------------------------------------------
@@ -340,12 +307,12 @@ def _build_instance_adapter(
 _ATTRS_CACHE: weakref.WeakKeyDictionary[type[BaseModel], AttrsSpec] = weakref.WeakKeyDictionary()
 
 
-def _extract_extras(model_cls: type[BaseModel], owner: type) -> Extras:
+def _extract_forbid_extras(model_cls: type[BaseModel], owner: type) -> bool:
     raw = model_cls.model_config.get("extra", "ignore")
     if raw is None or raw == "ignore":
-        return Extras.IGNORE
+        return False
     if raw == "forbid":
-        return Extras.FORBID
+        return True
     raise SchemaError(f"{owner.__name__}: extra must be 'ignore' or 'forbid', got {raw!r}")
 
 
@@ -354,7 +321,7 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
     if cached is not None:
         return cached
 
-    extras = _extract_extras(model_type, model_type)
+    forbid_extras = _extract_forbid_extras(model_type, model_type)
     if not getattr(model_type, "__pydantic_complete__", True):
         try:
             module = sys.modules.get(model_type.__module__)
@@ -417,7 +384,7 @@ def _compile_attrs_spec(model_type: type[BaseModel], owner: type) -> AttrsSpec:
     spec = AttrsSpec(
         model_type_ref=weakref.ref(model_type),
         fields=tuple(attr_fields),
-        extras=extras,
+        forbid_extras=forbid_extras,
     )
     _ATTRS_CACHE[model_type] = spec
     return spec
@@ -541,23 +508,10 @@ def _field_spec(
     if glob_marker is not None and kind is not MemberKind.COLLECTION:
         raise _schema_error(owner, py_name, "Glob applies only to dict[str, T] collection fields")
 
-    if kind is MemberKind.COLLECTION:
-        adapter_ann: Any = dict
-        adapter = _build_instance_adapter(owner, py_name, dict, optional)
-    elif kind in (MemberKind.GROUP, MemberKind.DATASET):
-        assert member_type is not None
-        adapter_ann = member_type
-        adapter = _build_instance_adapter(owner, py_name, member_type, optional)
-    else:
-        adapter_ann = np.ndarray | None if optional else np.ndarray
-        adapter = _build_adapter(owner, py_name, adapter_ann)
-
     return FieldSpec(
         py_name=py_name,
         h5_name=h5_name,
         kind=kind,
-        annotation=adapter_ann,
-        adapter=adapter,
         optional=optional,
         member_type=member_type,
         dataset_attrs=dataset_attrs,
@@ -615,7 +569,7 @@ def _compile_group_fields(
     group_cls: type[Group[Any]],
     localns: Mapping[str, Any] | None = None,
 ) -> GroupSpec:
-    extras = _extract_extras(group_cls, group_cls)
+    forbid_extras = _extract_forbid_extras(group_cls, group_cls)
 
     raw_fields: list[tuple[str, Any, Any]] = []
     seen_py_names: dict[str, int] = {}
@@ -667,7 +621,7 @@ def _compile_group_fields(
         group_type=group_cls,
         attrs=attrs_spec,
         fields=tuple(fields.values()),
-        extras=extras,
+        forbid_extras=forbid_extras,
     )
 
 
@@ -801,14 +755,20 @@ def _compiled_group(cls: type[Group[Any]]) -> GroupSpec:
 # ---------------------------------------------------------------------------
 
 
-def _short_pydantic_error(exc: PydanticValidationError) -> str:
+def _first_error_parts(exc: PydanticValidationError) -> tuple[tuple[Any, ...], str]:
+    """Return the first error's ``(loc, message)`` pair."""
     errors = exc.errors(include_url=False, include_context=False, include_input=False)
     if not errors:
-        return str(exc).splitlines()[0]
+        return (), str(exc).splitlines()[0]
     first = errors[0]
-    location = ".".join(str(part) for part in first.get("loc", ()))
-    message = str(first.get("msg", "invalid value"))
-    return f"{location}: {message}" if location else message
+    return tuple(first.get("loc", ())), str(first.get("msg", "invalid value"))
+
+
+def _short_pydantic_error(exc: PydanticValidationError) -> str:
+    loc, message = _first_error_parts(exc)
+    if not loc:
+        return message
+    return f"{'.'.join(str(part) for part in loc)}: {message}"
 
 
 def _validate_adapter(adapter: TypeAdapter[Any], value: Any, path: str) -> Any:
@@ -878,11 +838,7 @@ def _compile_closure(spec: GroupSpec) -> None:
 
 def _first_error(exc: PydanticValidationError, spec: GroupSpec, root: str) -> ValidationError:
     """Convert the first Pydantic error into an `h5t.ValidationError` at its HDF5 path."""
-    errors = exc.errors(include_url=False, include_context=False, include_input=False)
-    if not errors:
-        return ValidationError(root, _short_pydantic_error(exc))
-    loc = tuple(errors[0].get("loc", ()))
-    message = str(errors[0].get("msg", "invalid value"))
+    loc, message = _first_error_parts(exc)
     path, rest = _h5_error_path(spec, root, loc)
     return ValidationError(path, f"{rest}: {message}" if rest else message)
 
@@ -1029,7 +985,7 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
     @classmethod
     def _h5t_jaxtyping_scope(cls, values: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
         spec = _compiled_group(cls) if isinstance(values, _GroupView) else None
-        if spec is not None and spec.attrs is None and spec.extras is Extras.FORBID:
+        if spec is not None and spec.attrs is None and spec.forbid_extras:
             for name in _raw_attrs(values.node):
                 raise ValidationError(attr_path(values.node.name, name), "unexpected attribute")
         with jaxtyped("context"):

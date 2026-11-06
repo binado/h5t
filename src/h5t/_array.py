@@ -46,6 +46,24 @@ def _readonly(array: np.ndarray) -> np.ndarray:
     return view
 
 
+def _reject_not_a_dataset(value: Any, expected: type) -> None:
+    """Raise unless ``value`` is a `Dataset` (and an ``expected`` instance)."""
+    if isinstance(value, _GroupView):
+        raise PydanticCustomError("dataset_type", "expected a dataset, found a group")
+    if not isinstance(value, Dataset):
+        raise PydanticCustomError(
+            "dataset_type",
+            "Input should be an instance of Dataset, got {actual}",
+            {"actual": type(value).__name__},
+        )
+    if not isinstance(value, expected):
+        raise PydanticCustomError(
+            "dataset_type",
+            "Input should be an instance of {expected}, got {actual}",
+            {"expected": expected.__name__, "actual": type(value).__name__},
+        )
+
+
 class Dataset(Generic[T]):
     """A detached HDF5 dataset: metadata and typed attributes, with lazy array slicing.
 
@@ -171,7 +189,7 @@ class Dataset(Generic[T]):
         shape: tuple[int, ...],
         dtype: np.dtype[Any],
         attrs: Any,
-        cached: object,
+        cached: object = _DATA_NOT_LOADED,
     ) -> Self:
         """Create an instance directly from its state (the one place that does so)."""
         instance = object.__new__(cls)
@@ -182,20 +200,6 @@ class Dataset(Generic[T]):
         instance._h5t_attrs = attrs
         instance._h5t_data = cached
         return instance
-
-    @classmethod
-    def _from_hdf5(
-        cls,
-        filename: str,
-        path: str,
-        shape: tuple[int, ...],
-        dtype: np.dtype[Any],
-        attrs: Any,
-        *,
-        data: np.ndarray | None = None,
-    ) -> Self:
-        cached = _DATA_NOT_LOADED if data is None else _readonly(data)
-        return cls._build(filename, path, shape, dtype, attrs, cached)
 
     def _clone_with(self, target_cls: type[Dataset[Any]], attrs: Any) -> Dataset[Any]:
         """Copy this dataset's location and cached data into ``target_cls`` with ``attrs``."""
@@ -394,27 +398,14 @@ class Dataset(Generic[T]):
 
             def validate_untyped(value: Any) -> Dataset[Any]:
                 if isinstance(value, h5py.Dataset):
-                    return target_cls._from_hdf5(
+                    return target_cls._build(
                         value.file.filename,
                         value.name,
                         tuple(value.shape),
                         np.dtype(value.dtype),
                         MappingProxyType(_raw_attrs(value)),
                     )
-                if isinstance(value, _GroupView):
-                    raise PydanticCustomError("dataset_type", "expected a dataset, found a group")
-                if not isinstance(value, Dataset):
-                    raise PydanticCustomError(
-                        "dataset_type",
-                        "Input should be an instance of Dataset, got {actual}",
-                        {"actual": type(value).__name__},
-                    )
-                if not isinstance(value, cls):
-                    raise PydanticCustomError(
-                        "dataset_type",
-                        "Input should be an instance of {expected}, got {actual}",
-                        {"expected": cls.__name__, "actual": type(value).__name__},
-                    )
+                _reject_not_a_dataset(value, cls)
                 if not isinstance(value.attrs, Mapping):
                     raise PydanticCustomError(
                         "dataset_attrs",
@@ -433,21 +424,16 @@ class Dataset(Generic[T]):
             if isinstance(value, h5py.Dataset):
                 with jaxtyped("context"):
                     attrs = validate_attrs(_normalized_attrs(value))
-                return target_cls._from_hdf5(
+                return target_cls._build(
                     value.file.filename,
                     value.name,
                     tuple(value.shape),
                     np.dtype(value.dtype),
                     attrs,
                 )
-            if isinstance(value, _GroupView):
-                raise PydanticCustomError("dataset_type", "expected a dataset, found a group")
-            if not isinstance(value, Dataset):
-                raise PydanticCustomError(
-                    "dataset_type",
-                    "Input should be an instance of Dataset, got {actual}",
-                    {"actual": type(value).__name__},
-                )
+            # The typed branch deliberately skips the ``expected`` check: any Dataset
+            # is accepted and cloned into ``target_cls`` with validated attrs.
+            _reject_not_a_dataset(value, Dataset)
             if isinstance(value.attrs, attrs_type):
                 if isinstance(value, target_cls):
                     return value

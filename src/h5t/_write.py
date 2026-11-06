@@ -33,7 +33,6 @@ from h5t._errors import SchemaError, ValidationError
 from h5t._spec import (
     ArraySpec,
     AttrsSpec,
-    Extras,
     FieldSpec,
     GroupSpec,
     MemberKind,
@@ -112,7 +111,7 @@ def _plan_attrs(
         )
 
     extra_dict = getattr(attrs_val, "__pydantic_extra__", None) or {}
-    if attrs_spec.extras is Extras.FORBID and extra_dict:
+    if attrs_spec.forbid_extras and extra_dict:
         first_extra = str(next(iter(extra_dict)))
         raise ValidationError(attr_path(path, first_extra), "unexpected attribute")
 
@@ -175,12 +174,27 @@ def _plan_dataset(
     return _DatasetPlan(data=data, attrs=attrs)
 
 
-def _plan_array(value: Any, array_spec: ArraySpec | None, path: str) -> _DatasetPlan:
-    if not isinstance(value, np.ndarray):
-        raise ValidationError(path, f"expected ndarray, got {type(value).__name__}")
-    if array_spec is not None:
-        _check_array(array_spec, value, path)
-    return _DatasetPlan(data=np.asarray(value), attrs={})
+def _check_member_type(field: FieldSpec, value: Any, path: str) -> bool:
+    """Check a member's runtime type before planning it.
+
+    Returns ``False`` for an omitted optional member (``None``), which the caller
+    skips. The message mirrors the Pydantic isinstance wording used at load time.
+    """
+    if value is None and field.optional:
+        return False
+    if field.kind is MemberKind.COLLECTION:
+        target: type = dict
+        expected = "dict"
+    elif field.kind is MemberKind.ARRAY:
+        target = np.ndarray
+        expected = "ndarray"
+    else:
+        assert field.member_type is not None
+        target = field.member_type
+        expected = field.member_type.__name__
+    if not isinstance(value, target):
+        raise ValidationError(path, f"Input should be an instance of {expected}")
+    return True
 
 
 def _plan_member(field: FieldSpec, value: Any, path: str) -> _GroupPlan | _DatasetPlan:
@@ -190,7 +204,11 @@ def _plan_member(field: FieldSpec, value: Any, path: str) -> _GroupPlan | _Datas
         return _plan_group(_compiled_group(group_cls), value, path)
     if field.kind is MemberKind.DATASET:
         return _plan_dataset(value, field.dataset_attrs, field.array, path)
-    return _plan_array(value, field.array, path)
+    if not isinstance(value, np.ndarray):
+        raise ValidationError(path, f"expected ndarray, got {type(value).__name__}")
+    if field.array is not None:
+        _check_array(field.array, value, path)
+    return _DatasetPlan(data=np.asarray(value), attrs={})
 
 
 def _plan_collection(field: FieldSpec, value: Mapping[str, Any], path: str) -> _GroupPlan:
@@ -204,8 +222,8 @@ def _plan_collection(field: FieldSpec, value: Mapping[str, Any], path: str) -> _
             )
         if field.glob is not None and field.glob.match(key) is None:
             raise ValidationError(item_path, "collection key does not match the field's Glob")
-        validated = _validate_adapter(field.item.adapter, item, item_path)
-        plan.children[key] = _plan_member(field.item, validated, item_path)
+        if _check_member_type(field.item, item, item_path):
+            plan.children[key] = _plan_member(field.item, item, item_path)
     return plan
 
 
@@ -220,18 +238,17 @@ def _plan_group(spec: GroupSpec, group: Any, path: str) -> _GroupPlan:
             spec.attrs,
             _read_field(spec.group_type, group, "attrs"),
             path,
-            forbid_untyped_extras=(spec.extras is Extras.FORBID and spec.attrs is None),
+            forbid_untyped_extras=(spec.forbid_extras and spec.attrs is None),
         )
         for field in spec.fields:
             member_path = child_path(path, field.h5_name)
             raw_val = _read_field(spec.group_type, group, field.py_name)
-            value = _validate_adapter(field.adapter, raw_val, member_path)
-            if value is None:
+            if not _check_member_type(field, raw_val, member_path):
                 continue
             if field.kind is MemberKind.COLLECTION:
-                plan.children[field.h5_name] = _plan_collection(field, value, member_path)
+                plan.children[field.h5_name] = _plan_collection(field, raw_val, member_path)
             else:
-                plan.children[field.h5_name] = _plan_member(field, value, member_path)
+                plan.children[field.h5_name] = _plan_member(field, raw_val, member_path)
     return plan
 
 
@@ -248,29 +265,22 @@ def _write_attrs(node: h5py.Group | h5py.Dataset, attrs: Mapping[str, Any], path
             raise ValidationError(attr_path(path, name), f"cannot write attribute: {exc}") from exc
 
 
-def _write_children(group: h5py.Group, plan: _GroupPlan, path: str) -> None:
+def _write_plan(group: h5py.Group, plan: _GroupPlan, path: str) -> None:
+    _write_attrs(group, plan.attrs, path)
     for name, child in plan.children.items():
         cpath = child_path(path, name)
+        kind = "group" if isinstance(child, _GroupPlan) else "dataset"
         try:
             if isinstance(child, _GroupPlan):
                 node = group.create_group(name)
             else:
                 node = group.create_dataset(name, data=child.data)
         except (TypeError, ValueError, OSError) as exc:
-            raise ValidationError(cpath, f"cannot write {_kind(child)}: {exc}") from exc
+            raise ValidationError(cpath, f"cannot write {kind}: {exc}") from exc
         if isinstance(child, _GroupPlan):
             _write_plan(node, child, cpath)
         else:
             _write_attrs(node, child.attrs, cpath)
-
-
-def _kind(plan: _GroupPlan | _DatasetPlan) -> str:
-    return "group" if isinstance(plan, _GroupPlan) else "dataset"
-
-
-def _write_plan(group: h5py.Group, plan: _GroupPlan, path: str) -> None:
-    _write_attrs(group, plan.attrs, path)
-    _write_children(group, plan, path)
 
 
 def _clear(node: h5py.Group) -> None:
@@ -338,17 +348,14 @@ def _apply(
     overwrite: bool,
 ) -> None:
     created_file = mode != "a" or not os.path.exists(filename)
-    h5file = h5py.File(filename, mode)
     undo = _Undo()
-    try:
+    with h5py.File(filename, mode) as h5file:
         try:
             _prepare_target(h5file, root, overwrite, undo)
             _write_plan(typing.cast(h5py.Group, h5file[root]), plan, root)
         except BaseException as exc:
             _roll_back(h5file, filename, undo, created_file, exc)
             raise
-    finally:
-        h5file.close()
 
 
 def _roll_back(
@@ -385,10 +392,7 @@ def _dump_group(
 ) -> None:
     if mode not in ("w-", "x", "w", "a"):
         raise ValueError(f"mode must be 'w-', 'x', 'w' or 'a', got {mode!r}")
-    schema = type(group)
-    if not issubclass(schema, Group):
-        raise SchemaError(f"{schema!r} is not an h5t.Group subclass")
-    spec = _compiled_group(schema)
+    spec = _compiled_group(type(group))
     normalized_root = _normalize_root(root)
     filename = _filesystem_path(path)
 

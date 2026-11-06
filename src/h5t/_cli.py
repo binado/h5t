@@ -46,15 +46,13 @@ def _cmd_check(args: argparse.Namespace) -> int:
     except ValidationError as exc:
         print(f"invalid: {args.file} against {schema.__name__}: {exc}")
         return 1
-    except (OSError, ValueError, SchemaError) as exc:
-        if args.traceback:
-            raise
-        _fail(f"could not check {args.file!r}: {_describe(exc)}")
     except Exception as exc:
         # A bug in user code (e.g. a validator raising KeyError) is not a validation
         # failure: report it as a usage/runtime error (exit 2), never exit 1.
         if args.traceback:
             raise
+        if isinstance(exc, OSError | ValueError | SchemaError):
+            _fail(f"could not check {args.file!r}: {_describe(exc)}")
         _fail(f"unexpected {type(exc).__name__} while checking {args.file!r}: {exc}")
     print(f"ok: {args.file} validates against {schema.__name__} at {args.root}")
     return 0

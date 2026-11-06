@@ -189,22 +189,31 @@ def test_dataset_getitem_numpy_keys_match_ndarray_indexing(
     np.testing.assert_array_equal(indexed_dataset[key], np.arange(5)[key])
 
 
-def test_open_detects_shape_change_since_load(result_file: Path) -> None:
+@pytest.mark.parametrize(
+    ("mutate", "match", "path"),
+    [
+        pytest.param("shape", "changed since it was loaded", None, id="shape-change"),
+        pytest.param("dtype", "changed since it was loaded", None, id="dtype-change"),
+        pytest.param("deleted", "no longer exists", "/measurement", id="deleted"),
+        pytest.param("replaced-by-group", "found a group", "/measurement", id="replaced-by-group"),
+    ],
+)
+def test_open_detects_source_changes_since_load(
+    result_file: Path, mutate: str, match: str, path: str | None
+) -> None:
     measurement = Result.model_validate_hdf5(result_file).measurement
     with h5py.File(result_file, "a") as file:
         del file["measurement"]
-        file.create_dataset("measurement", data=np.arange(7))
-    with pytest.raises(h5t.ValidationError, match="changed since it was loaded"):
+        if mutate == "shape":
+            file.create_dataset("measurement", data=np.arange(7))
+        elif mutate == "dtype":
+            file.create_dataset("measurement", data=np.arange(5.0))
+        elif mutate == "replaced-by-group":
+            file.create_group("measurement")
+    with pytest.raises(h5t.ValidationError, match=match) as caught:
         measurement.read()
-
-
-def test_open_detects_dtype_change_since_load(result_file: Path) -> None:
-    measurement = Result.model_validate_hdf5(result_file).measurement
-    with h5py.File(result_file, "a") as file:
-        del file["measurement"]
-        file.create_dataset("measurement", data=np.arange(5.0))
-    with pytest.raises(h5t.ValidationError, match="changed since it was loaded"):
-        measurement.read()
+    if path is not None:
+        assert caught.value.path == path
 
 
 @pytest.mark.parametrize("access", [lambda ds: ds.data, lambda ds: ds[()], lambda ds: ds[:]])
@@ -239,25 +248,25 @@ def typed_adapter() -> TypeAdapter[h5t.Dataset[MeasurementAttrs]]:
     return TypeAdapter(h5t.Dataset[MeasurementAttrs])
 
 
-def test_dataset_schema_rejects_non_dataset_value(
-    typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]],
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        pytest.param(np.arange(3), "instance of Dataset", id="non-dataset"),
+        pytest.param(
+            h5t.Dataset(np.arange(3), _OtherAttrs()), "MeasurementAttrs", id="wrong-attrs-model"
+        ),
+        pytest.param(
+            h5t.Dataset(np.arange(3), {"unit": "parsec"}),
+            "unit",
+            id="invalid-attrs-mapping",
+        ),
+    ],
+)
+def test_dataset_schema_rejects_bad_values(
+    typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]], value: Any, match: str
 ) -> None:
-    with pytest.raises(PydanticValidationError, match="instance of Dataset"):
-        typed_adapter.validate_python(np.arange(3))
-
-
-def test_dataset_schema_rejects_wrong_attrs_model(
-    typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]],
-) -> None:
-    with pytest.raises(PydanticValidationError, match="MeasurementAttrs"):
-        typed_adapter.validate_python(h5t.Dataset(np.arange(3), _OtherAttrs()))
-
-
-def test_dataset_schema_rejects_invalid_attrs_mapping(
-    typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]],
-) -> None:
-    with pytest.raises(PydanticValidationError, match="unit"):
-        typed_adapter.validate_python(h5t.Dataset(np.arange(3), {"unit": "parsec"}))
+    with pytest.raises(PydanticValidationError, match=match):
+        typed_adapter.validate_python(value)
 
 
 def test_dataset_schema_clone_of_lazy_dataset_stays_lazy(
@@ -282,24 +291,6 @@ def test_dataset_schema_clone_keeps_cached_data(
         file["raw_measurement"][...] = np.arange(5) + 100
     clone = typed_adapter.validate_python(raw)
     assert clone.data is cached
-
-
-def test_dataset_deleted_from_a_live_file_fails_with_path(result_file: Path) -> None:
-    measurement = Result.model_validate_hdf5(result_file).measurement
-    with h5py.File(result_file, "a") as file:
-        del file["measurement"]
-    with pytest.raises(h5t.ValidationError, match="no longer exists") as caught:
-        measurement.read()
-    assert caught.value.path == "/measurement"
-
-
-def test_dataset_path_replaced_by_group_fails_with_path(result_file: Path) -> None:
-    measurement = Result.model_validate_hdf5(result_file).measurement
-    with h5py.File(result_file, "a") as file:
-        del file["measurement"]
-        file.create_group("measurement")
-    with pytest.raises(h5t.ValidationError, match="found a group"):
-        measurement.read()
 
 
 def test_dataset_subscript_with_mapping_returns_the_untyped_base() -> None:

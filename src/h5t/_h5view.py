@@ -16,19 +16,19 @@ def _raw_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
     return {str(name): node.attrs[name] for name in node.attrs}
 
 
-def _normalize_raw_attr(value: Any) -> Any:
-    if isinstance(value, (bytes, np.bytes_)):
-        return bytes(value)
-    if isinstance(value, np.str_):
-        return str(value)
-    if isinstance(value, np.generic) and not isinstance(value, np.ndarray):
-        return value.item()
-    return value
-
-
 def _normalized_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
     """Return ``node``'s attributes with numpy scalars and strings turned into Python values."""
-    return {name: _normalize_raw_attr(value) for name, value in _raw_attrs(node).items()}
+    out: dict[str, Any] = {}
+    for name in node.attrs:
+        value = node.attrs[name]
+        if isinstance(value, (bytes, np.bytes_)):
+            value = bytes(value)
+        elif isinstance(value, np.str_):
+            value = str(value)
+        elif isinstance(value, np.generic) and not isinstance(value, np.ndarray):
+            value = value.item()
+        out[str(name)] = value
+    return out
 
 
 def _ghost(node: h5py.Dataset) -> np.ndarray:

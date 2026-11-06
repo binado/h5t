@@ -37,7 +37,7 @@ real import cycle (the style guide allows deferred imports for that).
 
 - **`_spec.py`** — `Glob` marker and the compiled IR: `ArraySpec`, `AttrFieldSpec`, `AttrsSpec`,
   `FieldSpec`, `GroupSpec`, `MemberKind` (`ARRAY` / `DATASET` / `GROUP` / `COLLECTION`),
-  `Extras`, plus error-path formatters.
+  plus error-path formatters.
 - **`_h5view.py`** — `_GroupView`, a read-only `Mapping` over an open `h5py.Group`, plus the raw
   attribute helpers (`_raw_attrs`, `_normalized_attrs`) and `_ghost`.
 - **`_array.py`** — `Dataset[T]`, the detached lazily-read dataset with typed `.attrs: T`,
