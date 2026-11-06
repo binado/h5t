@@ -43,6 +43,7 @@ from typing_extensions import TypeVar
 
 from h5t._array import Dataset, _is_mapping_type
 from h5t._errors import SchemaError, ValidationError
+from h5t._h5view import _ghost, _normalize_raw_attr, _raw_attrs
 from h5t._spec import (
     _NO_DEFAULT,
     ArraySpec,
@@ -261,11 +262,6 @@ def _check_array(spec: ArraySpec, candidate: Any, path: str) -> None:
     reason = spec.hint.__instancecheck_str__(candidate)  # ty: ignore[unresolved-attribute]
     if reason:
         raise ValidationError(path, reason)
-
-
-def _ghost(node: h5py.Dataset) -> np.ndarray:
-    """Return an ndarray with ``node``'s shape and dtype that allocates one scalar only."""
-    return np.broadcast_to(np.empty((), node.dtype), node.shape)
 
 
 def _is_mapping_annotation(core: Any) -> bool:
@@ -755,20 +751,6 @@ def _missing_child_value(field: FieldSpec, path: str) -> Any:
         return None
     kind = field.kind.value
     raise ValidationError(path, f"required {kind} {field.h5_name!r} is missing")
-
-
-def _raw_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
-    return {str(name): node.attrs[name] for name in node.attrs}
-
-
-def _normalize_raw_attr(value: Any) -> Any:
-    if isinstance(value, (bytes, np.bytes_)):
-        return bytes(value)
-    if isinstance(value, np.str_):
-        return str(value)
-    if isinstance(value, np.generic) and not isinstance(value, np.ndarray):
-        return value.item()
-    return value
 
 
 def _construct_validated_model(
