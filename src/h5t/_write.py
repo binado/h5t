@@ -1,9 +1,9 @@
-"""Schema-validated writing of records to HDF5, in two phases.
+"""Schema-validated writing of `Group` instances to HDF5, in two phases.
 
-Phase 1 (*plan*) walks the compiled spec over an in-memory record and builds a small tree
-of what to write, validating everything and reading every lazy payload. It never touches
-the target file. Phase 2 (*apply*) opens the file and writes the tree, removing what it
-wrote if anything fails.
+Phase 1 (*plan*) walks the compiled spec over an in-memory `Group` and builds a tree of
+what to write, validating everything and reading every lazy `Dataset` payload. It never
+touches the target file. Phase 2 (*apply*) opens the file and writes the tree, rolling
+back what it wrote if anything fails.
 """
 
 from __future__ import annotations
@@ -19,23 +19,25 @@ from typing import Any, Literal
 import h5py
 import numpy as np
 from jaxtyping import jaxtyped
+from pydantic_core import PydanticSerializationError
 
-from h5t._array import _DATA_NOT_LOADED, LazyArray
+from h5t._array import _DATA_NOT_LOADED, Dataset
 from h5t._compile import (
+    Group,
     _check_array,
-    _compiled_record,
+    _compiled_group,
     _filesystem_path,
     _normalize_root,
-    _validate_value,
+    _validate_adapter,
 )
-from h5t._errors import ConversionError, SchemaError, ValidationError
+from h5t._errors import SchemaError, ValidationError
 from h5t._spec import (
     ArraySpec,
+    AttrsSpec,
     Extras,
     FieldSpec,
-    ForeignSpec,
+    GroupSpec,
     MemberKind,
-    RecordKind,
     attr_path,
     child_path,
 )
@@ -58,13 +60,11 @@ class _GroupPlan:
 # ---------------------------------------------------------------------------
 
 
-def _read_field(foreign: ForeignSpec, record: Any, name: str) -> Any:
+def _read_field(owner_type: type, record: Any, name: str) -> Any:
     try:
         return getattr(record, name)
     except AttributeError as exc:
-        raise SchemaError(
-            f"{foreign.record_type.__name__}.{name}: record has no such attribute"
-        ) from exc
+        raise SchemaError(f"{owner_type.__name__}.{name}: model has no such attribute") from exc
 
 
 def _check_storable(value: Any, path: str) -> None:
@@ -78,115 +78,130 @@ def _check_storable(value: Any, path: str) -> None:
     if kind == "O":
         raise ValidationError(
             path,
-            f"cannot store {type(value).__name__} as an HDF5 attribute; add Attr(serializer=...)",
+            f"cannot store {type(value).__name__} as an HDF5 attribute; add a PlainSerializer",
         )
 
 
-def _serialize_attribute(field: FieldSpec, value: Any, path: str) -> Any:
-    if field.serializer is not None:
-        try:
-            value = field.serializer(value)
-        except Exception as exc:
-            raise ConversionError(path, f"attribute serializer failed: {exc}") from exc
-    elif isinstance(value, Enum):
-        value = value.value
-    _check_storable(value, path)
-    return value
-
-
-def _plan_attributes(
-    foreign: ForeignSpec, record: Any, path: str, fields: tuple[FieldSpec, ...]
-) -> dict[str, Any]:
-    """Validate and serialize ``fields``' attribute members of ``record``."""
-    attrs: dict[str, Any] = {}
-    for field in fields:
-        if field.kind is not MemberKind.ATTRIBUTE:
-            continue
-        apath = attr_path(path, field.h5_name)
-        value = _validate_value(field, _read_field(foreign, record, field.py_name), apath)
-        if value is None:
-            continue  # an optional attribute left unset is omitted
-        attrs[field.h5_name] = _serialize_attribute(field, value, apath)
-    return attrs
-
-
-def _add_snapshot_attrs(
-    foreign: ForeignSpec,
-    record: Any,
+def _plan_attrs(
+    attrs_spec: AttrsSpec | None,
+    attrs_val: Any,
     path: str,
-    attrs: dict[str, Any],
-    declared: set[str],
-) -> None:
-    """Copy the undeclared entries of the ``attrs=`` snapshot field, raw."""
-    if foreign.attrs is None:
-        return
-    snapshot = _read_field(foreign, record, foreign.attrs)
-    if snapshot is None:
-        return
-    if not isinstance(snapshot, Mapping):
-        raise ValidationError(path, f"attrs field {foreign.attrs!r} must be a Mapping")
-    for name, value in snapshot.items():
-        name = str(name)
-        if name in declared:
-            continue  # declared names always come from their typed fields
+    *,
+    forbid_untyped_extras: bool = False,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if attrs_spec is None:
+        if not isinstance(attrs_val, Mapping):
+            raise ValidationError(
+                path, f"expected Mapping for attrs, got {type(attrs_val).__name__}"
+            )
+        for raw_name, value in attrs_val.items():
+            name = str(raw_name)
+            apath = attr_path(path, name)
+            if forbid_untyped_extras:
+                raise ValidationError(apath, "unexpected attribute")
+            if isinstance(value, Enum):
+                value = value.value
+            _check_storable(value, apath)
+            out[name] = value
+        return out
+
+    if not isinstance(attrs_val, attrs_spec.model_type):
+        raise ValidationError(
+            path,
+            f"expected {attrs_spec.model_type.__name__} for attrs, got {type(attrs_val).__name__}",
+        )
+
+    extra_dict = getattr(attrs_val, "__pydantic_extra__", None) or {}
+    if attrs_spec.extras is Extras.FORBID and extra_dict:
+        first_extra = str(next(iter(extra_dict)))
+        raise ValidationError(attr_path(path, first_extra), "unexpected attribute")
+
+    with jaxtyped("context"):
+        for field in attrs_spec.fields:
+            apath = attr_path(path, field.h5_name)
+            raw_val = _read_field(attrs_spec.model_type, attrs_val, field.py_name)
+            if raw_val is None and field.optional:
+                continue
+            if field.array is not None:
+                if not isinstance(raw_val, np.ndarray):
+                    raise ValidationError(apath, f"expected ndarray, got {type(raw_val).__name__}")
+                _check_array(field.array, raw_val, apath)
+                value = raw_val
+            else:
+                value = _validate_adapter(field.save_adapter, raw_val, apath)
+            if value is None:
+                continue
+            try:
+                serialized = field.save_adapter.dump_python(value, mode="python")
+            except (PydanticSerializationError, Exception) as exc:
+                cause = (
+                    exc.__cause__
+                    if isinstance(exc, PydanticSerializationError) and exc.__cause__
+                    else exc
+                )
+                raise ValidationError(apath, f"attribute serializer failed: {cause}") from cause
+            if isinstance(serialized, Enum):
+                serialized = serialized.value
+            _check_storable(serialized, apath)
+            out[field.h5_name] = serialized
+
+    for raw_name, value in extra_dict.items():
+        name = str(raw_name)
+        if name in out:
+            continue
         apath = attr_path(path, name)
-        if foreign.spec.extras is Extras.FORBID:
-            raise ValidationError(apath, "unexpected attribute")
+        if isinstance(value, Enum):
+            value = value.value
         _check_storable(value, apath)
-        attrs[name] = value
+        out[name] = value
+
+    return out
 
 
-def _materialize(lazy: LazyArray, path: str) -> np.ndarray:
-    """Return a lazy payload's data without caching it on the caller's record."""
-    cached = lazy._h5t_data
+def _materialize(dataset: Dataset[Any], path: str) -> np.ndarray:
+    """Return a dataset's payload without mutating the caller's detached instance."""
+    cached = dataset._h5t_data
     if cached is not _DATA_NOT_LOADED:
         return typing.cast(np.ndarray, cached)
     try:
-        with lazy.open() as dataset:
-            return np.asarray(dataset[()])
+        with dataset.open() as h5ds:
+            return np.asarray(h5ds[()])
     except OSError as exc:
         raise ValidationError(path, f"cannot read lazy payload: {exc}") from exc
 
 
-def _plan_payload(value: Any, array: ArraySpec | None, path: str, *, lazy: bool) -> np.ndarray:
-    """Check a payload (``np.ndarray`` or ``LazyArray``) and return its array."""
-    expected = LazyArray if lazy else np.ndarray
-    if not isinstance(value, expected):
-        raise ValidationError(path, f"expected {expected.__name__}, got {type(value).__name__}")
-    if array is not None:
-        _check_array(array, value, path)
-    if isinstance(value, LazyArray):
-        return _materialize(value, path)
-    return np.asarray(value)
+def _plan_dataset(
+    value: Any,
+    attrs_spec: AttrsSpec | None,
+    array_spec: ArraySpec | None,
+    path: str,
+) -> _DatasetPlan:
+    if not isinstance(value, Dataset):
+        raise ValidationError(path, f"expected Dataset, got {type(value).__name__}")
+    if array_spec is not None:
+        _check_array(array_spec, value, path)
+    attrs = _plan_attrs(attrs_spec, value.attrs, path, forbid_untyped_extras=False)
+    data = _materialize(value, path)
+    return _DatasetPlan(data=data, attrs=attrs)
 
 
-def _plan_dataset_record(foreign: ForeignSpec, record: Any, path: str) -> _DatasetPlan:
-    assert foreign.data is not None
-    # A dataset record is its own binding scope, as on load.
-    with jaxtyped("context"):
-        attrs = _plan_attributes(foreign, record, path, foreign.spec.fields)
-        declared = {f.h5_name for f in foreign.spec.fields}
-        _add_snapshot_attrs(foreign, record, path, attrs, declared)
-        payload = _plan_payload(
-            _read_field(foreign, record, foreign.data),
-            foreign.payload_array,
-            path,
-            lazy=foreign.lazy_type is not None,
-        )
-    return _DatasetPlan(payload, attrs)
+def _plan_array(value: Any, array_spec: ArraySpec | None, path: str) -> _DatasetPlan:
+    if not isinstance(value, np.ndarray):
+        raise ValidationError(path, f"expected ndarray, got {type(value).__name__}")
+    if array_spec is not None:
+        _check_array(array_spec, value, path)
+    return _DatasetPlan(data=np.asarray(value), attrs={})
 
 
 def _plan_member(field: FieldSpec, value: Any, path: str) -> _GroupPlan | _DatasetPlan:
-    """Plan one validated non-attribute, non-collection member (twin of ``_load_member``)."""
     if field.kind is MemberKind.GROUP:
         assert field.member_type is not None
-        return _plan_group(_compiled_record(field.member_type), value, path)
+        group_cls = typing.cast("type[Group[Any]]", field.member_type)
+        return _plan_group(_compiled_group(group_cls), value, path)
     if field.kind is MemberKind.DATASET:
-        if field.foreign is not None:
-            return _plan_dataset_record(field.foreign, value, path)
-        # A bare LazyArray member: no record type, no declared attributes.
-        return _DatasetPlan(_plan_payload(value, field.array, path, lazy=True), {})
-    return _DatasetPlan(_plan_payload(value, field.array, path, lazy=False), {})
+        return _plan_dataset(value, field.dataset_attrs, field.array, path)
+    return _plan_array(value, field.array, path)
 
 
 def _plan_collection(field: FieldSpec, value: Mapping[str, Any], path: str) -> _GroupPlan:
@@ -200,30 +215,34 @@ def _plan_collection(field: FieldSpec, value: Mapping[str, Any], path: str) -> _
             )
         if field.glob is not None and field.glob.match(key) is None:
             raise ValidationError(item_path, "collection key does not match the field's Glob")
-        validated = _validate_value(field.item, item, item_path)
+        validated = _validate_adapter(field.item.adapter, item, item_path)
         plan.children[key] = _plan_member(field.item, validated, item_path)
     return plan
 
 
-def _plan_group(foreign: ForeignSpec, record: Any, path: str) -> _GroupPlan:
-    """Plan ``record`` as a group (twin of ``_load_group_values``)."""
-    # Named dimensions unify across this record's own array fields only.
+def _plan_group(spec: GroupSpec, record: Any, path: str) -> _GroupPlan:
+    if not isinstance(record, spec.group_type):
+        raise ValidationError(
+            path, f"expected {spec.group_type.__name__}, got {type(record).__name__}"
+        )
     with jaxtyped("context"):
         plan = _GroupPlan()
-        plan.attrs = _plan_attributes(foreign, record, path, foreign.spec.fields)
-        for field in foreign.spec.fields:
-            if field.kind is MemberKind.ATTRIBUTE:
-                continue
+        plan.attrs = _plan_attrs(
+            spec.attrs,
+            _read_field(spec.group_type, record, "attrs"),
+            path,
+            forbid_untyped_extras=(spec.extras is Extras.FORBID and spec.attrs is None),
+        )
+        for field in spec.fields:
             member_path = child_path(path, field.h5_name)
-            value = _validate_value(field, _read_field(foreign, record, field.py_name), member_path)
+            raw_val = _read_field(spec.group_type, record, field.py_name)
+            value = _validate_adapter(field.adapter, raw_val, member_path)
             if value is None:
-                continue  # an optional child left unset is omitted
+                continue
             if field.kind is MemberKind.COLLECTION:
                 plan.children[field.h5_name] = _plan_collection(field, value, member_path)
             else:
                 plan.children[field.h5_name] = _plan_member(field, value, member_path)
-        declared = {f.h5_name for f in foreign.spec.fields if f.kind is MemberKind.ATTRIBUTE}
-        _add_snapshot_attrs(foreign, record, path, plan.attrs, declared)
     return plan
 
 
@@ -263,13 +282,11 @@ def _clear(node: h5py.Group) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class _Undo:
-    """How to take back what ``_write_plan`` adds: delete a created group, or clear one."""
-
     delete: str | None = None
     clear: str | None = None
 
     def rollback(self, file: h5py.File) -> None:
-        with contextlib.suppress(Exception):  # best effort: never mask the original error
+        with contextlib.suppress(Exception):
             if self.delete is not None:
                 del file[self.delete]
             elif self.clear is not None:
@@ -277,13 +294,12 @@ class _Undo:
 
 
 def _first_missing(file: h5py.File, root: str) -> str:
-    """Return the shallowest ancestor of ``root`` (or ``root``) that does not exist yet."""
     current = ""
     for part in root.strip("/").split("/"):
         current = f"{current}/{part}"
         if current not in file:
             return current
-    return root  # unreachable: ``root`` was just found missing
+    return root
 
 
 def _prepare_target(file: h5py.File, root: str, overwrite: bool) -> _Undo:
@@ -315,7 +331,7 @@ def _apply(
     overwrite: bool,
 ) -> None:
     created_file = mode != "a" or not os.path.exists(filename)
-    h5file = h5py.File(filename, mode)  # a failure to open must not remove anything
+    h5file = h5py.File(filename, mode)
     ok = False
     undo = _Undo()
     try:
@@ -331,67 +347,21 @@ def _apply(
                 os.remove(filename)
 
 
-def save(
-    record: object,
+def _dump_group(
+    record: Group[Any],
     path: str | os.PathLike[str],
     root: str = "/",
     mode: Literal["w-", "x", "w", "a"] = "w-",
     overwrite: bool = False,
 ) -> None:
-    """Validate ``record`` against its schema and write it under ``root`` in ``path``.
-
-    The record is fully checked before the file is opened, so a bad record never touches
-    the target. If writing fails midway, what was written is removed.
-
-    Parameters
-    ----------
-    record : object
-        An instance of a ``@h5t.group``-decorated record type.
-    path : str or os.PathLike
-        Target HDF5 file.
-    root : str
-        Absolute group path to write under; missing groups are created.
-    mode : {"w-", "x", "w", "a"}
-        ``"w-"``/``"x"`` fail if the file exists, ``"w"`` truncates, ``"a"`` writes into
-        an existing file or creates one.
-    overwrite : bool
-        Allow replacing the contents of a non-empty ``root`` group. This is destructive
-        and not undone if the write then fails.
-
-    Raises
-    ------
-    SchemaError
-        ``record`` is not an instance of a ``@h5t.group`` record.
-    ValidationError
-        The record does not conform to its schema, or ``root`` is occupied.
-    ConversionError
-        An ``Attr(serializer=...)`` raised.
-    ValueError
-        ``mode`` or ``root`` is invalid.
-
-    Examples
-    --------
-    >>> import dataclasses, h5t
-    >>> @h5t.group()
-    ... @dataclasses.dataclass
-    ... class Result:
-    ...     version: int
-    >>> h5t.save(Result(version=1), "out.h5", mode="w")
-    >>> h5t.save(Result(version=2), "out.h5", root="/run2", mode="a")
-    """
     if mode not in ("w-", "x", "w", "a"):
         raise ValueError(f"mode must be 'w-', 'x', 'w' or 'a', got {mode!r}")
     schema = type(record)
-    if "__h5t_record__" not in schema.__dict__:
-        raise SchemaError(f"{schema!r} is not a decorated record (@h5t.dataset/@h5t.group)")
-    foreign = _compiled_record(schema)
-    if foreign.kind is not RecordKind.GROUP:
-        raise SchemaError(
-            f"{schema.__name__} is a dataset record (@h5t.dataset); h5t.save needs a "
-            "@h5t.group record"
-        )
+    if not issubclass(schema, Group):
+        raise SchemaError(f"{schema!r} is not an h5t.Group subclass")
+    spec = _compiled_group(schema)
     normalized_root = _normalize_root(root)
     filename = _filesystem_path(path)
 
-    plan = _plan_group(foreign, record, normalized_root)
+    plan = _plan_group(spec, record, normalized_root)
     _apply(filename, "w-" if mode == "x" else mode, normalized_root, plan, overwrite)

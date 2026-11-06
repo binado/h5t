@@ -2,9 +2,9 @@ Checking dtype and shape with jaxtyping
 =======================================
 
 A `jaxtyping <https://docs.kidger.site/jaxtyping/>`_ annotation over ``np.ndarray`` or
-:class:`h5t.LazyArray` has its dtype and shape checked by jaxtyping itself, from the
-dataset's HDF5 metadata, without reading the data or casting it. h5t never parses a
-shape string.
+:class:`h5t.Dataset` (including parameterized ``h5t.Dataset[T]``) has its dtype and shape
+checked by jaxtyping itself, from the dataset's HDF5 metadata, without reading lazy disk
+chunks or casting data. ``h5t`` never parses a shape string.
 
 - ``Float`` accepts any float width and ``Float64`` only float64 (a file's byte order is
   ignored). ``Shaped`` accepts any dtype, and a custom ``AbstractDtype`` subclass works too.
@@ -13,35 +13,39 @@ shape string.
 Dimension binding scopes
 ------------------------
 
-A named dimension binds on first use and must agree across every array field of the same
-record. A nested record starts fresh, and a ``@h5t.dataset`` record is its own scope.
-Bare array items of a collection share the owner record's bindings (see
-:doc:`collections`). :func:`h5t.save` applies the same checks.
+A named dimension binds on first use and must agree across every array and ``Dataset`` field
+of the same group. A nested :class:`h5t.Group` starts a fresh scope. Collection items that are
+bare arrays or datasets share the owner group's bindings, while collection items that are
+``Group`` subclasses bind independently (see :doc:`collections`).
+:meth:`h5t.Group.model_dump_hdf5` and in-memory ``Group(...)`` construction apply the same
+checks.
 
 .. code-block:: python
-
-   import dataclasses
 
    import h5py
    import numpy as np
    from jaxtyping import Float
+   from pydantic import BaseModel
 
    import h5t
 
    with h5py.File("shapes.h5", "w") as f:
        f["fisher"] = np.zeros((3, 3))
-       f["fiducials"] = np.zeros(4)
+       ds = f.create_dataset("fiducials", data=np.zeros(4))
+       ds.attrs["unit"] = "m"
 
 
-   @h5t.group()
-   @dataclasses.dataclass
-   class Result:
+   class FiducialAttrs(BaseModel):
+       unit: str
+
+
+   class Result(h5t.Group):
        fisher: Float[np.ndarray, "n n"]
-       fiducials: Float[np.ndarray, "n"]
+       fiducials: Float[h5t.Dataset[FiducialAttrs], "n"]
 
 
    try:
-       h5t.load(Result, "shapes.h5")
+       Result.model_validate_hdf5("shapes.h5")
    except h5t.ValidationError as exc:
        print(exc)
 

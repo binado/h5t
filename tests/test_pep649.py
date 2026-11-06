@@ -6,7 +6,6 @@ inside the test functions because a module-level bare forward reference would ra
 collection time on the versions ``pytestmark`` skips.
 """
 
-import dataclasses
 import gc
 import inspect
 import sys
@@ -17,10 +16,11 @@ import h5py
 import numpy as np
 import pytest
 from jaxtyping import Float
+from pydantic import BaseModel, ConfigDict
 
 import h5t
-from h5t._compile import _PendingRecord
-from h5t._spec import ForeignSpec, MemberKind
+from h5t._compile import _PendingGroup
+from h5t._spec import GroupSpec, MemberKind
 
 from .conftest import write_result
 
@@ -29,13 +29,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def marker(record: type) -> Any:
-    return record.__dict__["__h5t_record__"]
+def marker(group_cls: type) -> Any:
+    return group_cls.__dict__["__h5t_group__"]
 
 
 def test_this_module_keeps_lazy_annotations() -> None:
-    # Guards the guard: adding `from __future__ import annotations` to this module
-    # would stringize every annotation below and silently void the whole file.
     class Probe:
         value: int
 
@@ -43,81 +41,54 @@ def test_this_module_keeps_lazy_annotations() -> None:
 
 
 def test_a_lazy_annotation_may_name_a_class_defined_later() -> None:
-    # Under PEP 649 the annotation is not evaluated at the class statement, so the
-    # bare name below is legal. Compilation still has to defer: inspect.get_annotations
-    # is the evaluation point, and it cannot resolve _DefinedLater yet.
-    @h5t.group()
-    @dataclasses.dataclass
-    class Deferred:
-        later: _DefinedLater  # noqa: F821 -- bound below; lazy under PEP 649
+    class Deferred(h5t.Group):
+        later: _DefinedLater  # noqa: F821
 
-    assert isinstance(marker(Deferred), _PendingRecord)
+    assert isinstance(marker(Deferred), _PendingGroup)
 
-    @h5t.group()
-    @dataclasses.dataclass
-    class _DefinedLater:
-        value: int
+    class _DefinedLater(h5t.Group):
+        value: np.ndarray
 
-    foreign = h5t._compile._ensure_record_compiled(Deferred)
-    fields = {field.py_name: field for field in foreign.spec.fields}
+    spec = h5t._compile._ensure_group_compiled(Deferred)
+    fields = {field.py_name: field for field in spec.fields}
     assert fields["later"].kind is MemberKind.GROUP
     assert fields["later"].member_type is _DefinedLater
 
 
 def test_a_lazy_forward_reference_still_unresolved_reports_a_schema_error() -> None:
-    @h5t.group()
-    @dataclasses.dataclass
-    class Deferred:
-        undefined: _NeverDefined  # noqa: F821 -- never bound anywhere
+    class Deferred(h5t.Group):
+        undefined: _NeverDefined  # noqa: F821
 
-    # h5t.load retries the record before touching the filesystem, so the still-
-    # unresolved name surfaces as the user-visible SchemaError there.
     with pytest.raises(h5t.SchemaError, match="_NeverDefined"):
-        h5t.load(Deferred, "never-opened.h5")
+        Deferred.model_validate_hdf5("never-opened.h5")
 
 
 def test_a_broken_lazy_annotation_helper_is_not_a_forward_reference() -> None:
-    # A NameError escaping a function the annotation calls is a bug in that function.
-    # The lazy form moves where it surfaces -- inside inspect.get_annotations rather
-    # than the class statement's own evaluation -- but it must still raise there.
     def alias():
         return _typo_inside_the_helper  # noqa: F821
 
     with pytest.raises(h5t.SchemaError, match="_typo_inside_the_helper"):
 
-        @h5t.group()
-        @dataclasses.dataclass
-        class Broken:
+        class Broken(h5t.Group):
             value: alias()
 
 
 def test_a_lazy_annotation_helper_that_raises_becomes_a_schema_error() -> None:
-    # Not a NameError at all: it propagates out of inspect.get_annotations and must
-    # be classified the same way the string path already classifies it.
     def alias():
         raise ValueError("kaboom")
 
     with pytest.raises(h5t.SchemaError, match="kaboom"):
 
-        @h5t.group()
-        @dataclasses.dataclass
-        class Broken:
+        class Broken(h5t.Group):
             value: alias()
 
 
-def test_a_deferred_record_needs_localns_for_a_quoted_function_local_annotation() -> None:
-    # A quoted annotation is a bare string even under PEP 649, so the `__annotate__`
-    # closure cannot carry it: a deferred record resolves it only through localns.
-    @h5t.group()
-    @dataclasses.dataclass
-    class Dependency:
-        value: int
+def test_a_deferred_group_needs_localns_for_a_quoted_function_local_annotation() -> None:
+    class Dependency(h5t.Group):
+        value: np.ndarray
 
-    def declare(**kwargs: Any) -> type:
-        # Dependency is not in this frame, so the record defers at decoration.
-        @h5t.group(**kwargs)
-        @dataclasses.dataclass
-        class Deferred:
+    def declare(**kwargs: Any) -> type[h5t.Group[Any]]:
+        class Deferred(h5t.Group, **kwargs):
             dependency: "Dependency"
 
         return Deferred
@@ -126,80 +97,42 @@ def test_a_deferred_record_needs_localns_for_a_quoted_function_local_annotation(
     with_localns = declare(localns={"Dependency": Dependency})
 
     with pytest.raises(h5t.SchemaError, match="Dependency"):
-        h5t.load(plain, "never-opened.h5")
-    fields = h5t._compile._compiled_record(with_localns).spec.fields
+        plain.model_validate_hdf5("never-opened.h5")
+    fields = h5t._compile._compiled_group(with_localns).fields
     assert fields[0].member_type is Dependency
 
 
-def test_a_record_whose_base_carries_the_unresolved_annotation_defers_too() -> None:
-    # A record's bases never compile or snapshot a scope of their own, so
-    # _record_annotation_names unions across the MRO -- mirroring the MRO walk
-    # _compile_foreign_fields does when it actually resolves the annotations.
-    @dataclasses.dataclass
+def test_a_group_whose_base_carries_the_unresolved_annotation_defers_too() -> None:
     class Base:
-        later: _DefinedLater  # noqa: F821 -- bound below; lazy under PEP 649
+        later: _DefinedLater  # noqa: F821
 
-    @h5t.group()
-    @dataclasses.dataclass
-    class Sub(Base):
-        also: int
+    class Sub(Base, h5t.Group):
+        also: np.ndarray
 
-    assert isinstance(marker(Sub), _PendingRecord)
+    assert isinstance(marker(Sub), _PendingGroup)
 
-    @h5t.group()
-    @dataclasses.dataclass
-    class _DefinedLater:
-        value: int
+    class _DefinedLater(h5t.Group):
+        value: np.ndarray
 
-    foreign = h5t._compile._ensure_record_compiled(Sub)
-    assert [field.py_name for field in foreign.spec.fields] == ["later", "also"]
+    spec = h5t._compile._ensure_group_compiled(Sub)
+    assert [field.py_name for field in spec.fields] == ["later", "also"]
 
 
-def test_the_dataset_decorator_does_not_defer_even_under_pep_649() -> None:
-    # @h5t.dataset is eager by design: an attributes-only record can never forward-
-    # reference another schema type, so nothing is gained by deferring, and the
-    # decorator forces __annotate__ to evaluate right here, before Later is bound.
-    # Contrast with test_the_group_decorator_defers_under_pep_649 below.
-    def declare() -> None:
-        with pytest.raises(h5t.SchemaError, match="Later"):
+def test_the_group_defers_under_pep_649() -> None:
+    def declare() -> type[h5t.Group[Any]]:
+        class Local(h5t.Group):
+            later: Later  # noqa: F821
 
-            @h5t.dataset(data="data")
-            @dataclasses.dataclass
-            class Recording:
-                unit: Later  # noqa: F821 -- bound below; never resolves for this decorator
-                data: np.ndarray
-
-        class Later:
-            pass
-
-    declare()
-
-
-def test_the_group_decorator_defers_under_pep_649() -> None:
-    # The PEP 649 win. A GROUP-kind record's fields are not restricted to attributes,
-    # so it may forward-reference another schema type and must defer. Its __annotate__
-    # closes over the defining function's cells, so a bare annotation naming a local
-    # bound *after* the decorator runs resolves without the scope snapshot -- and so
-    # escapes the accepted limitation the quoted form carries, where the referent may
-    # be collected first.
-    def declare() -> type:
-        @h5t.group()
-        @dataclasses.dataclass
-        class Local:
-            later: Later  # noqa: F821 -- bound below; reached via __annotate__'s closure
-
-        @h5t.group()
-        @dataclasses.dataclass
-        class Later:
-            value: int
+        class Later(h5t.Group):
+            value: np.ndarray
 
         return Local
 
     record = declare()
     gc.collect()
-    assert marker(record).localns is None  # nothing retained; the closure carries it
-    foreign = h5t._compile._ensure_record_compiled(record)
-    fields = {field.py_name: field for field in foreign.spec.fields}
+    assert marker(record).localns is None
+    spec = h5t._compile._ensure_group_compiled(record)
+    fields = {field.py_name: field for field in spec.fields}
     assert fields["later"].member_type.__name__ == "Later"
 
 
@@ -207,44 +140,41 @@ def test_a_lazy_schema_loads_from_a_file(tmp_path: Path) -> None:
     path = tmp_path / "result.h5"
     write_result(path)
 
-    @h5t.group(extras="ignore")
-    @dataclasses.dataclass
-    class Lazy:
+    class LazyAttrs(BaseModel):
         version: int
-        values: np.ndarray
-        measurement: LazyRecording  # noqa: F821 -- bound below; lazy under PEP 649
-        nested: LazyNested  # noqa: F821 -- same
-        optional_note: str | None
+        optional_note: str | None = None
 
-    @h5t.dataset(data="data", extras="ignore")
-    @dataclasses.dataclass
-    class LazyRecording:
+    class Lazy(h5t.Group[LazyAttrs]):
+        values: np.ndarray
+        measurement: h5t.Dataset[LazyRecordingAttrs]  # noqa: F821
+        nested: LazyNested  # noqa: F821
+
+    class LazyRecordingAttrs(BaseModel):
         unit: Literal["m"]
-        data: h5t.LazyArray
         scale: float = 1.0
 
-    @h5t.group(extras="forbid")
-    @dataclasses.dataclass
-    class LazyNested:
+    class LazyNestedAttrs(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
         answer: int
 
-    assert isinstance(marker(Lazy), _PendingRecord)
-    record = h5t.load(Lazy, path)
-    assert isinstance(marker(Lazy), ForeignSpec)  # resolved by the load
-    assert record.version == 2
+    class LazyNested(h5t.Group[LazyNestedAttrs]):
+        model_config = ConfigDict(extra="forbid")
+
+    assert isinstance(marker(Lazy), _PendingGroup)
+    record = Lazy.model_validate_hdf5(path)
+    assert isinstance(marker(Lazy), GroupSpec)
+    assert record.attrs.version == 2
     assert np.array_equal(record.values, np.arange(4))
-    assert record.measurement.unit == "m"
-    assert record.measurement.scale == 1.0
-    assert np.array_equal(record.measurement.data.read(), np.arange(5))
-    assert record.nested.answer == 42
-    assert record.optional_note is None
+    assert record.measurement.attrs.unit == "m"
+    assert record.measurement.attrs.scale == 1.0
+    assert np.array_equal(record.measurement.read(), np.arange(5))
+    assert record.nested.attrs.answer == 42
+    assert record.attrs.optional_note is None
 
 
 def test_bare_jaxtyping_annotation_inside_a_function(tmp_path: Path) -> None:
-    # No future import: `Float[np.ndarray, "n"]` is evaluated lazily by __annotate__.
-    @h5t.group()
-    @dataclasses.dataclass
-    class R:
+    class R(h5t.Group):
         x: Float[np.ndarray, "n"]
         y: Float[np.ndarray, "n"]
 
@@ -253,4 +183,4 @@ def test_bare_jaxtyping_annotation_inside_a_function(tmp_path: Path) -> None:
         f["x"] = np.zeros(3)
         f["y"] = np.zeros(4)
     with pytest.raises(h5t.ValidationError, match=r"/y: the size of dimension n is 4"):
-        h5t.load(R, path)
+        R.model_validate_hdf5(path)

@@ -6,10 +6,10 @@
 [![Docs](https://readthedocs.org/projects/h5t/badge/?version=latest)](https://h5t.readthedocs.io/en/latest/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/binado/h5t/blob/main/LICENSE)
 
-`h5t` loads HDF5 groups into detached, typed Python records, and writes them back with
-the same schema. Group attributes and ordinary NumPy-array fields are materialized while
-the file is open. Typed datasets keep snapshot metadata and can read their payload lazily
-without retaining an open file descriptor.
+`h5t` validates and loads HDF5 groups into detached, typed Pydantic models, and writes them
+back using the same schema. Group and dataset attributes are modeled with `pydantic.BaseModel`
+via `h5t.Group[T]` and `h5t.Dataset[T]`, while child datasets remain lazy and read slices on
+demand without retaining open file descriptors.
 
 ## Installation
 
@@ -21,40 +21,44 @@ Requires Python 3.11+. `h5py`, `numpy`, `jaxtyping` and Pydantic v2 are installe
 
 ## Usage
 
-A schema is a plain class: `@h5t.dataset` for a child dataset, `@h5t.group` for a group
-(including the root).
+Subclass `h5t.Group` (or `h5t.Group[Attrs]` where `Attrs` is a `pydantic.BaseModel` subclass)
+to describe an HDF5 group. Use `h5t.Dataset[Attrs]` (or bare `h5t.Dataset`) for lazy datasets
+with typed attributes, or `np.ndarray` for eager array datasets:
 
 ```python
-import dataclasses
 from typing import Annotated
 
 import numpy as np
+from jaxtyping import Float
+from pydantic import BaseModel, Field
 
 import h5t
 
 
-@h5t.dataset(data="data")
-@dataclasses.dataclass
-class Measurement:
+class MeasurementAttrs(BaseModel):
     unit: str
-    data: h5t.LazyArray                       # lazy, detached payload
 
 
-@h5t.group()
-@dataclasses.dataclass
-class Result:
-    version: int                              # HDF5 attribute
-    title: Annotated[str, h5t.Name("name")]   # attribute stored as "name"
-    values: np.ndarray                        # child dataset, read eagerly
-    measurement: Measurement                  # child dataset with attributes
+class ResultAttrs(BaseModel):
+    version: int
+    title: Annotated[str, Field(alias="name")]
 
 
-lazy = h5t.LazyArray("", "", (4,), np.dtype("f8"), data=np.linspace(0, 1, 4))
-record = Result(1, "demo", np.arange(3.0), Measurement("m", lazy))
+class Result(h5t.Group[ResultAttrs]):
+    values: Float[np.ndarray, "n"]                       # child dataset, read eagerly
+    measurement: Float[h5t.Dataset[MeasurementAttrs], "n"]  # lazy child dataset + typed attrs
 
-h5t.save(record, "result.h5", mode="w")
-result = h5t.load(Result, "result.h5")
-print(result.measurement.data.data)           # the payload is read on first access
+
+record = Result(
+    attrs=ResultAttrs(version=1, title="demo"),
+    values=np.arange(4.0),
+    measurement=h5t.Dataset(np.linspace(0, 1, 4), MeasurementAttrs(unit="m")),
+)
+
+record.model_dump_hdf5("result.h5", mode="w")
+result = Result.model_validate_hdf5("result.h5")
+print(result.attrs.title, result.measurement.attrs.unit)
+print(result.measurement[:2])                            # slices are read lazily on demand
 ```
 
 Full documentation: <https://h5t.readthedocs.io/en/latest/>. The `h5t check` command

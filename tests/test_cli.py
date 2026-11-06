@@ -11,15 +11,16 @@ import pytest
 from h5t._cli import main
 
 SCHEMA = """
-import dataclasses
-
+from pydantic import BaseModel
 import h5t
 
 
-@h5t.group()
-@dataclasses.dataclass
-class Result:
+class ResultAttrs(BaseModel):
     version: int
+
+
+class Result(h5t.Group[ResultAttrs]):
+    pass
 """
 
 
@@ -72,11 +73,11 @@ def test_group_record_schema_succeeds(result_file: Path, capsys: pytest.CaptureF
     assert capsys.readouterr().out.startswith("ok:")
 
 
-def test_dataset_record_schema_exits_two(result_file: Path, capsys: pytest.CaptureFixture) -> None:
+def test_non_group_schema_exits_two(result_file: Path, capsys: pytest.CaptureFixture) -> None:
     with pytest.raises(SystemExit) as caught:
-        main(["check", str(result_file), "--schema", "tests.conftest:EagerMeasurement"])
+        main(["check", str(result_file), "--schema", "tests.conftest:MeasurementAttrs"])
     assert caught.value.code == 2
-    assert "dataset record" in capsys.readouterr().err
+    assert "Group subclass" in capsys.readouterr().err
 
 
 def test_unresolved_nested_group_record_exits_two(
@@ -87,20 +88,14 @@ def test_unresolved_nested_group_record_exits_two(
         """\
 from __future__ import annotations
 
-import dataclasses
-
 import h5t
 
 
-@h5t.group()
-@dataclasses.dataclass
-class Inner:
+class Inner(h5t.Group):
     later: Later
 
 
-@h5t.group()
-@dataclasses.dataclass
-class Owner:
+class Owner(h5t.Group):
     nested: Inner
 """
     )

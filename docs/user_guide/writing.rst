@@ -1,29 +1,30 @@
-Writing with ``h5t.save``
-=========================
+Writing with ``model_dump_hdf5``
+================================
 
-:func:`h5t.save` validates a ``@h5t.group`` record against its own schema and writes it,
-so the code that produces files is checked by the same declarations that read them.
+:meth:`h5t.Group.model_dump_hdf5` validates a :class:`h5t.Group` instance against its own
+schema and writes it, so the code that produces files is checked by the same declarations
+that read them.
 
 .. code-block:: python
 
-   import dataclasses
-
    import numpy as np
+   from pydantic import BaseModel
 
    import h5t
 
 
-   @h5t.group()
-   @dataclasses.dataclass
-   class Result:
+   class ResultAttrs(BaseModel):
        version: int
+
+
+   class Result(h5t.Group[ResultAttrs]):
        values: np.ndarray
 
 
-   result = Result(version=1, values=np.arange(3.0))
-   h5t.save(result, "out.h5", mode="w")                    # "w-" (default) fails if it exists
-   h5t.save(result, "out.h5", root="/run2", mode="a")      # add another group to the file
-   print(h5t.load(Result, "out.h5", root="/run2"))
+   result = Result(attrs=ResultAttrs(version=1), values=np.arange(3.0))
+   result.model_dump_hdf5("out.h5", mode="w")                    # "w-" (default) fails if it exists
+   result.model_dump_hdf5("out.h5", root="/run2", mode="a")      # add another group to the file
+   print(Result.model_validate_hdf5("out.h5", root="/run2"))
 
 Options
 -------
@@ -40,23 +41,24 @@ Options
 Attribute serialization
 -----------------------
 
-- ``Attr(serializer=...)`` is the inverse of ``converter`` (e.g. ``json.dumps``).
+- ``PlainSerializer(fn)`` on an attribute field serializes the Python value before writing
+  (e.g. ``PlainSerializer(json.dumps)`` paired with ``BeforeValidator(json.loads)``).
 - An ``Enum`` attribute is stored as its ``.value``.
-- An attribute h5py cannot store (such as a ``dict``) is a ``ValidationError`` telling you
-  to add a serializer.
-- A ``None`` optional is omitted from the file.
-- A field bound with ``attrs=`` writes its undeclared entries back as raw attributes, so
-  load → save keeps them. Declared names always come from their typed fields.
+- An attribute h5py cannot store (such as a raw ``dict`` without a serializer) raises a
+  :class:`h5t.ValidationError`.
+- A ``None`` optional attribute is omitted from the file.
+- An untyped ``Group`` or ``Dataset`` writes its ``attrs`` mapping entries directly as raw
+  HDF5 attributes.
 - Collection keys must be non-empty, contain no ``/`` and match the field's ``Glob``.
 
 Validation first, rollback on failure
 -------------------------------------
 
-The whole record is validated, jaxtyping shapes are checked, and every ``LazyArray``
-payload is read *before* the file is opened, so a bad record never touches the target
-(and saving into the file a ``LazyArray`` came from is safe). If the write itself fails,
-the new file is removed; with ``mode="a"`` the group that ``save`` created is removed on
-a best-effort basis.
+The whole group tree is validated, jaxtyping shapes are checked, and every :class:`h5t.Dataset`
+payload is read *before* the file is opened, so an invalid model never touches the target
+(and saving into the file a lazy ``Dataset`` came from is safe). If the write itself fails,
+the new file is removed; with ``mode="a"`` the group that ``model_dump_hdf5`` created is
+removed on a best-effort basis.
 
-Lazy payloads are copied: an uncached one is read from its source file at save time,
-without caching it on your record.
+Lazy payloads are copied: an uncached ``Dataset`` is read from its source file at save time,
+without caching it on your instance.

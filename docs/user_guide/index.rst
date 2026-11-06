@@ -1,12 +1,11 @@
 User guide
 ==========
 
-- :doc:`schemas`: records, field rules, defaults, extras policy and errors.
-- :doc:`arrays`: ``np.ndarray`` versus ``LazyArray`` versus ``Eager``, and snapshot semantics.
+- :doc:`schemas`: ``Group[T]``, ``Dataset[T]``, field rules, defaults, extras policy and errors.
+- :doc:`arrays`: ``Dataset[T]`` versus ``np.ndarray``, slicing, caching and snapshot semantics.
 - :doc:`jaxtyping`: dtype and shape checks from file metadata.
 - :doc:`collections`: ``dict[str, T]`` fields and ``Glob``.
-- :doc:`payload`: loading undecoratable types with ``Payload``.
-- :doc:`writing`: ``h5t.save``.
+- :doc:`writing`: ``Group.model_dump_hdf5``.
 - :doc:`compilation`: when schemas compile, forward references and ``localns``.
 - :doc:`cli`: the ``h5t check`` command.
 
@@ -18,7 +17,6 @@ User guide
    arrays
    jaxtyping
    collections
-   payload
    writing
    compilation
    cli

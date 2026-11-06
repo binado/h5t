@@ -1,15 +1,15 @@
 Command line: ``h5t check``
 ===========================
 
-``h5t check`` imports a decorated schema, loads a file with it, and reports whether the
-file conforms.
+``h5t check`` imports a :class:`h5t.Group` schema, loads a file with it, and reports whether
+the file conforms.
 
 .. code-block:: bash
 
    h5t check result.h5 --schema mypackage.schemas:Result --root /results/latest
 
 ``--schema``
-    ``pkg.module:ClassName`` of a ``@h5t.group`` record.
+    ``pkg.module:ClassName`` of an :class:`h5t.Group` subclass.
 
 ``--root``
     Absolute path of the group to load (default ``/``).

@@ -1,11 +1,9 @@
-"""Tests for ``h5t.save``."""
+"""Tests for ``Group.model_dump_hdf5``."""
 
 from __future__ import annotations
 
-import dataclasses
 import enum
 import json
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -15,12 +13,13 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from jaxtyping import Float
+from pydantic import BaseModel, BeforeValidator, ConfigDict, PlainSerializer
 
 import h5t
 from tests.conftest import (
-    EagerMeasurement,
-    LazyMeasurement,
+    MeasurementAttrs,
     Nested,
+    NestedAttrs,
     open_fd_count,
     write_result,
 )
@@ -31,74 +30,93 @@ class Color(enum.Enum):
     BLUE = "blue"
 
 
-@h5t.group()
-@dataclasses.dataclass
-class Item:
+class ItemAttrs(BaseModel):
     n: int
 
 
-@h5t.group()
-@dataclasses.dataclass
-class Doc:
+class Item(h5t.Group[ItemAttrs]):
+    pass
+
+
+class DocAttrs(BaseModel):
     version: int
     title: str
     color: Color
     ratio: float
     flag: bool
-    note: str | None
+    note: str | None = None
+    cfg: Annotated[
+        dict[str, Any],
+        BeforeValidator(json.loads),
+        PlainSerializer(json.dumps),
+    ]
+
+
+class Doc(h5t.Group[DocAttrs]):
     fisher: Float[np.ndarray, "n n"]
     nested: Nested
     items: dict[str, Item]
-    cfg: Annotated[dict[str, Any], h5t.Attr(converter=json.loads, serializer=json.dumps)]
     opt_item: Item | None = None
 
 
 def make_doc(**overrides: Any) -> Doc:
-    values: dict[str, Any] = {
+    attr_keys = {"version", "title", "color", "ratio", "flag", "note", "cfg"}
+    attr_values: dict[str, Any] = {
         "version": 3,
         "title": "hello",
         "color": Color.BLUE,
         "ratio": 0.5,
         "flag": True,
         "note": None,
-        "fisher": np.eye(3),
-        "nested": Nested(answer=7),
-        "items": {"a": Item(1), "b": Item(2)},
         "cfg": {"k": [1, 2]},
     }
-    values.update(overrides)
-    return Doc(**values)
+    group_values: dict[str, Any] = {
+        "fisher": np.eye(3),
+        "nested": Nested(attrs=NestedAttrs(answer=7)),
+        "items": {"a": Item(attrs=ItemAttrs(n=1)), "b": Item(attrs=ItemAttrs(n=2))},
+        "opt_item": None,
+    }
+    for k, v in overrides.items():
+        if k in attr_keys:
+            attr_values[k] = v
+        else:
+            group_values[k] = v
+    doc = Doc.model_construct(
+        attrs=DocAttrs.model_construct(**attr_values),
+        **group_values,
+    )
+    return doc
 
 
 def assert_doc_equal(a: Doc, b: Doc) -> None:
-    assert a.version == b.version
-    assert a.title == b.title
-    assert a.color == b.color
-    assert a.ratio == b.ratio
-    assert a.flag == b.flag
-    assert a.note == b.note
+    assert a.attrs.version == b.attrs.version
+    assert a.attrs.title == b.attrs.title
+    assert a.attrs.color == b.attrs.color
+    assert a.attrs.ratio == b.attrs.ratio
+    assert a.attrs.flag == b.attrs.flag
+    assert a.attrs.note == b.attrs.note
+    assert a.attrs.cfg == b.attrs.cfg
     assert np.array_equal(a.fisher, b.fisher)
     assert a.nested == b.nested
     assert a.items == b.items
-    assert a.cfg == b.cfg
     assert a.opt_item == b.opt_item
 
 
 def test_round_trip(tmp_path: Path) -> None:
-    doc = make_doc(opt_item=Item(9))
+    doc = make_doc(opt_item=Item(attrs=ItemAttrs(n=9)))
     path = tmp_path / "doc.h5"
-    h5t.save(doc, path)
-    assert_doc_equal(h5t.load(Doc, path), doc)
+    doc.model_dump_hdf5(path)
+    assert_doc_equal(Doc.model_validate_hdf5(path), doc)
 
 
 def test_enum_stored_as_value_and_none_omitted(tmp_path: Path) -> None:
     path = tmp_path / "doc.h5"
-    h5t.save(make_doc(), path)
+    make_doc().model_dump_hdf5(path)
     with h5py.File(path) as f:
         assert f.attrs["color"] == "blue"
         assert "note" not in f.attrs
         assert "opt_item" not in f
-    assert h5t.load(Doc, path).note is None
+    assert Doc.model_validate_hdf5(path).attrs.note is None
 
 
 @settings(max_examples=25, deadline=None)
@@ -130,75 +148,65 @@ def test_round_trip_property(
         flag=flag,
         note=note,
         fisher=np.ones((size, size)),
-        nested=Nested(answer=answer),
-        items={k: Item(i) for i, k in enumerate(sorted(keys))},
+        nested=Nested(attrs=NestedAttrs(answer=answer)),
+        items={k: Item(attrs=ItemAttrs(n=i)) for i, k in enumerate(sorted(keys))},
     )
     path = tmp_path_factory.mktemp("prop") / "doc.h5"
-    h5t.save(doc, path)
-    assert_doc_equal(h5t.load(Doc, path), doc)
+    doc.model_dump_hdf5(path)
+    assert_doc_equal(Doc.model_validate_hdf5(path), doc)
 
 
-def test_dataset_records_and_lazy_payloads(tmp_path: Path) -> None:
-    @h5t.group()
-    @dataclasses.dataclass
-    class Holder:
-        eager: EagerMeasurement
-        lazy: Annotated[LazyMeasurement, h5t.Payload("data")]
-        samples: h5t.LazyArray
+def test_datasets_and_lazy_payloads(tmp_path: Path) -> None:
+    class Holder(h5t.Group):
+        typed: h5t.Dataset[MeasurementAttrs]
+        samples: h5t.Dataset
 
     src = tmp_path / "src.h5"
     with h5py.File(src, "w") as f:
-        for name in ("eager", "lazy", "samples"):
+        for name in ("typed", "samples"):
             ds = f.create_dataset(name, data=np.arange(4))
             if name != "samples":
                 ds.attrs["unit"] = "m"
-    holder = h5t.load(Holder, src)
-    assert holder.lazy.data._h5t_data is not None
+    holder = Holder.model_validate_hdf5(src)
     dst = tmp_path / "dst.h5"
-    h5t.save(holder, dst)
-    again = h5t.load(Holder, dst)
-    assert np.array_equal(again.lazy.data.read(), np.arange(4))
+    holder.model_dump_hdf5(dst)
+    again = Holder.model_validate_hdf5(dst)
+    assert np.array_equal(again.typed.read(), np.arange(4))
     assert np.array_equal(again.samples.read(), np.arange(4))
-    assert again.eager.unit == "m"
+    assert again.typed.attrs.unit == "m"
 
 
 def test_load_save_load_result_file(tmp_path: Path) -> None:
-    @h5t.group(attrs="snapshot")
-    @dataclasses.dataclass
-    class Snap:
-        version: int
+    class Snap(h5t.Group):
         values: np.ndarray
-        measurement: Annotated[LazyMeasurement, h5t.Payload("data")]
-        snapshot: Mapping[str, Any]
+        measurement: h5t.Dataset[MeasurementAttrs]
 
     src = tmp_path / "result.h5"
     write_result(src)
-    first = h5t.load(Snap, src)
-    assert first.snapshot["undeclared"] == "raw"
+    first = Snap.model_validate_hdf5(src)
+    assert first.attrs["undeclared"] == "raw"
 
     # Same file, different root, append mode: lazy payloads are read before opening.
-    h5t.save(first, src, root="/copy", mode="a")
-    second = h5t.load(Snap, src, root="/copy")
-    assert second.snapshot["undeclared"] == "raw"
-    assert np.array_equal(second.measurement.data.read(), np.arange(5))
+    first.model_dump_hdf5(src, root="/copy", mode="a")
+    second = Snap.model_validate_hdf5(src, root="/copy")
+    assert second.attrs["undeclared"] == "raw"
+    assert np.array_equal(second.measurement.read(), np.arange(5))
     assert np.array_equal(second.values, np.arange(4))
 
     dst = tmp_path / "dst.h5"
-    h5t.save(first, dst)
-    assert h5t.load(Snap, dst).version == 2
+    first.model_dump_hdf5(dst)
+    assert Snap.model_validate_hdf5(dst).attrs["version"] == 2
 
 
-def test_snapshot_forbid_rejects_undeclared(tmp_path: Path) -> None:
-    @h5t.group(attrs="snap", extras="forbid")
-    @dataclasses.dataclass
-    class Strict:
-        a: int
-        snap: Mapping[str, Any]
+def test_untyped_forbid_rejects_undeclared_attrs_on_dump(tmp_path: Path) -> None:
+    class Strict(h5t.Group):
+        model_config = ConfigDict(extra="forbid")
 
-    ok = Strict(a=1, snap={"a": 1})
-    h5t.save(ok, tmp_path / "ok.h5")
+    ok = Strict()
+    ok.model_dump_hdf5(tmp_path / "ok.h5")
+    bad = Strict.model_construct(attrs={"zzz": 1})
     with pytest.raises(h5t.ValidationError, match="unexpected attribute") as info:
-        h5t.save(Strict(a=1, snap={"zzz": 1}), tmp_path / "bad.h5")
+        bad.model_dump_hdf5(tmp_path / "bad.h5")
     assert info.value.path == "/@zzz"
     assert not (tmp_path / "bad.h5").exists()
 
@@ -209,130 +217,127 @@ def test_snapshot_forbid_rejects_undeclared(tmp_path: Path) -> None:
         ({"version": "nope"}, "/@version"),
         ({"fisher": np.ones((2, 3))}, "/fisher"),
         ({"fisher": np.ones((2, 2), dtype=int)}, "/fisher"),
-        ({"items": {"a/b": Item(1)}}, "/items/a/b"),
-        ({"items": {"": Item(1)}}, "/items/"),
-        ({"items": {"a": Nested(answer=1)}}, "/items/a"),
+        ({"items": {"a/b": Item(attrs=ItemAttrs(n=1))}}, "/items/a/b"),
+        ({"items": {"": Item(attrs=ItemAttrs(n=1))}}, "/items/"),
+        ({"items": {"a": Nested(attrs=NestedAttrs(answer=1))}}, "/items/a"),
         ({"nested": None}, "/nested"),
     ],
 )
 def test_failures_leave_no_file(tmp_path: Path, overrides: dict[str, Any], path: str) -> None:
     target = tmp_path / "doc.h5"
     with pytest.raises(h5t.ValidationError) as info:
-        h5t.save(make_doc(**overrides), target)
+        make_doc(**overrides).model_dump_hdf5(target)
     assert info.value.path == path
     assert not target.exists()
 
 
 def test_failures_leave_existing_file_bytes_unchanged(tmp_path: Path) -> None:
     target = tmp_path / "doc.h5"
-    h5t.save(make_doc(), target)
+    make_doc().model_dump_hdf5(target)
     before = target.read_bytes()
     with pytest.raises(h5t.ValidationError):
-        h5t.save(make_doc(fisher=np.ones((2, 3))), target, root="/other", mode="a")
+        make_doc(fisher=np.ones((2, 3))).model_dump_hdf5(target, root="/other", mode="a")
     assert target.read_bytes() == before
 
 
 def test_unstorable_attribute_requires_serializer(tmp_path: Path) -> None:
-    @h5t.group()
-    @dataclasses.dataclass
-    class Raw:
-        config: Annotated[dict[str, Any], h5t.Attr()]
+    class RawAttrs(BaseModel):
+        config: dict[str, Any]
 
-    with pytest.raises(h5t.ValidationError, match="serializer") as info:
-        h5t.save(Raw(config={"a": 1}), tmp_path / "raw.h5")
+    class Raw(h5t.Group[RawAttrs]):
+        pass
+
+    with pytest.raises(h5t.ValidationError, match="PlainSerializer") as info:
+        Raw(attrs=RawAttrs(config={"a": 1})).model_dump_hdf5(tmp_path / "raw.h5")
     assert info.value.path == "/@config"
 
 
 def test_glob_mismatch_rejected(tmp_path: Path) -> None:
-    @h5t.group()
-    @dataclasses.dataclass
-    class Globbed:
+    class Globbed(h5t.Group):
         snaps: Annotated[dict[str, Item], h5t.Glob("snap_*")]
 
-    h5t.save(Globbed(snaps={"snap_1": Item(1)}), tmp_path / "ok.h5")
+    Globbed(snaps={"snap_1": Item(attrs=ItemAttrs(n=1))}).model_dump_hdf5(tmp_path / "ok.h5")
     with pytest.raises(h5t.ValidationError, match="Glob") as info:
-        h5t.save(Globbed(snaps={"other": Item(1)}), tmp_path / "bad.h5")
+        Globbed(snaps={"other": Item(attrs=ItemAttrs(n=1))}).model_dump_hdf5(tmp_path / "bad.h5")
     assert info.value.path == "/snaps/other"
 
 
 def test_apply_failure_cleans_up(tmp_path: Path) -> None:
-    @h5t.group()
-    @dataclasses.dataclass
-    class Strings:
+    class Strings(h5t.Group):
         names: np.ndarray
 
     bad = Strings(names=np.array(["a", "b"]))  # unicode arrays are not HDF5-writable
     target = tmp_path / "s.h5"
     before = open_fd_count()
     with pytest.raises(h5t.ValidationError) as info:
-        h5t.save(bad, target)
+        bad.model_dump_hdf5(target)
     assert info.value.path == "/names"
     assert not target.exists()
     assert open_fd_count() == before
 
-    h5t.save(make_doc(), target)
+    make_doc().model_dump_hdf5(target)
     snapshot = target.read_bytes()
     with pytest.raises(h5t.ValidationError):
-        h5t.save(bad, target, root="/a/b", mode="a")
+        bad.model_dump_hdf5(target, root="/a/b", mode="a")
     with h5py.File(target) as f:
-        assert "a" not in f  # the groups save created were removed
-    assert h5t.load(Doc, target).version == 3
-    assert snapshot  # the original file still opens and loads
+        assert "a" not in f
+    assert Doc.model_validate_hdf5(target).attrs.version == 3
+    assert snapshot
 
 
 def test_modes(tmp_path: Path) -> None:
     target = tmp_path / "doc.h5"
-    h5t.save(make_doc(), target)
+    make_doc().model_dump_hdf5(target)
     with pytest.raises(OSError):
-        h5t.save(make_doc(), target)
+        make_doc().model_dump_hdf5(target)
     with pytest.raises(OSError):
-        h5t.save(make_doc(), target, mode="x")
-    h5t.save(make_doc(version=5), target, mode="w")
-    assert h5t.load(Doc, target).version == 5
+        make_doc().model_dump_hdf5(target, mode="x")
+    make_doc(version=5).model_dump_hdf5(target, mode="w")
+    assert Doc.model_validate_hdf5(target).attrs.version == 5
     with pytest.raises(ValueError, match="mode"):
-        h5t.save(make_doc(), target, mode="r")  # ty: ignore[invalid-argument-type]
+        make_doc().model_dump_hdf5(target, mode="r")  # ty: ignore[invalid-argument-type]
 
 
 def test_save_nested_root_creates_intermediate_groups(tmp_path: Path) -> None:
     target = tmp_path / "doc.h5"
-    h5t.save(make_doc(), target, root="/a/b")
-    assert h5t.load(Doc, target, root="/a/b").version == 3
+    make_doc().model_dump_hdf5(target, root="/a/b")
+    assert Doc.model_validate_hdf5(target, root="/a/b").attrs.version == 3
 
 
 def test_save_nonempty_root_without_overwrite_raises(tmp_path: Path) -> None:
     target = tmp_path / "doc.h5"
-    h5t.save(make_doc(), target, root="/a/b")
+    make_doc().model_dump_hdf5(target, root="/a/b")
     with pytest.raises(h5t.ValidationError, match="not empty") as info:
-        h5t.save(make_doc(), target, root="/a/b", mode="a")
+        make_doc().model_dump_hdf5(target, root="/a/b", mode="a")
     assert info.value.path == "/a/b"
 
 
 def test_save_nonempty_root_with_overwrite_replaces(tmp_path: Path) -> None:
     target = tmp_path / "doc.h5"
-    h5t.save(make_doc(), target, root="/a/b")
-    h5t.save(make_doc(version=8), target, root="/a/b", mode="a", overwrite=True)
-    assert h5t.load(Doc, target, root="/a/b").version == 8
+    make_doc().model_dump_hdf5(target, root="/a/b")
+    make_doc(version=8).model_dump_hdf5(target, root="/a/b", mode="a", overwrite=True)
+    assert Doc.model_validate_hdf5(target, root="/a/b").attrs.version == 8
 
 
 def test_save_file_root_nonempty_without_overwrite_raises(tmp_path: Path) -> None:
     target = tmp_path / "doc.h5"
-    h5t.save(make_doc(), target)
+    make_doc().model_dump_hdf5(target)
     with pytest.raises(h5t.ValidationError, match="not empty"):
-        h5t.save(make_doc(), target, mode="a")
+        make_doc().model_dump_hdf5(target, mode="a")
 
 
 def test_save_file_root_overwrite_clears_old_children(tmp_path: Path) -> None:
     target = tmp_path / "doc.h5"
-    h5t.save(make_doc(), target, root="/a/b")
-    h5t.save(make_doc(version=10), target, mode="a", overwrite=True)
-    assert h5t.load(Doc, target).version == 10
+    make_doc().model_dump_hdf5(target, root="/a/b")
+    make_doc(version=10).model_dump_hdf5(target, mode="a", overwrite=True)
+    assert Doc.model_validate_hdf5(target).attrs.version == 10
     with h5py.File(target) as f:
         assert "a" not in f
 
 
 def test_save_relative_root_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="absolute"):
-        h5t.save(make_doc(), tmp_path / "x.h5", root="rel")
+        make_doc().model_dump_hdf5(tmp_path / "x.h5", root="rel")
 
 
 def test_root_occupied_by_dataset(tmp_path: Path) -> None:
@@ -340,45 +345,28 @@ def test_root_occupied_by_dataset(tmp_path: Path) -> None:
     with h5py.File(target, "w") as f:
         f.create_dataset("d", data=1)
     with pytest.raises(h5t.ValidationError, match="found a dataset"):
-        h5t.save(make_doc(), target, root="/d", mode="a")
+        make_doc().model_dump_hdf5(target, root="/d", mode="a")
 
 
-def test_schema_errors(tmp_path: Path) -> None:
-    with pytest.raises(h5t.SchemaError, match="dataset record"):
-        h5t.save(EagerMeasurement("m", np.arange(2)), tmp_path / "a.h5")
-
-    class Plain:
-        pass
-
-    with pytest.raises(h5t.SchemaError, match="not a decorated"):
-        h5t.save(Plain(), tmp_path / "b.h5")
-
-    with pytest.raises(h5t.SchemaError, match="serializer must be callable"):
-
-        @h5t.group()
-        @dataclasses.dataclass
-        class BadSerializer:
-            x: Annotated[int, h5t.Attr(serializer=3)]  # ty: ignore[invalid-argument-type]
-
-
-def test_serializer_failure_is_conversion_error(tmp_path: Path) -> None:
+def test_serializer_failure_is_validation_error(tmp_path: Path) -> None:
     def boom(_: Any) -> Any:
         raise RuntimeError("no")
 
-    @h5t.group()
-    @dataclasses.dataclass
-    class Boom:
-        x: Annotated[int, h5t.Attr(serializer=boom)]
+    class BoomAttrs(BaseModel):
+        x: Annotated[int, PlainSerializer(boom)]
 
-    with pytest.raises(h5t.ConversionError, match="serializer failed") as info:
-        h5t.save(Boom(x=1), tmp_path / "boom.h5")
+    class Boom(h5t.Group[BoomAttrs]):
+        pass
+
+    with pytest.raises(h5t.ValidationError, match="serializer failed") as info:
+        Boom(attrs=BoomAttrs(x=1)).model_dump_hdf5(tmp_path / "boom.h5")
     assert info.value.path == "/@x"
 
 
 def test_no_fd_leak(tmp_path: Path) -> None:
     before = open_fd_count()
-    h5t.save(make_doc(), tmp_path / "ok.h5")
+    make_doc().model_dump_hdf5(tmp_path / "ok.h5")
     with pytest.raises(h5t.ValidationError):
-        h5t.save(make_doc(fisher=np.ones((2, 3))), tmp_path / "bad.h5")
-    h5t.load(Doc, tmp_path / "ok.h5")
+        make_doc(fisher=np.ones((2, 3))).model_dump_hdf5(tmp_path / "bad.h5")
+    Doc.model_validate_hdf5(tmp_path / "ok.h5")
     assert open_fd_count() == before

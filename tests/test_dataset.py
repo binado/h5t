@@ -1,66 +1,58 @@
-"""Detached dataset metadata, lazy caching, live opens, and lifetime hygiene."""
+"""Detached dataset metadata, lazy slicing/caching, live opens, and lifetime hygiene."""
 
 from __future__ import annotations
 
-import dataclasses
 import os
 from pathlib import Path
-from typing import Annotated
 
 import h5py
 import numpy as np
 import pytest
+from pydantic import BaseModel, ConfigDict
 
 import h5t
 
-from .conftest import EagerMeasurement, LazyMeasurement, Result, open_fd_count, write_result
+from .conftest import MeasurementAttrs, Result, open_fd_count, write_result
 
 
 def test_metadata_and_all_attributes_are_snapshots(result_file: Path) -> None:
-    @h5t.dataset(data="data", attrs="attrs")
-    @dataclasses.dataclass
-    class Snapshot:
+    class SnapshotAttrs(BaseModel):
         unit: str
-        data: h5t.LazyArray
-        attrs: dict[str, object]
         scale: float = 1.0
 
-    @h5t.group()
-    @dataclasses.dataclass
-    class Owner:
-        measurement: Snapshot
+    class Owner(h5t.Group):
+        measurement: h5t.Dataset[SnapshotAttrs]
+        raw_measurement: h5t.Dataset
 
-    measurement = h5t.load(Owner, result_file).measurement
-    assert measurement.data.path == "/measurement"
-    assert measurement.data.shape == (5,)
-    assert measurement.data.dtype == np.dtype("int64")
-    assert measurement.data.ndim == 1
-    assert measurement.unit == "m"
-    assert measurement.scale == 1.0
-    assert measurement.attrs["unit"] == "m"
-    assert measurement.attrs["scale"] == 1.0
-    assert measurement.attrs["extra"] == "measurement"
+    loaded = Owner.model_validate_hdf5(result_file)
+    measurement = loaded.measurement
+    assert measurement.path == "/measurement"
+    assert measurement.shape == (5,)
+    assert measurement.dtype == np.dtype("int64")
+    assert measurement.ndim == 1
+    assert measurement.size == 5
+    assert measurement.nbytes == 40
+    assert measurement.attrs.unit == "m"
+    assert measurement.attrs.scale == 1.0
+    assert loaded.raw_measurement.attrs["unit"] == "m"
+    assert loaded.raw_measurement.attrs["extra"] == "raw_measurement"
 
     with h5py.File(result_file, "a") as file:
         del file["measurement"]
         changed = file.create_dataset("measurement", data=np.arange(10))
         changed.attrs["unit"] = "s"
-    assert measurement.data.shape == (5,)
-    assert measurement.unit == "m"
-    assert measurement.attrs["unit"] == "m"
+    assert measurement.shape == (5,)
+    assert measurement.attrs.unit == "m"
 
 
 def test_forbidden_dataset_extra_attribute_fails_with_path(tmp_path: Path) -> None:
-    @h5t.dataset(data="data", extras="forbid")
-    @dataclasses.dataclass
-    class Strict:
-        unit: str
-        data: h5t.LazyArray
+    class StrictAttrs(BaseModel):
+        model_config = ConfigDict(extra="forbid")
 
-    @h5t.group()
-    @dataclasses.dataclass
-    class Owner:
-        payload: Strict
+        unit: str
+
+    class Owner(h5t.Group):
+        payload: h5t.Dataset[StrictAttrs]
 
     path = tmp_path / "strict-dataset.h5"
     with h5py.File(path, "w") as file:
@@ -68,75 +60,81 @@ def test_forbidden_dataset_extra_attribute_fails_with_path(tmp_path: Path) -> No
         dataset.attrs["unit"] = "m"
         dataset.attrs["surprise"] = 1
     with pytest.raises(h5t.ValidationError) as caught:
-        h5t.load(Owner, path)
+        Owner.model_validate_hdf5(path)
     assert caught.value.path == "/payload@surprise"
 
 
-def test_lazy_data_observes_current_file_once_and_preserves_identity(result_file: Path) -> None:
-    payload = h5t.load(Result, result_file).measurement.data
+def test_lazy_data_and_indexing_observe_file_and_cache(result_file: Path) -> None:
+    measurement = Result.model_validate_hdf5(result_file).measurement
     with h5py.File(result_file, "a") as file:
         file["measurement"][...] = np.arange(5) + 10
-    first = payload.data
-    assert np.array_equal(first, np.arange(5) + 10)
+    # Partial slice reads from disk without caching the full array
+    assert np.array_equal(measurement[:2], [10, 11])
     with h5py.File(result_file, "a") as file:
         file["measurement"][...] = np.arange(5) + 20
-    assert payload.data is first
-    assert payload.read() is first
-
-
-def test_eager_data_is_captured_during_loading(result_file: Path) -> None:
-    payload = h5t.load(Result, result_file).eager_measurement.data
+    # Full read via [()] or .data caches the array
+    first = measurement[()]
+    assert np.array_equal(first, np.arange(5) + 20)
     with h5py.File(result_file, "a") as file:
-        file["eager_measurement"][...] = np.arange(5) + 100
-    assert np.array_equal(payload.data, np.arange(5))
+        file["measurement"][...] = np.arange(5) + 30
+    assert measurement.data is first
+    assert measurement.read() is first
+    assert measurement[:] is first
+    assert np.array_equal(measurement[:2], [20, 21])
+    assert np.array_equal(np.asarray(measurement), first)
 
 
 def test_scalar_dataset_payload_is_zero_dimensional_array(tmp_path: Path) -> None:
-    @h5t.group()
-    @dataclasses.dataclass
-    class Scalar:
+    class Scalar(h5t.Group):
         plain: np.ndarray
-        detached: h5t.LazyArray
+        detached: h5t.Dataset
 
     path = tmp_path / "scalar.h5"
     with h5py.File(path, "w") as file:
         file.create_dataset("plain", data=7)
         file.create_dataset("detached", data=9)
-    loaded = h5t.load(Scalar, path)
+    loaded = Scalar.model_validate_hdf5(path)
     assert isinstance(loaded.plain, np.ndarray) and loaded.plain.shape == ()
-    assert isinstance(loaded.detached.data, np.ndarray) and loaded.detached.data.shape == ()
+    assert isinstance(loaded.detached[()], np.ndarray) and loaded.detached[()].shape == ()
 
 
 def test_open_supports_slices_repeated_opens_and_closes_on_exceptions(result_file: Path) -> None:
-    payload = h5t.load(Result, result_file).measurement.data
-    with payload.open() as live:
+    measurement = Result.model_validate_hdf5(result_file).measurement
+    with measurement.open() as live:
         assert np.array_equal(live[:2], [0, 1])
     assert not live.id.valid
-    with payload.open() as second:
+    with measurement.open() as second:
         assert second.shape == (5,)
     with pytest.raises(RuntimeError):
-        with payload.open() as exceptional:
+        with measurement.open() as exceptional:
             raise RuntimeError("consumer failed")
     assert not exceptional.id.valid
 
 
+def test_in_memory_dataset_slicing_and_equality() -> None:
+    ds1 = h5t.Dataset(np.arange(5), MeasurementAttrs(unit="m"))
+    ds2 = h5t.Dataset[MeasurementAttrs](np.arange(5), {"unit": "m"})
+    assert ds1 == ds2
+    assert np.array_equal(ds1[1:4], [1, 2, 3])
+    with pytest.raises(h5t.ValidationError, match="not backed by an HDF5 file"):
+        with ds1.open():
+            pass
+
+
 def test_deleted_source_preserves_snapshot_but_live_access_fails(result_file: Path) -> None:
-    measurement = h5t.load(Result, result_file).measurement
+    measurement = Result.model_validate_hdf5(result_file).measurement
     os.unlink(result_file)
-    assert measurement.data.shape == (5,)
-    assert measurement.unit == "m"
+    assert measurement.shape == (5,)
+    assert measurement.attrs.unit == "m"
     with pytest.raises(OSError):
-        measurement.data.read()
+        measurement.read()
 
 
 @pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="requires POSIX descriptors")
 def test_no_descriptors_leak_on_success_or_failure(tmp_path: Path) -> None:
-    @h5t.group(extras="ignore")
-    @dataclasses.dataclass
-    class Owner:
-        measurement: Annotated[LazyMeasurement, h5t.Payload("data")]
-        eager_measurement: EagerMeasurement
-        values: h5t.LazyArray
+    class Owner(h5t.Group):
+        measurement: h5t.Dataset[MeasurementAttrs]
+        values: h5t.Dataset
 
     good = tmp_path / "good.h5"
     write_result(good)
@@ -145,13 +143,13 @@ def test_no_descriptors_leak_on_success_or_failure(tmp_path: Path) -> None:
         pass
 
     def exercise() -> None:
-        h5t.load(Result, good)
-        h5t.load(Owner, good).measurement.data.read()
-        h5t.load(Owner, good).values.read()
+        Result.model_validate_hdf5(good)
+        Owner.model_validate_hdf5(good).measurement.read()
+        Owner.model_validate_hdf5(good).values[:2]
         with pytest.raises(h5t.ValidationError):
-            h5t.load(Result, bad)
+            Result.model_validate_hdf5(bad)
         with pytest.raises(h5t.ValidationError):
-            h5t.load(Owner, bad)
+            Owner.model_validate_hdf5(bad)
 
     exercise()
     baseline = open_fd_count()

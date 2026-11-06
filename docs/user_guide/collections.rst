@@ -2,13 +2,13 @@ Dynamic collections
 ===================
 
 Real files often hold one group or dataset per sample, with names a schema cannot list.
-A ``dict[str, T]`` or ``Mapping[str, T]`` field (no :class:`h5t.Attr`) mirrors the HDF5
-tree: it names **one child group** (:class:`h5t.Name` is honoured), and its value is a
-plain ``dict`` with one item per child of that group, in HDF5 iteration order.
+A ``dict[str, T]`` or ``Mapping[str, T]`` field on a :class:`h5t.Group` mirrors the HDF5
+tree: it names **one child group** (Pydantic's ``Field(alias=...)`` is honoured), and its
+value is a plain ``dict`` with one item per child of that group, in HDF5 iteration order.
 Attributes on the collection's own group are ignored.
 
-``T`` is any group/dataset record, ``Payload`` type, ``LazyArray``, ``np.ndarray`` or
-jaxtyping array.
+``T`` is any :class:`h5t.Group` subclass, :class:`h5t.Dataset` (or ``Dataset[Attrs]``),
+``np.ndarray``, or jaxtyping array.
 
 Filtering with ``Glob``
 -----------------------
@@ -18,11 +18,11 @@ shell-style pattern (case-sensitive; it may not be empty or contain ``/``).
 
 .. code-block:: python
 
-   import dataclasses
    from typing import Annotated
 
    import h5py
    import numpy as np
+   from pydantic import BaseModel, Field
 
    import h5t
 
@@ -33,23 +33,23 @@ shell-style pattern (case-sensitive; it may not be empty or contain ``/``).
        f.create_group("snaps/s2").attrs["step"] = 2
 
 
-   @h5t.group()
-   @dataclasses.dataclass
-   class Snapshot:
+   class SnapshotAttrs(BaseModel):
        step: int
 
 
-   @h5t.group()
-   @dataclasses.dataclass
-   class Run:
+   class Snapshot(h5t.Group[SnapshotAttrs]):
+       pass
+
+
+   class Run(h5t.Group):
        snaps: dict[str, Snapshot]
-       chains: Annotated[dict[str, h5t.LazyArray], h5t.Glob("chain_?")]
-       raw: Annotated[dict[str, Snapshot], h5t.Name("Raw Data")] = dataclasses.field(
+       chains: Annotated[dict[str, h5t.Dataset], h5t.Glob("chain_?")]
+       raw: Annotated[dict[str, Snapshot], Field(alias="Raw Data")] = Field(
            default_factory=dict
        )
 
 
-   run = h5t.load(Run, "runs.h5")
+   run = Run.model_validate_hdf5("runs.h5")
    print(list(run.snaps), list(run.chains), run.raw)
 
 Rules and limits
@@ -58,9 +58,8 @@ Rules and limits
 - A missing group follows the usual rules (``| None``, a default or ``default_factory``,
   else a :class:`h5t.ValidationError`).
 - Keys must be ``str``. Items cannot be scalars, optional, nested collections, or carry
-  ``Name`` / ``Attr`` / ``Glob``.
-- Bare array items share the owner record's jaxtyping dimension bindings; record items
-  bind independently.
-- Layouts with per-sample groups at the file *root* are not covered yet.
-- On :func:`h5t.save`, collection keys must be non-empty, contain no ``/`` and match the
-  field's ``Glob``; otherwise the item would not load back.
+  ``Field(alias=...)`` / ``Glob``.
+- Array and ``Dataset`` items share the owner group's jaxtyping dimension bindings; nested
+  ``Group`` items bind independently.
+- On :meth:`h5t.Group.model_dump_hdf5`, collection keys must be non-empty, contain no ``/``
+  and match the field's ``Glob``; otherwise the item would not load back.
