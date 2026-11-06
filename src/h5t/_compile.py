@@ -510,7 +510,9 @@ def _field_spec(
     elif isinstance(origin, type) and issubclass(origin, Dataset):
         is_dataset = True
         args = typing.get_args(core)
-        if args:
+        # A still-open TypeVar (``Dataset[T]`` in a generic group) says nothing about
+        # the attrs model, so it behaves like a bare ``Dataset``.
+        if args and not isinstance(args[0], TypeVar):
             dataset_cls = origin[args[0]]
             if dataset_cls._h5t_attrs_type is not None:
                 dataset_attrs = _compile_attrs_spec(dataset_cls._h5t_attrs_type, owner)
@@ -698,6 +700,13 @@ def _ensure_group_compiled(cls: type[Group[Any]]) -> GroupSpec:
         if localns:
             ns.update(localns)
         _rebuild_model(cls, ns)
+        if not getattr(cls, "__pydantic_complete__", True):
+            raise SchemaError(
+                f"{cls.__name__}: the Pydantic model is still incomplete after resolving "
+                f"annotations; a forward reference could not be resolved. If it is defined "
+                f"in a function scope, declare the group with `localns={{...}}` as a class "
+                f"keyword argument."
+            )
         cls.__pydantic_parent_namespace__ = None
     setattr(cls, "__h5t_group__", spec)  # noqa: B010
     return spec

@@ -398,13 +398,17 @@ def test_failed_overwrite_is_destructive_like_h5py(
         assert list(f[root].attrs) == []
 
 
+@pytest.mark.parametrize("rollback_exc", [KeyError, OSError, ValueError, RuntimeError, TypeError])
 def test_rollback_failure_is_attached_to_the_original_error(
-    tmp_path: Path, unwritable_names: _Names, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    unwritable_names: _Names,
+    monkeypatch: pytest.MonkeyPatch,
+    rollback_exc: type[Exception],
 ) -> None:
     from h5t import _write
 
     def broken_rollback(self: _write._Undo, file: h5py.File) -> None:
-        raise KeyError("cannot undo")
+        raise rollback_exc("cannot undo")
 
     target = tmp_path / "doc.h5"
     make_doc().model_dump_hdf5(target)

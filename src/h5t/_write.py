@@ -382,7 +382,7 @@ def _roll_back(
         return
     try:
         undo.rollback(h5file)
-    except (KeyError, OSError, ValueError) as rollback_exc:
+    except Exception as rollback_exc:
         exc.add_note(
             f"h5t: rollback failed, {filename!r} may contain partially written data: {rollback_exc}"
         )

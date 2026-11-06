@@ -323,6 +323,24 @@ def test_generic_group_subclass_enforces_attrs_extra_forbid(tmp_path: Path) -> N
     assert caught.value.path == "/@surprise"
 
 
+class _OpenDatasetGeneric(h5t.Group[T_attrs], typing.Generic[T_attrs]):
+    ds: h5t.Dataset[T_attrs]
+
+
+class _OpenDatasetAttrs(BaseModel):
+    answer: int
+
+
+def test_generic_group_with_open_typevar_dataset_compiles_and_loads(tmp_path: Path) -> None:
+    path = tmp_path / "open-typevar.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["answer"] = 1
+        file.create_dataset("ds", data=np.arange(3)).attrs["answer"] = 2
+    loaded = _OpenDatasetGeneric[_OpenDatasetAttrs].model_validate_hdf5(path)
+    assert loaded.ds.shape == (3,)
+    assert loaded.ds.attrs.answer == 2
+
+
 def test_unresolved_name_error_names_it_and_suggests_localns() -> None:
     class Pending(h5t.Group):
         child: _NeverResolved  # noqa: F821
