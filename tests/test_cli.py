@@ -126,3 +126,63 @@ def test_io_and_invalid_root_exit_two(
     with pytest.raises(SystemExit) as caught:
         main(["check", str(path), "--schema", schema_ref, "--root", "relative"])
     assert caught.value.code == 2
+
+
+BUGGY_SCHEMA = """
+from pydantic import BaseModel, field_validator
+import h5t
+
+
+class BuggyAttrs(BaseModel):
+    version: int
+
+    @field_validator("version")
+    @classmethod
+    def explode(cls, value):
+        raise KeyError("validator bug")
+
+
+class Buggy(h5t.Group[BuggyAttrs]):
+    pass
+"""
+
+
+@pytest.fixture
+def buggy_schema_ref(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    module_name = f"buggy_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{module_name}.py").write_text(BUGGY_SCHEMA)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    return f"{module_name}:Buggy"
+
+
+@pytest.fixture
+def versioned_file(tmp_path: Path) -> Path:
+    path = tmp_path / "versioned.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["version"] = 1
+    return path
+
+
+def test_validator_bug_exits_two_and_names_the_exception_type(
+    versioned_file: Path, buggy_schema_ref: str, capsys: pytest.CaptureFixture
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["check", str(versioned_file), "--schema", buggy_schema_ref])
+    assert caught.value.code == 2
+    assert "KeyError" in capsys.readouterr().err
+
+
+def test_traceback_flag_reraises_unexpected_errors(
+    versioned_file: Path, buggy_schema_ref: str
+) -> None:
+    with pytest.raises(KeyError):
+        main(["check", str(versioned_file), "--schema", buggy_schema_ref, "--traceback"])
+
+
+def test_oserror_message_names_the_exception_type(
+    tmp_path: Path, schema_ref: str, capsys: pytest.CaptureFixture
+) -> None:
+    with pytest.raises(SystemExit):
+        main(["check", str(tmp_path / "missing.h5"), "--schema", schema_ref])
+    assert "FileNotFoundError" in capsys.readouterr().err
