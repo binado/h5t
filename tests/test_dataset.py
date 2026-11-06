@@ -156,3 +156,30 @@ def test_no_descriptors_leak_on_success_or_failure(tmp_path: Path) -> None:
     for _ in range(20):
         exercise()
     assert open_fd_count() == baseline
+
+
+_KEY_CASES = {
+    "ellipsis": ...,
+    "empty-tuple": (),
+    "full-slice": slice(None),
+    "negative-int": -1,
+    "int-list": [0, 2, 4],
+    "int-array": np.array([0, 2, 4]),
+    "bool-mask": np.array([True, False, True, False, True]),
+    "slice-tuple": (slice(1, 4),),
+    "stepped-slice": slice(None, None, 2),
+}
+
+
+@pytest.fixture(params=["in-memory", "file-backed"])
+def indexed_dataset(request: pytest.FixtureRequest, result_file: Path) -> h5t.Dataset:
+    if request.param == "in-memory":
+        return h5t.Dataset(np.arange(5), MeasurementAttrs(unit="m"))
+    return Result.model_validate_hdf5(result_file).measurement
+
+
+@pytest.mark.parametrize("key", list(_KEY_CASES.values()), ids=list(_KEY_CASES))
+def test_dataset_getitem_numpy_keys_match_ndarray_indexing(
+    indexed_dataset: h5t.Dataset, key: object
+) -> None:
+    np.testing.assert_array_equal(indexed_dataset[key], np.arange(5)[key])

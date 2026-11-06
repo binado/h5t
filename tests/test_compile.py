@@ -14,6 +14,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
 import h5t
+from h5t._compile import _rebuild_model
 from h5t._spec import GroupSpec, MemberKind
 
 
@@ -249,3 +250,41 @@ def test_removed_api_is_absent() -> None:
     for name in removed:
         assert not hasattr(h5t, name)
         assert name not in h5t.__all__
+
+
+class _Plain(BaseModel):
+    value: int = 0
+
+
+def test_rebuild_model_unresolved_annotation_is_tolerated(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic import PydanticUndefinedAnnotation
+
+    def undefined(*args: object, **kwargs: object) -> None:
+        raise PydanticUndefinedAnnotation("Later", "name 'Later' is not defined")
+
+    monkeypatch.setattr(_Plain, "model_rebuild", undefined)
+    _rebuild_model(_Plain, {})
+
+
+def test_rebuild_model_schema_failure_raises_schema_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic import PydanticUserError
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise PydanticUserError("bad schema", code=None)
+
+    monkeypatch.setattr(_Plain, "model_rebuild", broken)
+    with pytest.raises(h5t.SchemaError, match="_Plain.*bad schema") as caught:
+        _rebuild_model(_Plain, {})
+    assert isinstance(caught.value.__cause__, PydanticUserError)
+
+
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, RuntimeError])
+def test_rebuild_model_unrelated_exceptions_propagate(
+    monkeypatch: pytest.MonkeyPatch, exc_type: type[BaseException]
+) -> None:
+    def interrupted(*args: object, **kwargs: object) -> None:
+        raise exc_type()
+
+    monkeypatch.setattr(_Plain, "model_rebuild", interrupted)
+    with pytest.raises(exc_type):
+        _rebuild_model(_Plain, {})

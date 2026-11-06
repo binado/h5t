@@ -27,7 +27,8 @@ _SPECIALIZED_CACHE: weakref.WeakKeyDictionary[
 
 
 def _is_mapping_type(tp: Any) -> bool:
-    if tp in (dict, Mapping):
+    # Identity, not ``in``: PEP 649 forward-reference stand-ins overload ``__eq__``.
+    if tp is dict or tp is Mapping:
         return True
     origin = typing.get_origin(tp)
     if origin in (dict, Mapping):
@@ -95,6 +96,11 @@ class Dataset(Generic[T]):
             return super().__class_getitem__(item)
         if _is_mapping_type(item):
             return cls
+        if isinstance(item, (str, typing.ForwardRef)) or type(item).__name__ == "_Stringifier":
+            # A not-yet-defined name (PEP 649 evaluates annotations with stand-ins). Raising
+            # NameError makes Pydantic treat the field as an undefined forward reference
+            # and re-evaluate it later instead of freezing it as an untyped ``Dataset``.
+            raise NameError(f"name {getattr(item, '__forward_arg__', item)!s} is not defined")
         if isinstance(item, type) and issubclass(item, BaseModel):
             per_base = _SPECIALIZED_CACHE.get(item)
             if per_base is None:
@@ -211,7 +217,12 @@ class Dataset(Generic[T]):
         return self.data
 
     def __getitem__(self, key: Any) -> np.ndarray:
-        if key is Ellipsis or key == () or key == slice(None):
+        # Compare by type first: ``ndarray == ()`` is elementwise and would be ambiguous.
+        if (
+            key is Ellipsis
+            or (isinstance(key, tuple) and key == ())
+            or (isinstance(key, slice) and key == slice(None))
+        ):
             return self.data
         if self._h5t_data is not _DATA_NOT_LOADED:
             return np.asarray(typing.cast(np.ndarray, self._h5t_data)[key])

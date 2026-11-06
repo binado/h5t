@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fnmatch
 import inspect
@@ -27,6 +28,9 @@ from pydantic import (
     Field,
     GetCoreSchemaHandler,
     ModelWrapValidatorHandler,
+    PydanticSchemaGenerationError,
+    PydanticUndefinedAnnotation,
+    PydanticUserError,
     TypeAdapter,
     model_validator,
 )
@@ -665,6 +669,15 @@ class _PendingGroup:
     localns: Mapping[str, Any] | None
 
 
+def _rebuild_model(cls: type[BaseModel], namespace: dict[str, Any]) -> None:
+    """Rebuild ``cls``, tolerating only still-undefined forward references."""
+    try:
+        with contextlib.suppress(PydanticUndefinedAnnotation):
+            cls.model_rebuild(_types_namespace=namespace)
+    except (PydanticUserError, PydanticSchemaGenerationError) as exc:
+        raise SchemaError(f"{cls.__name__}: could not build the Pydantic schema: {exc}") from exc
+
+
 def _ensure_group_compiled(cls: type[Group[Any]]) -> GroupSpec:
     marker = cls.__dict__.get("__h5t_group__")
     if isinstance(marker, GroupSpec):
@@ -677,8 +690,7 @@ def _ensure_group_compiled(cls: type[Group[Any]]) -> GroupSpec:
         ns: dict[str, Any] = {**globalns, cls.__name__: cls}
         if localns:
             ns.update(localns)
-        with contextlib_suppress_pydantic():
-            cls.model_rebuild(_types_namespace=ns)
+        _rebuild_model(cls, ns)
         cls.__pydantic_parent_namespace__ = None
     setattr(cls, "__h5t_group__", spec)  # noqa: B010
     return spec
@@ -689,14 +701,6 @@ def _compiled_group(cls: type[Group[Any]]) -> GroupSpec:
         return _ensure_group_compiled(cls)
     except _UnresolvedAnnotation as exc:
         raise SchemaError(f"{exc.owner.__name__}: could not resolve annotations: {exc}") from exc
-
-
-class contextlib_suppress_pydantic:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        return exc_type is not None and not issubclass(exc_type, SchemaError)
 
 
 # ---------------------------------------------------------------------------
@@ -719,16 +723,6 @@ def _validate_adapter(adapter: TypeAdapter[Any], value: Any, path: str) -> Any:
         return adapter.validate_python(value)
     except PydanticValidationError as exc:
         raise ValidationError(path, _short_pydantic_error(exc)) from exc
-
-
-def _missing_attr_value(field: AttrFieldSpec, path: str) -> Any:
-    if field.has_default:
-        return _validate_adapter(field.adapter, field.default, path)
-    if field.default_factory is not None:
-        return _validate_adapter(field.adapter, field.default_factory(), path)
-    if field.optional:
-        return None
-    raise ValidationError(path, f"required attribute {field.h5_name!r} is missing")
 
 
 def _missing_child_value(field: FieldSpec, path: str) -> Any:
@@ -760,31 +754,40 @@ def _construct_validated_model(
     model_cls: type[BaseModel],
     values: dict[str, Any],
     path: str,
+    *,
+    error_paths: Mapping[str, str] | None = None,
 ) -> Any:
+    """Build ``model_cls`` through Pydantic so every validator mode runs as declared.
+
+    ``error_paths`` maps a failing field's input key to the path reported in the
+    `ValidationError`; failures elsewhere (model validators) report ``path``. Only
+    Pydantic's own ``ValueError``/``AssertionError`` handling turns validator failures
+    into errors, so a bug in a validator (``KeyError``, ...) propagates unchanged.
+    """
     token = _IN_H5T_LOAD.set(True)
     try:
-        instance = model_cls.model_construct(**values)
-        decorators = getattr(model_cls, "__pydantic_decorators__", None)
-        if decorators is not None:
-            for dec in decorators.field_validators.values():
-                if dec.info.mode == "after":
-                    for fname in dec.info.fields:
-                        if fname in values:
-                            setattr(instance, fname, dec.func(getattr(instance, fname)))
-            for dec in decorators.model_validators.values():
-                if dec.info.mode == "after":
-                    res = dec.func(instance)
-                    if isinstance(res, model_cls):
-                        instance = res
-        return instance
-    except (ValidationError, SchemaError):
-        raise
+        return model_cls.model_validate(values)
     except PydanticValidationError as exc:
-        raise ValidationError(path, _short_pydantic_error(exc)) from exc
-    except Exception as exc:
-        raise ValidationError(path, f"{model_cls.__name__} validation failed: {exc}") from exc
+        raise ValidationError(*_pydantic_error_location(exc, path, error_paths)) from exc
     finally:
         _IN_H5T_LOAD.reset(token)
+
+
+def _pydantic_error_location(
+    exc: PydanticValidationError, path: str, error_paths: Mapping[str, str] | None
+) -> tuple[str, str]:
+    """Return the ``(path, message)`` for the first error of ``exc``."""
+    errors = exc.errors(include_url=False, include_context=False, include_input=False)
+    if not errors:
+        return path, _short_pydantic_error(exc)
+    first = errors[0]
+    loc = tuple(first.get("loc", ()))
+    message = str(first.get("msg", "invalid value"))
+    if loc and error_paths and str(loc[0]) in error_paths:
+        rest = ".".join(str(part) for part in loc[1:])
+        return error_paths[str(loc[0])], f"{rest}: {message}" if rest else message
+    location = ".".join(str(part) for part in loc)
+    return path, f"{location}: {message}" if location else message
 
 
 def _load_attrs(
@@ -808,24 +811,36 @@ def _load_attrs(
                 raise ValidationError(attr_path(path, name), "unexpected attribute")
 
     with jaxtyped("context"):
+        # Pydantic validates the raw values itself (aliases are the HDF5 names), so
+        # every validator mode runs once, exactly as declared on the model.
         values: dict[str, Any] = {}
+        error_paths: dict[str, str] = {}
         for field in attrs_spec.fields:
             apath = attr_path(path, field.h5_name)
+            error_paths[field.h5_name] = apath
             if field.h5_name not in raw:
-                values[field.py_name] = _missing_attr_value(field, apath)
-                continue
+                # Declared defaults are validated like loaded values.
+                if field.has_default:
+                    values[field.h5_name] = field.default
+                    continue
+                if field.default_factory is not None:
+                    values[field.h5_name] = field.default_factory()
+                    continue
+                if field.optional:
+                    values[field.h5_name] = None
+                    continue
+                raise ValidationError(apath, f"required attribute {field.h5_name!r} is missing")
             raw_val = raw[field.h5_name]
             if field.array is not None:
-                arr_val = np.asarray(raw_val)
-                _check_array(field.array, arr_val, apath)
-                values[field.py_name] = _validate_adapter(field.adapter, arr_val, apath)
-            else:
-                norm_val = (
-                    raw_val if isinstance(raw_val, np.ndarray) else _normalize_raw_attr(raw_val)
-                )
-                values[field.py_name] = _validate_adapter(field.adapter, norm_val, apath)
+                raw_val = np.asarray(raw_val)
+                _check_array(field.array, raw_val, apath)
+            elif not isinstance(raw_val, np.ndarray):
+                raw_val = _normalize_raw_attr(raw_val)
+            values[field.h5_name] = raw_val
 
-        return _construct_validated_model(attrs_spec.model_type, values, path)
+        return _construct_validated_model(
+            attrs_spec.model_type, values, path, error_paths=error_paths
+        )
 
 
 def _load_dataset_node(
@@ -992,8 +1007,7 @@ class _GroupMeta(ModelMetaclass):
             delattr(cls, "__h5t_group__")
             raise
         if not getattr(cls, "__pydantic_complete__", True):
-            with contextlib_suppress_pydantic():
-                cls.model_rebuild(_types_namespace=caller_locals)
+            _rebuild_model(cls, caller_locals)
             cls.__pydantic_parent_namespace__ = None
         setattr(cls, "__h5t_group__", spec)  # noqa: B010
         return cls
