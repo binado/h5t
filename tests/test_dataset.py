@@ -328,3 +328,31 @@ def test_dataset_accepts_untyped_mapping_attrs_argument(annotation: Any) -> None
 def test_dataset_rejects_typed_mapping_attrs_argument(annotation: Any) -> None:
     with pytest.raises(h5t.SchemaError, match="BaseModel"):
         h5t.Dataset[annotation]
+
+
+def test_type_adapter_builds_lazy_dataset_from_open_h5py_node(tmp_path: Path) -> None:
+    path = tmp_path / "d.h5"
+    with h5py.File(path, "w") as f:
+        f["m"] = np.arange(6.0)
+        f["m"].attrs["unit"] = "m"
+        f["m"].attrs["scale"] = np.float64(2.0)
+    adapter = TypeAdapter(h5t.Dataset[MeasurementAttrs])
+    with h5py.File(path, "r") as f:
+        ds = adapter.validate_python(f["m"])
+    assert ds.path == "/m"
+    assert ds.filename == str(path)
+    assert ds.shape == (6,)
+    assert isinstance(ds.attrs, MeasurementAttrs)
+    assert ds[:2].tolist() == [0.0, 1.0]  # read lazily, after the file closed
+
+
+def test_type_adapter_untyped_dataset_exposes_read_only_attrs(tmp_path: Path) -> None:
+    path = tmp_path / "d.h5"
+    with h5py.File(path, "w") as f:
+        f["m"] = np.zeros(2)
+        f["m"].attrs["k"] = 1
+    with h5py.File(path, "r") as f:
+        ds = TypeAdapter(h5t.Dataset).validate_python(f["m"])
+    assert dict(ds.attrs) == {"k": 1}
+    with pytest.raises(TypeError):
+        ds.attrs["k"] = 2  # type: ignore[index]

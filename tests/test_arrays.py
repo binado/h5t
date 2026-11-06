@@ -9,7 +9,7 @@ import h5py
 import numpy as np
 import pytest
 from jaxtyping import AbstractArray, AbstractDtype, Float, Float64, Num, Shaped
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 import h5t
@@ -306,3 +306,31 @@ def test_unsupported_array_type_is_a_schema_error() -> None:
 
         class R(h5t.Group):
             x: Float[list, "n"]  # ty: ignore
+
+
+def test_type_adapter_rejects_jaxtyping_mismatch_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write(tmp_path / "a.h5", x=np.zeros((2, 3)))
+    adapter = TypeAdapter(Float[np.ndarray, "n n"], config=ConfigDict(arbitrary_types_allowed=True))
+    reads: list[object] = []
+    real_getitem = h5py.Dataset.__getitem__
+
+    def spy(self: h5py.Dataset, *args: Any, **kwargs: Any) -> Any:
+        reads.append(args)
+        return real_getitem(self, *args, **kwargs)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", spy)
+    with h5py.File(path, "r") as f, pytest.raises(h5t.ValidationError) as info:
+        adapter.validate_python(f["x"])
+    assert info.value.path == "/x"
+    assert reads == []
+
+
+def test_type_adapter_reads_matching_h5py_array(tmp_path: Path) -> None:
+    path = write(tmp_path / "a.h5", x=np.eye(2))
+    adapter = TypeAdapter(Float[np.ndarray, "n n"], config=ConfigDict(arbitrary_types_allowed=True))
+    with h5py.File(path, "r") as f:
+        out = adapter.validate_python(f["x"])
+    assert isinstance(out, np.ndarray)
+    assert out.shape == (2, 2)

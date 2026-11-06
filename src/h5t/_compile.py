@@ -86,21 +86,39 @@ def _jaxtyping_pydantic_schema(
             f"jaxtyping array type {array_type!r} is not supported; use np.ndarray or Dataset"
         )
     base_schema = handler(array_type)
+    reads_ndarray = array_type is np.ndarray
 
     def _validate_jaxtyping(value: Any) -> Any:
-        if _IN_H5T_LOAD.get():
-            return value
         reason = cls.__instancecheck_str__(value)
         if reason:
             raise PydanticCustomError("jaxtyping", "{reason}", {"reason": reason})
         return value
 
-    return core_schema.chain_schema(
-        [
-            base_schema,
-            core_schema.no_info_plain_validator_function(_validate_jaxtyping),
-        ]
+    def _read_h5py(value: Any) -> Any:
+        # An ndarray-backed field is read eagerly, but only after jaxtyping has approved the
+        # shape and dtype from a metadata-only stand-in, so a mismatch never reads data.
+        if reads_ndarray and isinstance(value, h5py.Dataset):
+            reason = cls.__instancecheck_str__(_ghost(value))
+            if reason:
+                raise ValidationError(value.name, reason)
+            return np.asarray(value[()])
+        # Attribute values arrive as Python scalars; a jaxtyping field wants an array.
+        if reads_ndarray and isinstance(value, _SCALAR_TYPES):
+            return np.asarray(value)
+        return value
+
+    return core_schema.no_info_before_validator_function(
+        _read_h5py,
+        core_schema.chain_schema(
+            [
+                base_schema,
+                core_schema.no_info_plain_validator_function(_validate_jaxtyping),
+            ]
+        ),
     )
+
+
+_SCALAR_TYPES = (bool, int, float, complex, str, bytes, np.generic)
 
 
 setattr(  # noqa: B010

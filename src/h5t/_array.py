@@ -11,11 +11,14 @@ from typing import Any, ClassVar, Generic, Self
 
 import h5py
 import numpy as np
+from jaxtyping import jaxtyped
 from pydantic import BaseModel, GetCoreSchemaHandler
+from pydantic import ValidationError as PydanticValidationError
 from pydantic_core import PydanticCustomError, core_schema
 from typing_extensions import TypeVar
 
 from h5t._errors import SchemaError, ValidationError
+from h5t._h5view import _GroupView, _normalized_attrs, _raw_attrs
 
 _DATA_NOT_LOADED = object()
 
@@ -42,6 +45,23 @@ def _readonly(array: np.ndarray) -> np.ndarray:
     view = array.view()
     view.flags.writeable = False
     return view
+
+
+def _validate_node_attrs(attrs_type: type[BaseModel], node: h5py.Dataset) -> BaseModel:
+    """Validate ``node``'s attributes as ``attrs_type``, reporting failures at the attribute."""
+    try:
+        # Its own jaxtyping scope: attribute dims must not bind with other fields' dims.
+        with jaxtyped("context"):
+            return attrs_type.model_validate(_normalized_attrs(node))
+    except PydanticValidationError as exc:
+        errors = exc.errors(include_url=False, include_context=False, include_input=False)
+        if not errors:
+            raise ValidationError(node.name, str(exc).splitlines()[0]) from exc
+        loc, msg = tuple(errors[0].get("loc", ())), str(errors[0].get("msg", "invalid value"))
+        if not loc:
+            raise ValidationError(node.name, msg) from exc
+        rest = ".".join(str(part) for part in loc[1:])
+        raise ValidationError(f"{node.name}@{loc[0]}", f"{rest}: {msg}" if rest else msg) from exc
 
 
 class Dataset(Generic[T]):
@@ -384,7 +404,23 @@ class Dataset(Generic[T]):
             if args and isinstance(args[0], type) and issubclass(args[0], BaseModel):
                 attrs_type = args[0]
 
+        def from_node(node: h5py.Dataset) -> Dataset[Any]:
+            """Build a lazy dataset from an open node; no array data is read."""
+            if attrs_type is None:
+                attrs: Any = MappingProxyType(_raw_attrs(node))
+                target_cls: type[Dataset[Any]] = cls
+            else:
+                target_cls = cls if cls._h5t_attrs_type is not None else cls[attrs_type]
+                attrs = _validate_node_attrs(attrs_type, node)
+            return target_cls._from_hdf5(
+                node.file.filename, node.name, tuple(node.shape), np.dtype(node.dtype), attrs
+            )
+
         def validate_dataset(value: Any) -> Dataset[Any]:
+            if isinstance(value, h5py.Dataset):
+                return from_node(value)
+            if isinstance(value, _GroupView):
+                raise PydanticCustomError("dataset_type", "expected a dataset, found a group")
             if not isinstance(value, Dataset):
                 raise PydanticCustomError(
                     "dataset_type",
