@@ -238,7 +238,7 @@ def test_dataset_generic_with_jaxtyping(tmp_path: Path) -> None:
 
 def test_optional_field_missing(tmp_path: Path) -> None:
     class R(h5t.Group):
-        x: Float[np.ndarray, "n"] | None
+        x: Float[np.ndarray, "n"] | None = None
         y: Float[h5t.Dataset, "n"] | None = None
 
     result = R.model_validate_hdf5(write(tmp_path / "e.h5", other=np.zeros(1)))

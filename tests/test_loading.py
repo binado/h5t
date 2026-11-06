@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Generic
 
 import h5py
 import numpy as np
 import pytest
 from pydantic import BaseModel, ConfigDict
+from typing_extensions import TypeVar
 
 import h5t
 
-from .conftest import MeasurementAttrs, Nested, Result, write_result
+from .conftest import MeasurementAttrs, Nested, Result, open_fd_count, write_result
 
 
 def test_model_validate_hdf5_loads_typed_attrs_and_children(result_file: Path) -> None:
@@ -83,13 +85,15 @@ def test_missing_wrong_kind_and_forbidden_extra_fail_with_paths(tmp_path: Path) 
 
     with h5py.File(path, "w") as file:
         file.create_group("value")
-    with pytest.raises(h5t.ValidationError, match="expected a dataset") as caught:
+    with pytest.raises(
+        h5t.ValidationError, match="Input should be an instance of ndarray"
+    ) as caught:
         Strict.model_validate_hdf5(path)
     assert caught.value.path == "/value"
 
     with h5py.File(path, "w"):
         pass
-    with pytest.raises(h5t.ValidationError, match="required array") as caught:
+    with pytest.raises(h5t.ValidationError, match="Field required") as caught:
         Strict.model_validate_hdf5(path)
     assert caught.value.path == "/value"
 
@@ -111,7 +115,7 @@ def test_group_and_dataset_kind_mismatches_fail_with_paths(tmp_path: Path) -> No
     path = tmp_path / "kind-mismatch.h5"
     with h5py.File(path, "w") as file:
         file.create_dataset("child", data=1)  # a group field finds a dataset
-    with pytest.raises(h5t.ValidationError, match="expected a group") as caught:
+    with pytest.raises(h5t.ValidationError, match="Input should be a valid dictionary") as caught:
         Owner.model_validate_hdf5(path)
     assert caught.value.path == "/child"
 
@@ -132,3 +136,78 @@ def test_nested_record_controls_its_own_extras(tmp_path: Path) -> None:
     with pytest.raises(h5t.ValidationError) as caught:
         Result.model_validate_hdf5(path)
     assert caught.value.path == "/nested@surprise"
+
+
+class _InnerAttrs(BaseModel):
+    n: int
+
+
+class _Inner(h5t.Group[_InnerAttrs]):
+    values: np.ndarray
+
+
+class _Outer(h5t.Group):
+    inner: _Inner
+    runs: dict[str, _Inner]
+
+
+def _write_outer(path: Path, *, inner_values: bool = True, run_values: bool = True) -> Path:
+    with h5py.File(path, "w") as file:
+        for group in (file.create_group("inner"), file.create_group("runs/r1")):
+            group.attrs["n"] = 1
+        if inner_values:
+            file["inner/values"] = np.arange(3)
+        if run_values:
+            file["runs/r1/values"] = np.arange(2)
+    return path
+
+
+def test_load_nested_group_and_collection_item_read_plain_arrays(tmp_path: Path) -> None:
+    loaded = _Outer.model_validate_hdf5(_write_outer(tmp_path / "o.h5"))
+    np.testing.assert_array_equal(loaded.inner.values, [0, 1, 2])
+    np.testing.assert_array_equal(loaded.runs["r1"].values, [0, 1])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "path"),
+    [
+        ({"inner_values": False}, "/inner/values"),
+        ({"run_values": False}, "/runs/r1/values"),
+    ],
+)
+def test_load_missing_nested_member_reports_its_hdf5_path(
+    tmp_path: Path, kwargs: dict[str, bool], path: str
+) -> None:
+    file = _write_outer(tmp_path / "o.h5", **kwargs)
+    with pytest.raises(h5t.ValidationError, match="Field required") as caught:
+        _Outer.model_validate_hdf5(file)
+    assert caught.value.path == path
+
+
+def test_load_failure_mid_pass_leaks_no_file_descriptors(tmp_path: Path) -> None:
+    file = _write_outer(tmp_path / "o.h5", run_values=False)
+    before = open_fd_count()
+    for _ in range(5):
+        with pytest.raises(h5t.ValidationError):
+            _Outer.model_validate_hdf5(file)
+    assert open_fd_count() == before
+
+
+_GenericAttrs = TypeVar("_GenericAttrs", bound=BaseModel)
+
+
+class _GenericBox(h5t.Group[_GenericAttrs], Generic[_GenericAttrs]):
+    values: np.ndarray
+
+
+def test_load_parametrized_generic_group_child_reads_plain_arrays(tmp_path: Path) -> None:
+    class Holder(h5t.Group):
+        box: _GenericBox[_InnerAttrs]
+
+    path = tmp_path / "h.h5"
+    with h5py.File(path, "w") as file:
+        file.create_group("box").attrs["n"] = 4
+        file["box/values"] = np.ones(2)
+    loaded = Holder.model_validate_hdf5(path)
+    assert loaded.box.values.sum() == 2
+    assert loaded.box.attrs.n == 4

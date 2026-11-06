@@ -46,7 +46,7 @@ class ResultAttrs(BaseModel):
     config: Annotated[dict[str, Any], BeforeValidator(json.loads)]
     array_attr: np.ndarray
     optional_note: str | None = None
-    defaulted: int = "42"  # type: ignore[assignment]
+    defaulted: int = 42
 
 
 class Result(h5t.Group[ResultAttrs]):

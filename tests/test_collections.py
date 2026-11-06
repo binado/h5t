@@ -172,11 +172,11 @@ def test_missing_collection_group(tmp_path: Path) -> None:
     class Required(h5t.Group):
         snaps: dict[str, Snapshot]
 
-    with pytest.raises(h5t.ValidationError, match=r"/snaps.*required collection 'snaps'"):
+    with pytest.raises(h5t.ValidationError, match=r"/snaps: Field required"):
         Required.model_validate_hdf5(path)
 
     class Optional_(h5t.Group):
-        snaps: dict[str, Snapshot] | None
+        snaps: dict[str, Snapshot] | None = None
 
     assert Optional_.model_validate_hdf5(path).snaps is None
 
@@ -191,7 +191,7 @@ def test_dataset_at_collection_path(tmp_path: Path) -> None:
         snaps: dict[str, Snapshot]
 
     path = _write(tmp_path / "a.h5", lambda f: f.create_dataset("snaps", data=1))
-    with pytest.raises(h5t.ValidationError, match="expected a group, found a dataset"):
+    with pytest.raises(h5t.ValidationError, match="/snaps: Input should be a valid dictionary"):
         Root.model_validate_hdf5(path)
 
 

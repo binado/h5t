@@ -204,12 +204,18 @@ def test_validator_bug_propagates_instead_of_becoming_validation_error(attrs_fil
         Schema.model_validate_hdf5(attrs_file)
 
 
-def test_before_model_validator_on_group_runs_on_load(attrs_file: Path) -> None:
+def test_before_model_validator_on_group_sees_a_read_only_mapping_on_load(
+    attrs_file: Path,
+) -> None:
+    seen: list[type] = []
+
     class Schema(h5t.Group):
         @model_validator(mode="before")
         @classmethod
-        def tag(cls, data: Any) -> Any:
-            data["attrs"] = {**data["attrs"], "tagged": True}
+        def observe(cls, data: Any) -> Any:
+            seen.append(type(data))
+            assert not isinstance(data, dict)
             return data
 
-    assert Schema.model_validate_hdf5(attrs_file).attrs["tagged"] is True
+    assert Schema.model_validate_hdf5(attrs_file).attrs["count"] == 3
+    assert len(seen) == 1

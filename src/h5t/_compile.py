@@ -14,7 +14,6 @@ import types
 import typing
 import weakref
 from collections.abc import Callable, Mapping
-from contextvars import ContextVar
 from types import MappingProxyType
 from typing import Annotated, Any, ClassVar, Generic, Literal, Self
 
@@ -33,7 +32,9 @@ from pydantic import (
     PydanticUndefinedAnnotation,
     PydanticUserError,
     TypeAdapter,
+    ValidatorFunctionWrapHandler,
     WrapSerializer,
+    WrapValidator,
     model_validator,
 )
 from pydantic import ValidationError as PydanticValidationError
@@ -44,7 +45,7 @@ from typing_extensions import TypeVar
 
 from h5t._array import Dataset, _is_mapping_type
 from h5t._errors import SchemaError, ValidationError
-from h5t._h5view import ATTRS_KEY, _ghost, _normalize_raw_attr, _raw_attrs
+from h5t._h5view import ATTRS_KEY, _ghost, _GroupView, _raw_attrs
 from h5t._spec import (
     _NO_DEFAULT,
     ArraySpec,
@@ -60,8 +61,6 @@ from h5t._spec import (
 )
 
 T = TypeVar("T", bound=BaseModel | Mapping[str, Any], default=Mapping[str, Any])
-
-_IN_H5T_LOAD: ContextVar[bool] = ContextVar("_IN_H5T_LOAD", default=False)
 
 _ANNOTATION_FILE = "<h5t annotation>"
 
@@ -86,7 +85,12 @@ def _jaxtyping_pydantic_schema(
         raise SchemaError(
             f"jaxtyping array type {array_type!r} is not supported; use np.ndarray or Dataset"
         )
-    base_schema = handler(array_type)
+    # ``handler(Dataset[T])`` would fall back to a plain isinstance check on this path, so a
+    # Dataset-backed array asks the Dataset class for its own schema (the raw-h5py reader).
+    if array_type is np.ndarray:
+        base_schema = handler(array_type)
+    else:
+        base_schema = array_type.__get_pydantic_core_schema__(array_type, handler)
     reads_ndarray = array_type is np.ndarray
 
     def _validate_jaxtyping(value: Any) -> Any:
@@ -712,6 +716,15 @@ def _read_array(value: Any) -> Any:
 _READ_ARRAY = BeforeValidator(_read_array)
 
 
+def _attrs_scope(value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
+    # Attribute dims must not bind together with the dims of the group's children.
+    with jaxtyped("context"):
+        return handler(value)
+
+
+_ATTRS_SCOPE = WrapValidator(_attrs_scope)
+
+
 def _with_item_reader(annotation: Any) -> Any | None:
     """Return a ``dict[str, T]`` annotation whose items read h5py datasets, or ``None``."""
     optional = False
@@ -746,13 +759,16 @@ def _inject_readers(cls: type[Group[Any]], spec: GroupSpec) -> bool:
     if attrs_field is not None and attrs_field.validation_alias != ATTRS_KEY:
         attrs_field.validation_alias = ATTRS_KEY
         changed = True
+    if attrs_field is not None and not any(m is _ATTRS_SCOPE for m in attrs_field.metadata):
+        attrs_field.metadata = [*attrs_field.metadata, _ATTRS_SCOPE]
+        changed = True
     for fspec in spec.fields:
         field_info = fields.get(fspec.py_name)
         if field_info is None:
             continue
         if fspec.kind is MemberKind.ARRAY and fspec.array is None:
             if not any(m is _READ_ARRAY for m in field_info.metadata):
-                field_info.metadata.append(_READ_ARRAY)
+                field_info.metadata = [*field_info.metadata, _READ_ARRAY]
                 changed = True
         elif (
             fspec.kind is MemberKind.COLLECTION
@@ -838,197 +854,68 @@ def _validate_adapter(adapter: TypeAdapter[Any], value: Any, path: str) -> Any:
         raise ValidationError(path, _short_pydantic_error(exc)) from exc
 
 
-def _missing_child_value(field: FieldSpec, path: str) -> Any:
-    if field.has_default:
-        return _validate_adapter(field.adapter, field.default, path)
-    if field.default_factory is not None:
-        return _validate_adapter(field.adapter, field.default_factory(), path)
-    if field.optional:
-        return None
-    kind = field.kind.value
-    raise ValidationError(path, f"required {kind} {field.h5_name!r} is missing")
+def _h5_error_path(spec: GroupSpec, root: str, loc: tuple[Any, ...]) -> tuple[str, str]:
+    """Translate a Pydantic error ``loc`` into ``(hdf5_path, unplaced_location)``.
 
-
-def _construct_validated_model(
-    model_cls: type[BaseModel],
-    values: dict[str, Any],
-    path: str,
-    *,
-    error_paths: Mapping[str, str] | None = None,
-) -> Any:
-    """Build ``model_cls`` through Pydantic so every validator mode runs as declared.
-
-    ``error_paths`` maps a failing field's input key to the path reported in the
-    `ValidationError`; failures elsewhere (model validators) report ``path``. Only
-    Pydantic's own ``ValueError``/``AssertionError`` handling turns validator failures
-    into errors, so a bug in a validator (``KeyError``, ...) propagates unchanged.
+    Walks ``loc`` down the compiled specs: a field alias becomes a child path, `ATTRS_KEY`
+    followed by a name becomes an attribute path, and a collection key becomes the item's
+    path. Whatever cannot be placed (a field inside a dataset's attributes, an index into an
+    array, ...) is returned as a dotted remainder for the message. A name no field claims
+    is an undeclared child, so it is reported at that child.
     """
-    token = _IN_H5T_LOAD.set(True)
-    try:
-        return model_cls.model_validate(values)
-    except PydanticValidationError as exc:
-        raise ValidationError(*_pydantic_error_location(exc, path, error_paths)) from exc
-    finally:
-        _IN_H5T_LOAD.reset(token)
+    path = root
+    current: GroupSpec | None = spec
+    i = 0
+    while i < len(loc) and current is not None:
+        part = loc[i]
+        if part == ATTRS_KEY:
+            if i + 1 < len(loc):
+                return attr_path(path, str(loc[i + 1])), _dotted(loc[i + 2 :])
+            return path, ""
+        field = next((f for f in current.fields if f.h5_name == part), None)
+        path = child_path(path, str(part))
+        i += 1
+        current = None
+        if field is None:
+            break
+        member = field
+        if field.kind is MemberKind.COLLECTION and field.item is not None and i < len(loc):
+            path = child_path(path, str(loc[i]))
+            i += 1
+            member = field.item
+        if member.kind is MemberKind.GROUP and member.member_type is not None:
+            current = _compiled_group(typing.cast("type[Group[Any]]", member.member_type))
+    return path, _dotted(loc[i:])
 
 
-def _pydantic_error_location(
-    exc: PydanticValidationError, path: str, error_paths: Mapping[str, str] | None
-) -> tuple[str, str]:
-    """Return the ``(path, message)`` for the first error of ``exc``."""
+def _dotted(loc: tuple[Any, ...]) -> str:
+    return ".".join(str(part) for part in loc)
+
+
+def _compile_closure(spec: GroupSpec) -> None:
+    """Compile every group reachable from ``spec``, so an unresolved name is a `SchemaError`."""
+    seen: set[type] = {spec.group_type}
+    stack = [spec]
+    while stack:
+        for fspec in stack.pop().fields:
+            member = fspec.item if fspec.item is not None else fspec
+            if member.kind is not MemberKind.GROUP or member.member_type is None:
+                continue
+            if member.member_type in seen:
+                continue
+            seen.add(member.member_type)
+            stack.append(_compiled_group(typing.cast("type[Group[Any]]", member.member_type)))
+
+
+def _first_error(exc: PydanticValidationError, spec: GroupSpec, root: str) -> ValidationError:
+    """Convert the first Pydantic error into an `h5t.ValidationError` at its HDF5 path."""
     errors = exc.errors(include_url=False, include_context=False, include_input=False)
     if not errors:
-        return path, _short_pydantic_error(exc)
-    first = errors[0]
-    loc = tuple(first.get("loc", ()))
-    message = str(first.get("msg", "invalid value"))
-    if loc and error_paths and str(loc[0]) in error_paths:
-        rest = ".".join(str(part) for part in loc[1:])
-        return error_paths[str(loc[0])], f"{rest}: {message}" if rest else message
-    location = ".".join(str(part) for part in loc)
-    return path, f"{location}: {message}" if location else message
-
-
-def _load_attrs(
-    attrs_spec: AttrsSpec | None,
-    node: h5py.Group | h5py.Dataset,
-    path: str,
-    *,
-    forbid_untyped_extras: bool = False,
-) -> Any:
-    raw = _raw_attrs(node)
-    if attrs_spec is None:
-        if forbid_untyped_extras and raw:
-            first_extra = next(iter(raw))
-            raise ValidationError(attr_path(path, first_extra), "unexpected attribute")
-        return MappingProxyType(raw)
-
-    if attrs_spec.extras is Extras.FORBID:
-        declared = {f.h5_name for f in attrs_spec.fields}
-        for name in raw:
-            if name not in declared:
-                raise ValidationError(attr_path(path, name), "unexpected attribute")
-
-    with jaxtyped("context"):
-        # Pydantic validates the raw values itself (aliases are the HDF5 names), so
-        # every validator mode runs once, exactly as declared on the model.
-        values: dict[str, Any] = {}
-        error_paths: dict[str, str] = {}
-        for field in attrs_spec.fields:
-            apath = attr_path(path, field.h5_name)
-            error_paths[field.h5_name] = apath
-            if field.h5_name not in raw:
-                # Declared defaults are validated like loaded values.
-                if field.has_default:
-                    values[field.h5_name] = field.default
-                    continue
-                if field.default_factory is not None:
-                    values[field.h5_name] = field.default_factory()
-                    continue
-                if field.optional:
-                    values[field.h5_name] = None
-                    continue
-                raise ValidationError(apath, f"required attribute {field.h5_name!r} is missing")
-            raw_val = raw[field.h5_name]
-            if field.array is not None:
-                raw_val = np.asarray(raw_val)
-                _check_array(field.array, raw_val, apath)
-            elif not isinstance(raw_val, np.ndarray):
-                raw_val = _normalize_raw_attr(raw_val)
-            values[field.h5_name] = raw_val
-
-        return _construct_validated_model(
-            attrs_spec.model_type, values, path, error_paths=error_paths
-        )
-
-
-def _load_dataset_node(
-    dataset_cls: type[Dataset[Any]],
-    attrs_spec: AttrsSpec | None,
-    array_spec: ArraySpec | None,
-    node: h5py.Dataset,
-    filename: str,
-    path: str,
-) -> Dataset[Any]:
-    shape, dtype = tuple(node.shape), np.dtype(node.dtype)
-    attrs_val = _load_attrs(attrs_spec, node, path, forbid_untyped_extras=False)
-    ds = dataset_cls._from_hdf5(filename, path, shape, dtype, attrs_val)
-    if array_spec is not None:
-        _check_array(array_spec, ds, path)
-    return ds
-
-
-def _load_member(field: FieldSpec, node: Any, filename: str, path: str) -> Any:
-    """Load one child member from ``node`` and validate it."""
-    if field.kind is MemberKind.GROUP:
-        if not isinstance(node, h5py.Group):
-            raise ValidationError(path, "expected a group, found a dataset")
-        assert field.member_type is not None
-        group_cls = typing.cast("type[Group[Any]]", field.member_type)
-        value = _load_group(_compiled_group(group_cls), node, filename, path)
-    elif field.kind is MemberKind.DATASET:
-        if not isinstance(node, h5py.Dataset):
-            raise ValidationError(path, "expected a dataset, found a group")
-        assert field.member_type is not None
-        dataset_cls = typing.cast("type[Dataset[Any]]", field.member_type)
-        value = _load_dataset_node(
-            dataset_cls, field.dataset_attrs, field.array, node, filename, path
-        )
-    else:
-        if not isinstance(node, h5py.Dataset):
-            raise ValidationError(path, "expected a dataset, found a group")
-        if field.array is not None:
-            _check_array(field.array, _ghost(node), path)
-        value = np.asarray(node[()])
-    return _validate_adapter(field.adapter, value, path)
-
-
-def _load_collection(field: FieldSpec, node: Any, filename: str, path: str) -> dict[str, Any]:
-    """Load each (glob-matching) child of the collection's group as one item."""
-    if not isinstance(node, h5py.Group):
-        raise ValidationError(path, "expected a group, found a dataset")
-    assert field.item is not None
-    items: dict[str, Any] = {}
-    for name in node.keys():
-        key = str(name)
-        if field.glob is not None and field.glob.match(key) is None:
-            continue
-        items[key] = _load_member(field.item, node[name], filename, child_path(path, key))
-    return items
-
-
-def _check_group_extras(spec: GroupSpec, group: h5py.Group, path: str) -> None:
-    if spec.extras is Extras.IGNORE:
-        return
-    children = {field.h5_name for field in spec.fields}
-    for name in group.keys():
-        rendered = str(name)
-        if rendered not in children:
-            raise ValidationError(child_path(path, rendered), "unexpected child node")
-
-
-def _load_group(spec: GroupSpec, group: h5py.Group, filename: str, path: str) -> Any:
-    with jaxtyped("context"):
-        _check_group_extras(spec, group, path)
-        attrs_val = _load_attrs(
-            spec.attrs,
-            group,
-            path,
-            forbid_untyped_extras=(spec.extras is Extras.FORBID and spec.attrs is None),
-        )
-        values: dict[str, Any] = {"attrs": attrs_val}
-        for field in spec.fields:
-            member_path = child_path(path, field.h5_name)
-            if field.h5_name not in group:
-                values[field.py_name] = _missing_child_value(field, member_path)
-                continue
-            node = group[field.h5_name]
-            if field.kind is MemberKind.COLLECTION:
-                values[field.py_name] = _load_collection(field, node, filename, member_path)
-            else:
-                values[field.py_name] = _load_member(field, node, filename, member_path)
-
-        return _construct_validated_model(spec.group_type, values, path)
+        return ValidationError(root, _short_pydantic_error(exc))
+    loc = tuple(errors[0].get("loc", ()))
+    message = str(errors[0].get("msg", "invalid value"))
+    path, rest = _h5_error_path(spec, root, loc)
+    return ValidationError(path, f"{rest}: {message}" if rest else message)
 
 
 def _filesystem_path(path: str | os.PathLike[str]) -> str:
@@ -1165,10 +1052,18 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
     @model_validator(mode="wrap")
     @classmethod
     def _h5t_jaxtyping_scope(cls, values: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
-        if _IN_H5T_LOAD.get():
-            return handler(values)
+        spec = _compiled_group(cls) if isinstance(values, _GroupView) else None
+        if spec is not None and spec.attrs is None and spec.extras is Extras.FORBID:
+            for name in _raw_attrs(values.node):
+                raise ValidationError(attr_path(values.node.name, name), "unexpected attribute")
         with jaxtyped("context"):
-            return handler(values)
+            model = handler(values)
+        if spec is not None and spec.attrs is None:
+            # Untyped attributes of a loaded group are a read-only snapshot.
+            model.attrs = typing.cast(
+                T, MappingProxyType(dict(typing.cast(Mapping[str, Any], model.attrs)))
+            )
+        return model
 
     @classmethod
     def model_validate_hdf5(
@@ -1208,6 +1103,7 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
             ``path`` is not a string or path-like object.
         """
         spec = _compiled_group(cls)
+        _compile_closure(spec)
         normalized_root = _normalize_root(root)
         filename = _filesystem_path(path)
         with h5py.File(filename, mode="r") as h5file:
@@ -1216,7 +1112,10 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
                 raise ValidationError(normalized_root, "root group does not exist")
             if not isinstance(node, h5py.Group):
                 raise ValidationError(normalized_root, "expected a group, found a dataset")
-            return typing.cast(Self, _load_group(spec, node, filename, normalized_root))
+            try:
+                return cls.model_validate(_GroupView(node))
+            except PydanticValidationError as exc:
+                raise _first_error(exc, spec, normalized_root) from exc
 
     def model_dump_hdf5(
         self,

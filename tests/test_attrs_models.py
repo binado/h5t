@@ -140,7 +140,7 @@ def test_group_attrs_extra_forbid_rejects_undeclared_attribute(attr_group_file: 
 def test_group_attrs_missing_required_field_reports_attribute_path(attr_group_file: Path) -> None:
     with h5py.File(attr_group_file, "a") as file:
         del file.attrs["count"]
-    with pytest.raises(h5t.ValidationError, match="required attribute") as caught:
+    with pytest.raises(h5t.ValidationError, match="Field required") as caught:
         _AttrGroup.model_validate_hdf5(attr_group_file)
     assert caught.value.path == "/@count"
 

@@ -75,7 +75,7 @@ def test_attrs_cache_reuses_live_specs_without_retaining_models() -> None:
     assert transient() is None
 
 
-def test_group_defaults_are_instance_checked(result_file: Path) -> None:
+def test_group_defaults_are_validated_only_with_validate_default(result_file: Path) -> None:
     class ChildAttrs(BaseModel):
         answer: int
 
@@ -83,10 +83,10 @@ def test_group_defaults_are_instance_checked(result_file: Path) -> None:
         pass
 
     class WithInvalidDefault(h5t.Group):
-        child: Child = 123  # type: ignore[assignment]
+        child: Child = Field(default=123, validate_default=True)  # type: ignore[assignment]
 
     class WithInvalidFactory(h5t.Group):
-        child: Child = Field(default_factory=lambda: 123)  # type: ignore[arg-type]
+        child: Child = Field(default_factory=lambda: 123, validate_default=True)  # type: ignore[arg-type]
 
     for schema in (WithInvalidDefault, WithInvalidFactory):
         with pytest.raises(h5t.ValidationError) as caught:
