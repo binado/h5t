@@ -82,7 +82,7 @@ def test_mapping_annotation_and_dataset_items(tmp_path: Path) -> None:
     assert out.series["a"].attrs.unit == "m"
 
 
-def test_dataset_items_read_no_payload(tmp_path: Path) -> None:
+def test_dataset_items_read_no_data(tmp_path: Path) -> None:
     def build(f: h5py.File) -> None:
         g = f.create_group("arrs")
         g.create_dataset("x", data=np.arange(4.0))

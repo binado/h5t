@@ -30,13 +30,13 @@ Define, save and load
        measurement: h5t.Dataset[MeasurementAttrs]   # a lazy child dataset with typed attributes
 
 
-   record = Result(
+   group = Result(
        attrs=ResultAttrs(version=1),
        values=np.arange(3.0),
        measurement=h5t.Dataset(np.linspace(0, 1, 4), MeasurementAttrs(unit="m")),
    )
 
-   record.model_dump_hdf5("result.h5", mode="w")
+   group.model_dump_hdf5("result.h5", mode="w")
    result = Result.model_validate_hdf5("result.h5")
    print(result.attrs.version, result.values, result.measurement.attrs.unit)
 
@@ -47,7 +47,7 @@ Lazy datasets
 -------------
 
 An :class:`h5t.Dataset` field remembers a dataset's shape, dtype, and validated ``attrs``,
-but doesn't read the array payload until you index it or access ``.data``:
+but doesn't read the array data until you index it or access ``.data``:
 
 .. code-block:: python
 

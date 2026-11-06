@@ -1,7 +1,7 @@
 """Lazy annotations under PEP 649/749.
 
 Deliberately no ``from __future__ import annotations``: this module exists to exercise
-the annotation forms every other test module opts out of. Record types are declared
+the annotation forms every other test module opts out of. Schema types are declared
 inside the test functions because a module-level bare forward reference would raise at
 collection time on the versions ``pytestmark`` skips.
 """
@@ -128,10 +128,10 @@ def test_the_group_defers_under_pep_649() -> None:
 
         return Local
 
-    record = declare()
+    group_cls = declare()
     gc.collect()
-    assert marker(record).localns is None
-    spec = h5t._compile._ensure_group_compiled(record)
+    assert marker(group_cls).localns is None
+    spec = h5t._compile._ensure_group_compiled(group_cls)
     fields = {field.py_name: field for field in spec.fields}
     assert fields["later"].member_type.__name__ == "Later"
 
@@ -162,15 +162,15 @@ def test_a_lazy_schema_loads_from_a_file(tmp_path: Path) -> None:
         model_config = ConfigDict(extra="forbid")
 
     assert isinstance(marker(Lazy), _PendingGroup)
-    record = Lazy.model_validate_hdf5(path)
+    loaded = Lazy.model_validate_hdf5(path)
     assert isinstance(marker(Lazy), GroupSpec)
-    assert record.attrs.version == 2
-    assert np.array_equal(record.values, np.arange(4))
-    assert record.measurement.attrs.unit == "m"
-    assert record.measurement.attrs.scale == 1.0
-    assert np.array_equal(record.measurement.read(), np.arange(5))
-    assert record.nested.attrs.answer == 42
-    assert record.attrs.optional_note is None
+    assert loaded.attrs.version == 2
+    assert np.array_equal(loaded.values, np.arange(4))
+    assert loaded.measurement.attrs.unit == "m"
+    assert loaded.measurement.attrs.scale == 1.0
+    assert np.array_equal(loaded.measurement.read(), np.arange(5))
+    assert loaded.nested.attrs.answer == 42
+    assert loaded.attrs.optional_note is None
 
 
 def test_bare_jaxtyping_annotation_inside_a_function(tmp_path: Path) -> None:

@@ -5,12 +5,12 @@ Two ways to declare a dataset field
 -----------------------------------
 
 ``np.ndarray``
-    The complete payload is read eagerly into an ``ndarray`` while the file is open, and any
+    The complete array is read eagerly into an ``ndarray`` while the file is open, and any
     attributes on the dataset are ignored.
 
 :class:`h5t.Dataset` / ``h5t.Dataset[T]``
     A detached snapshot of the dataset's metadata (``filename``, ``path``, ``shape``,
-    ``dtype``) and validated ``attrs: T``. The array payload is read on demand when indexed
+    ``dtype``) and validated ``attrs: T``. The array data is read on demand when indexed
     or accessed via ``.data``. Custom ``Dataset`` subclasses are preserved too.
 
 Using a ``Dataset``
@@ -70,5 +70,5 @@ A loaded group is a snapshot, with deliberate lazy-read semantics for :class:`h5
 - A ``Dataset``'s first full read (`ds[()]`, `ds[:]`, ``.data``, or ``.read()``) reads the
   complete array from the file at that moment and caches it permanently on the instance.
 - ``.open()`` always opens the current file and yields the live ``h5py.Dataset``.
-- :meth:`h5t.Group.model_dump_hdf5` copies lazy payloads: an uncached ``Dataset`` is read from
+- :meth:`h5t.Group.model_dump_hdf5` copies lazy datasets: an uncached ``Dataset`` is read from
   its source file at dump time without caching it on your instance.

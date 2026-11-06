@@ -256,7 +256,7 @@ def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> tuple[Any, ArrayS
 
 
 def _check_array(spec: ArraySpec, candidate: Any, path: str) -> None:
-    """Ask jaxtyping whether ``candidate`` satisfies ``spec``; call inside a record scope."""
+    """Ask jaxtyping whether ``candidate`` satisfies ``spec``; call inside a jaxtyping scope."""
     reason = spec.hint.__instancecheck_str__(candidate)  # ty: ignore[unresolved-attribute]
     if reason:
         raise ValidationError(path, reason)
@@ -1036,6 +1036,14 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
     attrs : T
         The group's HDF5 attributes (`BaseModel` instance or read-only `Mapping`).
 
+    Notes
+    -----
+    ``Field(alias="...")`` on a child field or an attribute field sets its on-disk HDF5
+    name. ``extra="forbid"`` in ``model_config`` rejects undeclared child nodes (and, on
+    ``T``, undeclared attributes); only ``"ignore"`` and ``"forbid"`` are supported.
+    Annotate a ``dict[str, ...]`` field with `Glob` to restrict which child names it
+    collects.
+
     Examples
     --------
     >>> import numpy as np
@@ -1072,8 +1080,8 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
         """Validate and load an HDF5 group into a detached instance of ``cls``.
 
         The HDF5 file is closed before ``model_validate_hdf5`` returns, even on error.
-        Child `Dataset` fields remain lazy and remember the file path so slices or full
-        payloads can be read on demand.
+        Child `Dataset` fields remain lazy and remember the file path so slices or the full
+        array can be read on demand.
 
         Parameters
         ----------
@@ -1095,6 +1103,10 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
             The file does not conform to the schema (including a missing ``root``).
         ValueError
             ``root`` is not an absolute HDF5 path.
+        OSError
+            The file cannot be opened.
+        TypeError
+            ``path`` is not a string or path-like object.
         """
         spec = _compiled_group(cls)
         normalized_root = _normalize_root(root)
@@ -1141,6 +1153,11 @@ class Group(BaseModel, Generic[T], metaclass=_GroupMeta):
             The model does not conform to its schema, or ``root`` is occupied.
         ValueError
             ``mode`` or ``root`` is invalid.
+        OSError
+            The file cannot be created or opened (for example it exists in ``"w-"``/``"x"``
+            mode).
+        TypeError
+            ``path`` is not a string or path-like object.
         """
         from h5t._write import _dump_group
 

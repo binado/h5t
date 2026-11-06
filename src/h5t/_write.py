@@ -1,7 +1,7 @@
 """Schema-validated writing of `Group` instances to HDF5, in two phases.
 
 Phase 1 (*plan*) walks the compiled spec over an in-memory `Group` and builds a tree of
-what to write, validating everything and reading every lazy `Dataset` payload. It never
+what to write, validating everything and reading the data of every lazy `Dataset`. It never
 touches the target file. Phase 2 (*apply*) opens the file and writes the tree, rolling
 back what it wrote if anything fails.
 """
@@ -60,9 +60,9 @@ class _GroupPlan:
 # ---------------------------------------------------------------------------
 
 
-def _read_field(owner_type: type, record: Any, name: str) -> Any:
+def _read_field(owner_type: type, instance: Any, name: str) -> Any:
     try:
-        return getattr(record, name)
+        return getattr(instance, name)
     except AttributeError as exc:
         raise SchemaError(f"{owner_type.__name__}.{name}: model has no such attribute") from exc
 
@@ -160,7 +160,7 @@ def _plan_attrs(
 
 
 def _materialize(dataset: Dataset[Any], path: str) -> np.ndarray:
-    """Return a dataset's payload without mutating the caller's detached instance."""
+    """Return a dataset's array data without mutating the caller's detached instance."""
     cached = dataset._h5t_data
     if cached is not _DATA_NOT_LOADED:
         return typing.cast(np.ndarray, cached)
@@ -221,22 +221,22 @@ def _plan_collection(field: FieldSpec, value: Mapping[str, Any], path: str) -> _
     return plan
 
 
-def _plan_group(spec: GroupSpec, record: Any, path: str) -> _GroupPlan:
-    if not isinstance(record, spec.group_type):
+def _plan_group(spec: GroupSpec, group: Any, path: str) -> _GroupPlan:
+    if not isinstance(group, spec.group_type):
         raise ValidationError(
-            path, f"expected {spec.group_type.__name__}, got {type(record).__name__}"
+            path, f"expected {spec.group_type.__name__}, got {type(group).__name__}"
         )
     with jaxtyped("context"):
         plan = _GroupPlan()
         plan.attrs = _plan_attrs(
             spec.attrs,
-            _read_field(spec.group_type, record, "attrs"),
+            _read_field(spec.group_type, group, "attrs"),
             path,
             forbid_untyped_extras=(spec.extras is Extras.FORBID and spec.attrs is None),
         )
         for field in spec.fields:
             member_path = child_path(path, field.h5_name)
-            raw_val = _read_field(spec.group_type, record, field.py_name)
+            raw_val = _read_field(spec.group_type, group, field.py_name)
             value = _validate_adapter(field.adapter, raw_val, member_path)
             if value is None:
                 continue
@@ -419,7 +419,7 @@ def _roll_back(
 
 
 def _dump_group(
-    record: Group[Any],
+    group: Group[Any],
     path: str | os.PathLike[str],
     root: str = "/",
     mode: Literal["w-", "x", "w", "a"] = "w-",
@@ -427,12 +427,12 @@ def _dump_group(
 ) -> None:
     if mode not in ("w-", "x", "w", "a"):
         raise ValueError(f"mode must be 'w-', 'x', 'w' or 'a', got {mode!r}")
-    schema = type(record)
+    schema = type(group)
     if not issubclass(schema, Group):
         raise SchemaError(f"{schema!r} is not an h5t.Group subclass")
     spec = _compiled_group(schema)
     normalized_root = _normalize_root(root)
     filename = _filesystem_path(path)
 
-    plan = _plan_group(spec, record, normalized_root)
+    plan = _plan_group(spec, group, normalized_root)
     _apply(filename, "w-" if mode == "x" else mode, normalized_root, plan, overwrite)

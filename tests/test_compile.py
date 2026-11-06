@@ -126,10 +126,10 @@ def test_eager_compilation_does_not_retain_the_defining_scope() -> None:
 
         return Local, weakref.ref(unrelated)
 
-    record, ref = declare()
+    group_cls, ref = declare()
     gc.collect()
     assert ref() is None
-    assert compiled(record).fields[0].py_name == "value"
+    assert compiled(group_cls).fields[0].py_name == "value"
 
 
 def test_deferred_group_with_function_local_dependency_needs_localns_to_resolve() -> None:
@@ -173,12 +173,12 @@ def test_deferred_group_retains_no_locals_the_annotations_never_name() -> None:
 
         return Local, weakref.ref(tracked)
 
-    record, ref = declare()
+    group_cls, ref = declare()
     gc.collect()
-    assert record.__dict__["__h5t_group__"].localns is None
+    assert group_cls.__dict__["__h5t_group__"].localns is None
     assert ref() is None
     with pytest.raises(h5t.SchemaError, match="_NeverDefined"):
-        record.model_validate_hdf5("never-opened.h5")
+        group_cls.model_validate_hdf5("never-opened.h5")
 
 
 def test_a_broken_annotation_helper_is_not_a_forward_reference() -> None:

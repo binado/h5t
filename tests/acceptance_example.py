@@ -65,7 +65,7 @@ label: str = result.nested.attrs.label
 untyped_attrs: Mapping[str, Any] = result.untyped.attrs
 recording: h5t.Dataset[RecordingAttrs] = result.recording
 unit: str = result.recording.attrs.unit
-payload: np.ndarray = result.recording[()]
+full: np.ndarray = result.recording[()]
 
 saved: None = result.model_dump_hdf5(Path("out.h5"), root="/run", mode="a", overwrite=True)
 

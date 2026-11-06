@@ -156,7 +156,7 @@ def test_round_trip_property(
     assert_doc_equal(Doc.model_validate_hdf5(path), doc)
 
 
-def test_datasets_and_lazy_payloads(tmp_path: Path) -> None:
+def test_datasets_and_lazy_datasets(tmp_path: Path) -> None:
     class Holder(h5t.Group):
         typed: h5t.Dataset[MeasurementAttrs]
         samples: h5t.Dataset
@@ -186,7 +186,7 @@ def test_load_save_load_result_file(tmp_path: Path) -> None:
     first = Snap.model_validate_hdf5(src)
     assert first.attrs["undeclared"] == "raw"
 
-    # Same file, different root, append mode: lazy payloads are read before opening.
+    # Same file, different root, append mode: lazy datasets are read before opening.
     first.model_dump_hdf5(src, root="/copy", mode="a")
     second = Snap.model_validate_hdf5(src, root="/copy")
     assert second.attrs["undeclared"] == "raw"

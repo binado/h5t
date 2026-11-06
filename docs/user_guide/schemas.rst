@@ -8,9 +8,8 @@ A schema is a subclass of :class:`h5t.Group` (a :class:`pydantic.BaseModel` subc
 - :class:`h5t.Group` / ``h5t.Group[T]``: stores group attributes on ``.attrs: T`` (defaulting
   to ``Mapping[str, Any]`` or a :class:`pydantic.BaseModel` subclass ``T``) and treats all
   other declared fields as immediate HDF5 child nodes (subgroups, datasets, or collections).
-- :class:`h5t.Dataset` / ``h5t.Dataset[T]``: stores dataset attributes on ``.attrs: T``
-  (defaulting to ``Mapping[str, Any]`` or a :class:`pydantic.BaseModel` subclass ``T``) and
-  represents a detached, lazily-indexed HDF5 dataset.
+- :class:`h5t.Dataset` / ``h5t.Dataset[T]``: the same ``.attrs: T`` convention for a
+  detached, lazily-indexed HDF5 dataset; see :doc:`arrays`.
 
 Child field rules on ``Group``
 ------------------------------
@@ -27,10 +26,10 @@ Child field rules on ``Group``
      - recursively materialized
    * - :class:`h5t.Dataset` or ``h5t.Dataset[T]``
      - child dataset
-     - metadata and ``attrs`` loaded; array payload read lazily when indexed
+     - metadata and ``attrs`` loaded; array data read lazily when indexed
    * - ``np.ndarray``
      - child dataset
-     - complete payload loaded eagerly as an ``ndarray``
+     - complete array loaded eagerly as an ``ndarray``
    * - ``Float[np.ndarray, "n n"]``, ``Float[h5t.Dataset[T], "n _"]`` (jaxtyping)
      - child dataset
      - dtype and shape checked against the file's metadata before any read; otherwise
@@ -83,7 +82,7 @@ accepted wherever ``np.ndarray`` is; for ``NDArray`` the dtype parameter is not 
        nested: Nested
 
 
-   record = Result(
+   group = Result(
        attrs=ResultAttrs(
            version=2,
            title="demo",
@@ -93,7 +92,7 @@ accepted wherever ``np.ndarray`` is; for ``NDArray`` the dtype parameter is not 
        values=np.zeros(4),
        nested=Nested(attrs=NestedAttrs(label="n")),
    )
-   record.model_dump_hdf5("schema.h5", mode="w")
+   group.model_dump_hdf5("schema.h5", mode="w")
    print(Result.model_validate_hdf5("schema.h5"))
 
 Missing members, defaults and optionals

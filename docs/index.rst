@@ -3,7 +3,9 @@ h5t
 
 ``h5t`` turns HDF5 groups into typed, detached Pydantic objects, and writes them back using
 the same description. You describe the layout of your file once as an :class:`h5t.Group`
-subclass; ``h5t`` reads it, checks shapes and dtypes, and closes the file for you. Child
+subclass; ``h5t`` reads it, validates attributes with Pydantic, and closes the file for you.
+Shapes and dtypes are checked only for fields you annotate with jaxtyping (see
+:doc:`user_guide/jaxtyping`). Plain ``np.ndarray`` fields are read eagerly; child
 :class:`h5t.Dataset` fields are loaded lazily, so you only pay for the slices you actually
 read.
 
@@ -23,8 +25,8 @@ read.
        values: np.ndarray
 
 
-   record = Result(attrs=ResultAttrs(version=1), values=np.arange(3.0))
-   record.model_dump_hdf5("result.h5", mode="w")
+   group = Result(attrs=ResultAttrs(version=1), values=np.arange(3.0))
+   group.model_dump_hdf5("result.h5", mode="w")
    result = Result.model_validate_hdf5("result.h5")
    print(result.attrs.version, result.values)
 

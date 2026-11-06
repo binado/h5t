@@ -49,17 +49,17 @@ class Dataset(Generic[T]):
 
     No file is kept open: a ``Dataset`` loaded via `Group.model_validate_hdf5` remembers
     where the dataset lives, along with its shape, dtype, and validated ``attrs``, and
-    reads array slices or the full payload only when indexed (`ds[()]`, `ds[:10]`) or
+    reads array slices or the full array only when indexed (`ds[()]`, `ds[:10]`) or
     accessed via `data`. You can also construct a ``Dataset`` in memory from a NumPy
     array to write out with `Group.model_dump_hdf5`.
 
     Parameters
     ----------
     data : array_like
-        In-memory array payload.
+        In-memory array data.
     attrs : BaseModel or Mapping, optional
-        Dataset attributes. Defaults to an empty mapping (or default-constructed
-        ``T`` model when specialized as ``Dataset[T]``).
+        Dataset attributes. Defaults to an empty mapping. For ``Dataset[T]`` the empty
+        mapping is validated as ``T``, so every field of ``T`` then needs a default.
 
     Attributes
     ----------
@@ -212,20 +212,22 @@ class Dataset(Generic[T]):
 
     @property
     def data(self) -> np.ndarray:
-        """Read and cache the complete payload as a NumPy array.
+        """Read and cache the complete array as a NumPy array.
 
-        The first access on a detached dataset reads the payload from the HDF5 file and
+        The first access on a detached dataset reads the array from the HDF5 file and
         caches it; later accesses reuse the cached array.
 
         Returns
         -------
         numpy.ndarray
-            The complete payload.
+            The complete array, read-only.
 
         Raises
         ------
         ValidationError
-            The dataset no longer exists in the source file, or is not a dataset.
+            The dataset is in-memory only, its source file cannot be opened, the dataset
+            no longer exists or is not a dataset, or its shape or dtype changed since it was
+            loaded.
         """
         if self._h5t_data is _DATA_NOT_LOADED:
             with self.open() as dataset:
@@ -234,7 +236,7 @@ class Dataset(Generic[T]):
         return typing.cast(np.ndarray, self._h5t_data)
 
     def read(self) -> np.ndarray:
-        """Return the complete payload; an alias of `data`.
+        """Return the complete array; an alias of `data`.
 
         Returns
         -------
@@ -244,6 +246,27 @@ class Dataset(Generic[T]):
         return self.data
 
     def __getitem__(self, key: Any) -> np.ndarray:
+        """Read ``key`` with ``h5py``-style indexing and return a NumPy array.
+
+        ``ds[()]``, ``ds[...]`` and ``ds[:]`` return the complete cached array (reading it
+        once). Any other key reads just that selection from the file, without caching,
+        unless the full array is already cached, in which case it indexes the cache.
+
+        Parameters
+        ----------
+        key : int, slice, tuple, Ellipsis, array_like
+            Anything ``h5py.Dataset`` or ``numpy.ndarray`` accepts as an index.
+
+        Returns
+        -------
+        numpy.ndarray
+            The selected data. Full reads are read-only.
+
+        Raises
+        ------
+        ValidationError
+            The dataset cannot be read from its source file; see `open`.
+        """
         # Compare by type first: ``ndarray == ()`` is elementwise and would be ambiguous.
         if (
             key is Ellipsis
@@ -257,6 +280,7 @@ class Dataset(Generic[T]):
             return np.asarray(dataset[key])
 
     def __array__(self, dtype: Any = None, copy: bool | None = None) -> np.ndarray:
+        """Support ``np.asarray(ds)`` by reading and caching the complete array."""
         arr = self.data
         if copy is None:
             return np.asarray(arr, dtype=dtype)
@@ -277,7 +301,9 @@ class Dataset(Generic[T]):
         Raises
         ------
         ValidationError
-            The dataset is in-memory only, no longer exists, or the path names a group.
+            The dataset is in-memory only, its source file cannot be opened, the dataset
+            no longer exists, the path names a group, or the shape or dtype differ from the
+            values recorded when it was loaded.
         """
         if self.filename is None or self.path is None:
             raise ValidationError("<in-memory>", "dataset is not backed by an HDF5 file")

@@ -87,7 +87,7 @@ def test_lazy_data_and_indexing_observe_file_and_cache(result_file: Path) -> Non
     assert np.array_equal(np.asarray(measurement), first)
 
 
-def test_scalar_dataset_payload_is_zero_dimensional_array(tmp_path: Path) -> None:
+def test_scalar_dataset_data_is_zero_dimensional_array(tmp_path: Path) -> None:
     class Scalar(h5t.Group):
         plain: np.ndarray
         detached: h5t.Dataset

@@ -55,10 +55,10 @@ Validation first, rollback on failure
 -------------------------------------
 
 The whole group tree is validated, jaxtyping shapes are checked, and every :class:`h5t.Dataset`
-payload is read *before* the file is opened, so an invalid model never touches the target
+data is read *before* the file is opened, so an invalid model never touches the target
 (and saving into the file a lazy ``Dataset`` came from is safe). If the write itself fails,
 the new file is removed; with ``mode="a"`` the group that ``model_dump_hdf5`` created is
 removed on a best-effort basis.
 
-Lazy payloads are copied: an uncached ``Dataset`` is read from its source file at save time,
+Lazy datasets are copied: an uncached ``Dataset`` is read from its source file at save time,
 without caching it on your instance.

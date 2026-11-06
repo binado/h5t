@@ -8,8 +8,9 @@
 
 `h5t` validates and loads HDF5 groups into detached, typed Pydantic models, and writes them
 back using the same schema. Group and dataset attributes are modeled with `pydantic.BaseModel`
-via `h5t.Group[T]` and `h5t.Dataset[T]`, while child datasets remain lazy and read slices on
-demand without retaining open file descriptors.
+via `h5t.Group[T]` and `h5t.Dataset[T]`. Loaded groups hold no open file handles:
+`np.ndarray` fields are read eagerly, while `h5t.Dataset` fields stay lazy and reopen the file
+to read slices on demand.
 
 ## Installation
 
@@ -49,13 +50,13 @@ class Result(h5t.Group[ResultAttrs]):
     measurement: Float[h5t.Dataset[MeasurementAttrs], "n"]  # lazy child dataset + typed attrs
 
 
-record = Result(
+group = Result(
     attrs=ResultAttrs(version=1, title="demo"),
     values=np.arange(4.0),
     measurement=h5t.Dataset(np.linspace(0, 1, 4), MeasurementAttrs(unit="m")),
 )
 
-record.model_dump_hdf5("result.h5", mode="w")
+group.model_dump_hdf5("result.h5", mode="w")
 result = Result.model_validate_hdf5("result.h5")
 print(result.attrs.title, result.measurement.attrs.unit)
 print(result.measurement[:2])                            # slices are read lazily on demand
