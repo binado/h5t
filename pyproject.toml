@@ -79,6 +79,7 @@ convention = "numpy"
 "tests/test_arrays.py" = ["F722", "F821", "UP037"]
 "tests/test_collections.py" = ["F722", "F821", "UP037"]
 "tests/test_save.py" = ["F722", "F821", "UP037"]
+"tests/test_attrs_models.py" = ["F722", "F821", "UP037"]
 "tests/test_pep649.py" = ["F722", "F821", "UP037"]
 "tests/acceptance_example.py" = ["F722", "F821", "UP037"]
 

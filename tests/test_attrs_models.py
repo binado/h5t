@@ -8,6 +8,7 @@ from typing import Annotated
 import h5py
 import numpy as np
 import pytest
+from jaxtyping import Float
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 import h5t
@@ -161,3 +162,41 @@ def test_dump_attrs_with_non_idempotent_validator_does_not_revalidate(tmp_path: 
 
     with h5py.File(target) as f:
         assert f.attrs["n"] == 2
+
+
+class _ArrayAttrs(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    weights: Float[np.ndarray, "n"]
+    bias: Float[np.ndarray, "n"] | None = None
+
+
+class _ArrayAttrsGroup(h5t.Group[_ArrayAttrs]):
+    pass
+
+
+def test_load_array_attr_with_wrong_shape_reports_attribute_path(tmp_path: Path) -> None:
+    path = tmp_path / "arrays.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["weights"] = np.zeros((2, 2))
+    with pytest.raises(h5t.ValidationError) as caught:
+        _ArrayAttrsGroup.model_validate_hdf5(path)
+    assert caught.value.path == "/@weights"
+
+
+def test_load_missing_optional_array_attr_is_none(tmp_path: Path) -> None:
+    path = tmp_path / "arrays.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["weights"] = np.zeros(3)
+    loaded = _ArrayAttrsGroup.model_validate_hdf5(path)
+    assert loaded.attrs.bias is None
+
+
+def test_attrs_model_with_extra_allow_is_schema_error() -> None:
+    class OpenAttrs(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+        declared: int
+
+    with pytest.raises(h5t.SchemaError, match="ignore.*forbid"):
+        h5t.Group[OpenAttrs]

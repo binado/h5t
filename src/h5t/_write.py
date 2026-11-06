@@ -146,16 +146,6 @@ def _plan_attrs(
             _check_storable(serialized, apath)
             out[field.h5_name] = serialized
 
-    for raw_name, value in extra_dict.items():
-        name = str(raw_name)
-        if name in out:
-            continue
-        apath = attr_path(path, name)
-        if isinstance(value, Enum):
-            value = value.value
-        _check_storable(value, apath)
-        out[name] = value
-
     return out
 
 

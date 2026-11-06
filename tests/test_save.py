@@ -466,3 +466,48 @@ def test_dump_of_dataset_whose_source_file_was_deleted_leaves_no_file(tmp_path: 
         loaded.model_dump_hdf5(target)
     assert caught.value.path == "/measurement"
     assert not target.exists()
+
+
+class _PartialAttrs(BaseModel):
+    label: str
+
+
+class _Partial(h5t.Group[_PartialAttrs]):
+    ok: np.ndarray
+    names: np.ndarray
+
+
+@pytest.fixture
+def partly_writable() -> _Partial:
+    """Writes attrs and one child before the unicode array fails in the apply phase."""
+    return _Partial(attrs=_PartialAttrs(label="new"), ok=np.arange(3), names=np.array(["a", "b"]))
+
+
+@pytest.mark.parametrize("root", ["/", "/a/b"])
+def test_dump_into_existing_empty_root_failing_midway_leaves_root_empty(
+    tmp_path: Path, root: str, partly_writable: _Partial
+) -> None:
+    target = tmp_path / "doc.h5"
+    with h5py.File(target, "w") as f:
+        f.require_group(root)
+    with pytest.raises(h5t.ValidationError):
+        partly_writable.model_dump_hdf5(target, root=root, mode="a")
+    with h5py.File(target) as f:
+        assert list(f[root].keys()) == []
+        assert list(f[root].attrs) == []
+
+
+@pytest.mark.parametrize("value", ["a\x00b", np.zeros(70_000)], ids=["embedded-nul", "too-large"])
+def test_dump_attr_h5py_rejects_reports_attribute_path_and_removes_file(
+    tmp_path: Path, value: object
+) -> None:
+    class Attrs(BaseModel):
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+
+        v: Any
+
+    target = tmp_path / "doc.h5"
+    with pytest.raises(h5t.ValidationError, match="cannot write attribute") as info:
+        h5t.Group[Attrs](attrs=Attrs(v=value)).model_dump_hdf5(target)
+    assert info.value.path == "/@v"
+    assert not target.exists()
