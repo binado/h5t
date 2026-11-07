@@ -13,7 +13,7 @@ ATTRS_KEY = "/attrs"
 
 
 def _raw_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
-    return {str(name): node.attrs[name] for name in node.attrs}
+    return {name: node.attrs[name] for name in node.attrs}
 
 
 def _normalized_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
@@ -27,7 +27,7 @@ def _normalized_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
             value = str(value)
         elif isinstance(value, np.generic) and not isinstance(value, np.ndarray):
             value = value.item()
-        out[str(name)] = value
+        out[name] = value
     return out
 
 
@@ -60,7 +60,7 @@ class _GroupView(Mapping[str, Any]):
         return child
 
     def __iter__(self) -> Iterator[str]:
-        return (str(name) for name in self.node.keys())
+        return iter(self.node.keys())
 
     def __len__(self) -> int:
         return len(self.node)
