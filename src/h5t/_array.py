@@ -18,7 +18,7 @@ from pydantic_core import PydanticCustomError, core_schema
 from typing_extensions import TypeVar
 
 from h5t._errors import SchemaError, ValidationError
-from h5t._h5view import _GroupView, _normalized_attrs, _raw_attrs
+from h5t._h5view import _GroupView, _normalized_attrs
 
 _DATA_NOT_LOADED = object()
 
@@ -404,7 +404,7 @@ class Dataset(Generic[T]):
                         value.name,
                         tuple(value.shape),
                         np.dtype(value.dtype),
-                        MappingProxyType(_raw_attrs(value)),
+                        MappingProxyType(dict(value.attrs)),
                     )
                 _reject_not_a_dataset(value, cls)
                 if not isinstance(value.attrs, Mapping):

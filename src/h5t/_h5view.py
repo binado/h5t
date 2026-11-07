@@ -12,10 +12,6 @@ import numpy as np
 ATTRS_KEY = "/attrs"
 
 
-def _raw_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
-    return {name: node.attrs[name] for name in node.attrs}
-
-
 def _normalized_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
     """Return ``node``'s attributes with numpy scalars and strings turned into Python values."""
     out: dict[str, Any] = {}
