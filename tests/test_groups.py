@@ -1,0 +1,208 @@
+"""The ``h5t.Group[T]`` and ``h5t.Dataset[T]`` generic API."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pytest
+from pydantic import BaseModel, ConfigDict, Field, PydanticUndefinedAnnotation
+
+import h5t
+
+from .conftest import MeasurementAttrs, Nested, Result
+
+
+class _ForwardBAttrs(BaseModel):
+    value: int
+
+
+class _ForwardA(h5t.Group):
+    b: _ForwardB
+
+
+class _ForwardB(h5t.Group[_ForwardBAttrs]):
+    pass
+
+
+class _NodeAttrs(BaseModel):
+    value: int
+
+
+class _RecursiveNode(h5t.Group[_NodeAttrs]):
+    child: _RecursiveNode | None = None
+
+
+def test_group_declaration_is_checked_on_load() -> None:
+    with pytest.raises(h5t.SchemaError, match=r"Bad\.missing:"):
+
+        class Bad(h5t.Group):
+            missing: int
+
+        Bad.model_validate_hdf5("never-opened.h5")
+
+
+def test_group_defaults_are_validated_only_with_validate_default(result_file: Path) -> None:
+    class ChildAttrs(BaseModel):
+        answer: int
+
+    class Child(h5t.Group[ChildAttrs]):
+        pass
+
+    class WithInvalidDefault(h5t.Group):
+        child: Child = Field(default=123, validate_default=True)  # type: ignore[assignment]
+
+    class WithInvalidFactory(h5t.Group):
+        child: Child = Field(default_factory=lambda: 123, validate_default=True)  # type: ignore[arg-type]
+
+    for schema in (WithInvalidDefault, WithInvalidFactory):
+        with pytest.raises(h5t.ValidationError) as caught:
+            schema.model_validate_hdf5(result_file)
+        assert caught.value.path == "/child"
+
+
+def test_dataset_generic_loads_typed_attrs_and_slices(result_file: Path) -> None:
+    class Owner(h5t.Group):
+        measurement: h5t.Dataset[MeasurementAttrs]
+
+    result = Owner.model_validate_hdf5(result_file)
+    assert isinstance(result.measurement, h5t.Dataset)
+    assert result.measurement.attrs.unit == "m"
+    assert result.measurement.attrs.scale == 1.0
+    assert np.array_equal(result.measurement[()], np.arange(5))
+
+
+def test_untyped_dataset_and_group_expose_raw_attrs_mapping(result_file: Path) -> None:
+    class Owner(h5t.Group):
+        measurement: h5t.Dataset
+
+    result = Owner.model_validate_hdf5(result_file)
+    assert result.attrs["version"] == 2
+    assert result.attrs["undeclared"] == "raw"
+    assert result.measurement.attrs["unit"] == "m"
+    assert result.measurement.attrs["extra"] == "measurement"
+
+
+def test_forward_reference_to_a_group_defined_later_in_the_module_resolves(tmp_path: Path) -> None:
+    path = tmp_path / "forward.h5"
+    with h5py.File(path, "w") as file:
+        file.create_group("b").attrs["value"] = 3
+    assert _ForwardA.model_validate_hdf5(path).b.attrs.value == 3
+
+
+def test_recursive_group_compiles_and_loads_a_nested_file(tmp_path: Path) -> None:
+    path = tmp_path / "recursive.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["value"] = 1
+        child = file.create_group("child")
+        child.attrs["value"] = 2
+
+    result = _RecursiveNode.model_validate_hdf5(path)
+    assert result.attrs.value == 1
+    assert result.child is not None
+    assert result.child.attrs.value == 2
+    assert result.child.child is None
+
+
+def test_group_nested_inside_another_group(result_file: Path) -> None:
+    class InnerAttrs(BaseModel):
+        answer: int
+
+    class Inner(h5t.Group[InnerAttrs]):
+        pass
+
+    class Outer(h5t.Group):
+        nested: Inner
+
+    result = Outer.model_validate_hdf5(result_file)
+    assert isinstance(result.nested, Inner)
+    assert result.nested.attrs.answer == 42
+
+
+def test_a_group_from_another_module_is_usable_as_a_field(result_file: Path) -> None:
+    class Owner(h5t.Group):
+        nested: Nested
+
+    result = Owner.model_validate_hdf5(result_file)
+    assert isinstance(result.nested, Nested)
+    assert result.nested.attrs.answer == 42
+
+
+def test_still_unresolved_nested_group_raises_pydantic_error(tmp_path: Path) -> None:
+    class Inner(h5t.Group):
+        later: _NeverDefined  # noqa: F821
+
+    class Outer(h5t.Group):
+        nested: Inner
+
+    path = tmp_path / "nested.h5"
+    with h5py.File(path, "w") as file:
+        file.create_group("nested").attrs["later"] = 1
+
+    for load in (
+        lambda: Outer.model_validate_hdf5(path),
+        lambda: Inner.model_validate_hdf5(path),
+    ):
+        with pytest.raises(PydanticUndefinedAnnotation, match="_NeverDefined"):
+            load()
+
+
+def test_extras_forbid_on_a_group_rejects_undeclared_members(result_file: Path) -> None:
+    class StrictAttrs(BaseModel):
+        version: int
+
+    class Strict(h5t.Group[StrictAttrs]):
+        model_config = ConfigDict(extra="forbid")
+
+    with pytest.raises(h5t.ValidationError):
+        Strict.model_validate_hdf5(result_file)
+
+
+def test_the_shared_result_schema_loads_every_field_kind(result_file: Path) -> None:
+    actual = Result.model_validate_hdf5(result_file)
+
+    assert actual.attrs.version == 2
+    assert actual.attrs.renamed == "current"
+    assert actual.attrs.config == {"enabled": True}
+    assert np.array_equal(actual.attrs.array_attr, np.arange(3))
+    assert np.array_equal(actual.values, np.arange(4))
+    assert actual.measurement.attrs.unit == "m"
+    assert actual.measurement.attrs.scale == 1.0
+    assert np.array_equal(actual.measurement[()], np.arange(5))
+    assert actual.raw_measurement.attrs["unit"] == "m"
+    assert np.array_equal(actual.raw_measurement[()], np.arange(5))
+    assert isinstance(actual.nested, Nested)
+    assert actual.nested.attrs.answer == 42
+    assert actual.attrs.optional_note is None
+    assert actual.attrs.defaulted == 42
+
+
+def test_dataset_is_a_member_in_its_own_right(result_file: Path) -> None:
+    class Owner(h5t.Group):
+        measurement: h5t.Dataset
+        absent: h5t.Dataset | None = None
+
+    loaded = Owner.model_validate_hdf5(result_file)
+    assert loaded.absent is None
+    assert loaded.measurement.path == "/measurement"
+    assert loaded.measurement.shape == (5,)
+    assert loaded.measurement.dtype == np.dtype("int64")
+
+    with h5py.File(result_file, "a") as file:
+        file["measurement"][...] = np.arange(5) + 10
+    assert np.array_equal(loaded.measurement.data, np.arange(5) + 10)
+
+
+def test_dataset_member_preserves_a_custom_subclass(result_file: Path) -> None:
+    class Tracked(h5t.Dataset):
+        pass
+
+    class Owner(h5t.Group):
+        measurement: Tracked
+        absent: Tracked | None = None
+
+    loaded = Owner.model_validate_hdf5(result_file)
+    assert type(loaded.measurement) is Tracked
+    assert loaded.absent is None
+    assert np.array_equal(loaded.measurement.read(), np.arange(5))

@@ -13,7 +13,6 @@ uv run ty check                          # type check (Astral's ty, not mypy/pyr
 uv run ruff check .                      # lint
 uv run ruff format --check src tests     # format check, as CI runs it
 just docs build                          # Sphinx docs; warnings are errors (-W)
-just docs build                          # Sphinx docs; warnings are errors (-W)
 ```
 
 `[tool.ty.src]` restricts type checking to `src/h5t` and `tests/acceptance_example.py`. `prek.toml`
@@ -22,73 +21,71 @@ runs ruff-check, ruff-format and ty as pre-commit hooks. Commits follow Conventi
 Public docstrings are numpy-style and rendered by Sphinx (`docs/`, built with `-W`), so keep
 them user-facing; put internal reasoning in `#` comments.
 
-Public docstrings are numpy-style and rendered by Sphinx (`docs/`, built with `-W`), so keep
-them user-facing; put internal reasoning in `#` comments.
-
 ## Architecture
 
-`h5t` turns annotated Python classes into loaders (`h5t.load`) and writers (`h5t.save`) for HDF5
-groups. Loaded records are **detached**: every handle is closed before `load` returns; only a
-`LazyArray` keeps its filename/path so the payload can be read later. A schema is a plain class
-(usually a dataclass) decorated with `@h5t.dataset` / `@h5t.group`, or reached through a `Payload`
-marker for a type you cannot decorate. h5t adds no base class and constructs every record by
-calling the record type's own constructor.
+`h5t` turns `h5t.Group[T]` subclasses (`pydantic.BaseModel` subclasses) into loaders
+(`Group.model_validate_hdf5`) and writers (`group.model_dump_hdf5`) for HDF5 groups. Loaded
+groups are **detached**: every file handle is closed before `model_validate_hdf5` returns; only a
+`Dataset[T]` keeps its `filename`/`path` so slices or the full array can be read lazily on
+demand. Both `Group[T]` and `Dataset[T]` are generic over `T` (defaulting to `Mapping[str, Any]`
+or accepting a `pydantic.BaseModel` subclass for strongly typed `.attrs: T`).
 
-Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_spec`/`_errors`.
+Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_spec`/`_errors` → `_h5view`
+(a leaf: imports only h5py/numpy). The one
+reverse edge is `Group.model_dump_hdf5`, which imports `_write` inside the method to avoid a
+real import cycle (the style guide allows deferred imports for that).
 
-- **`_spec.py`** — public markers (`Name`, `Attr`, `Eager`, `Payload`) and the compiled IR:
-  `FieldSpec`, `ClassSpec`, `ForeignSpec` (one compiled record type), plus error-path formatters.
-- **`_array.py`** — `LazyArray`, the detached lazily-read payload. Usable as a record's `Payload`
-  field or directly as a member annotation.
-- **`_compile.py`** — annotation → `FieldSpec` compilation *and* the loader. `MemberKind`
-  (ATTRIBUTE / ARRAY / DATASET / GROUP / COLLECTION) selects the load path in `_load_group_values`.
-- **`_write.py`** — `h5t.save`: a *plan* phase that mirrors the load functions over an in-memory
-  record without touching the file, then an *apply* phase that writes and rolls back on failure.
-- **`_cli.py`** — `h5t check`: import `pkg.mod:Class`, call `h5t.load`, exit 0 (ok) / 1
-  (`ValidationError`) / 2 (import, schema, usage, or I/O error).
+- **`_spec.py`** — `Glob` marker and HDF5 path formatters.
+- **`_h5view.py`** — `_GroupView`, a read-only `Mapping` over an open `h5py.Group`, plus the raw
+  attribute helpers (`_raw_attrs`, `_normalized_attrs`) and `_ghost`.
+- **`_array.py`** — `Dataset[T]`, the detached lazily-read dataset with typed `.attrs: T`,
+  `h5py`-style indexing (`ds[()]`, `ds[:]`, `ds[:10]`), `.data`, `.read()`, `.open()`, and
+  `__array__()`.
+- **`_compile.py`** — `Group[T]`, stateless declaration checks over Pydantic metadata,
+  annotation helpers, jaxtyping core-schema hook, and the loader (`model_validate_hdf5`).
+- **`_write.py`** — `Group.model_dump_hdf5`: a *plan* phase that walks an in-memory `Group`
+  tree without touching the file (it trusts construction-time validation and checks only what
+  HDF5 imposes), then an *apply* phase that writes and rolls back on failure.
+- **`_cli.py`** — `h5t check`: import `pkg.mod:Class`, call `Class.model_validate_hdf5`, exit 0
+  (ok) / 1 (`ValidationError`) / 2 (import, schema, usage, or I/O error).
 
-`RecordKind` (DATASET vs GROUP) is load-bearing: a `DATASET` record names one payload field and may
-declare only attributes besides; a `GROUP` record has no payload and admits nested groups, datasets
-and arrays. "Foreign" in internal names (`_foreign_spec`, `ForeignSpec`) is historical — these are
-simply the record types.
+### Model lifecycle: owned by Pydantic
 
-### Compilation: eager, with deferral for `GROUP` forward references
+`Group` is an ordinary Pydantic model with no custom metaclass, compiled schema IR,
+caches, or pending-model state. HDF5 operations check `model_fields` directly, rebuilding
+incomplete models with `model_rebuild()`. `_check_group` walks reachable declarations
+with an operation-local visited set before opening a file; recursive schemas terminate.
 
-The decorators compile at the decorator call. Annotations resolve against the module globals, then
-a `localns` built from the decorator caller's locals (used once, never stored), the explicit
-`localns=` kwarg, and the class's own name (so self-reference works).
-
-- A bad declaration raises `SchemaError` from the decorator call itself.
-- `DATASET` records never defer (attributes only, so no forward references are possible).
-- A `GROUP` record whose annotation raises `NameError` is stored as a `_PendingRecord` on
-  `cls.__h5t_record__` and retried later. Retries see only the explicit `localns`, not the
-  decorating function's locals — a function-scope group that defers *and* uses a local type must
-  pass `localns={...}`.
-- A `NameError` raised by a *function the annotation calls* is a bug, not a forward reference
-  (`_raised_by_annotation` distinguishes them by the raising frame).
-- `_ensure_record_compiled` is the compile-time retry point; `_compiled_record` wraps it for load
-  time and turns a still-unresolved name into `SchemaError`.
-- A `GROUP`-kind member's `ForeignSpec` is resolved at load time, not compile time, because eager
-  resolution would recurse forever on `child: Node | None`.
-- On 3.14, use `annotationlib.get_annotations(cls, format=Format.VALUE)`. Do **not** use
-  `Format.STRING`/`FORWARDREF`: they run the user's annotation helper inside a swallowing handler,
-  hiding its `NameError`.
+- HDF5 declaration restrictions raise `SchemaError` at load/write time.
+- Pydantic model-building and unresolved-annotation errors propagate unchanged.
+- Neither `np.ndarray` nor `jaxtyping.AbstractArray` is monkey-patched. Instead,
+  `_prepare_group_fields` (called in `Group.__get_pydantic_core_schema__`) and
+  `_prepare_attrs_model` recursively wrap array leaves in `model_fields` with `Annotated`
+  markers (`_NdarraySchema` and `_JaxtypingSchema`). Foreign models h5t never sees (jax,
+  torch, ...) are never touched; the unsupported-type `SchemaError` comes from
+  `_unwrap_jaxtyping` at load/write time.
+- `localns=` is removed. Resolve local dependencies explicitly with
+  `Model.model_rebuild(_types_namespace={...})`; do not inspect frames or clear namespaces.
+- The writer checks runtime group and attribute model declarations during planning,
+  including subclass fields in direct children and collection items.
 
 ### Naming
 
-Internal state is prefixed `_h5t_`; the only name written onto a user's class is `__h5t_record__`
-(set via `setattr`, deliberately not inherited). Annotations starting with `_` are skipped as
-fields. Record fields may use any name (`data`, `attrs`, `path`, ...); only repeated *HDF5* names
-within a record are rejected.
+Internal state is prefixed `_h5t_`. Pydantic excludes annotations starting with `_` from
+fields. Group fields represent child HDF5 nodes (attributes live on `.attrs: T`); only repeated
+*HDF5* names within a group or attributes model are rejected.
 
 ### jaxtyping arrays
 
 jaxtyping does the checking; h5t never parses a shape string. `_unwrap_jaxtyping` rewrites an
-`AbstractArray` subclass to its backing `np.ndarray`/`LazyArray` early in compilation and keeps the
-original as an `ArraySpec`. `_check_array` calls the non-public `hint.__instancecheck_str__` on a
-metadata-only candidate (a zero-stride `_ghost` array, or a `LazyArray`), so no data is read. A
-guard test fails if jaxtyping drops that method. Each `_load_group_values` / `_load_foreign_dataset`
-call opens its own `jaxtyped("context")` scope; the writer mirrors this.
+`AbstractArray` subclass to its backing `np.ndarray`/`Dataset[T]` during annotation inspection. The
+Pydantic core-schema hook (`_jaxtyping_pydantic_schema`) calls the non-public
+`hint.__instancecheck_str__` on a metadata-only candidate (a zero-stride `_ghost` array, or a
+`Dataset`), so no data is read. A guard test fails if jaxtyping drops that method. Dimension
+bindings are scoped per group: `Group`'s wrap validator opens one `jaxtyped("context")` for the
+children, and the `attrs` field has its own scope (`Group._h5t_attrs_scope`) so attribute dims
+never bind with child dims. A jaxtyping `np.ndarray` field checks a `_ghost` of an `h5py.Dataset`
+*before* reading it; a `Dataset`-backed one builds the lazy `Dataset` and checks that.
 
 ### Array annotations see through type aliases
 
@@ -97,39 +94,58 @@ alias rather than `np.ndarray`. `_is_ndarray_annotation` expands `__value__` (de
 it reaches a real origin. numpy 2.5 needs Python ≥ 3.12, so a failure here that looks
 Python-version-dependent is really numpy-version-dependent.
 
-### Validation
+### Validation: one pass, type-owned readers
 
-Pydantic is used only through `TypeAdapter` (never `BaseModel`), built once per field with
-`arbitrary_types_allowed=True`. Attribute order: raw h5py value → `Attr(converter=)` (failure ⇒
-`ConversionError`) → adapter (failure ⇒ `ValidationError`). Errors are fail-fast and path-aware.
-Hierarchy: `H5TError` → `SchemaError`, `ValidationError` → `ConversionError`.
+`Group.model_validate_hdf5` opens the file and calls `cls.model_validate(_GroupView(node))`
+once. The view hands Pydantic raw material: child groups as nested views, child datasets as the
+raw `h5py.Dataset`, and the attributes under `ATTRS_KEY` (`"/attrs"`, not a legal child name;
+`Group.attrs` has `validation_alias=ATTRS_KEY`, so in-memory `Group(attrs=...)` still works).
+Each *type* converts raw input itself:
 
-Missing members go through `_missing_value`: declared default (validated; `default_factory` called
-first), else `None` for `T | None`, else `ValidationError`.
+- `Dataset[T]` builds a lazy `Dataset` from an `h5py.Dataset` (typed attrs are validated in their
+  own jaxtyping scope via `handler.generate_schema(attrs_type)`; failures flow out in `loc` and
+  are formatted by `_h5_error_path` as `<path>@<attr>`).
+- jaxtyping arrays and plain `np.ndarray` fields (including collections and chained PEP 695
+  aliases of them): `_rewrite_annotation` wraps each array leaf in `Annotated[..., _JaxtypingSchema | _NdarraySchema]`
+  before Pydantic builds the model's core schema, so `_read_h5py` or `_read_array` runs via
+  Pydantic's standard `Annotated` hook without walking or rewriting raw `CoreSchema` dicts.
+- `Glob.__get_pydantic_core_schema__` filters only a `_GroupView` (`fnmatch.fnmatchcase`).
+- `Group._h5t_jaxtyping_scope` rejects any attribute on a `extra="forbid"` group with untyped
+  attrs, and freezes loaded untyped attrs into a `MappingProxyType`.
 
-Pydantic/dataclass quirks that shaped the design:
+Pydantic's semantics apply: `T | None` without a default is required, defaults are not
+re-validated unless `validate_default`, and under `extra="ignore"` only declared names are read.
+Pydantic's `ValidationError` is a `ValueError`, so anything raised inside a validator must be an
+`h5t.ValidationError` (not a `ValueError`) to propagate unchanged.
 
-1. `TypeAdapter(Dataclass, config=...)` raises, and an unconfigured one would revalidate fields, so
-   `_build_record_adapter` uses an `InstanceOf` adapter instead.
-2. `dataclasses.field(default_factory=...)` leaves no class attribute, so defaults are read from
-   `dataclasses.fields()` for dataclasses; for other types, from the declaring class, then the
-   constructor signature.
-3. Records are built with the real constructor via `_construct_record` (never `object.__new__`).
-   Only an argument-binding `TypeError` is a `SchemaError`; anything raised after user code starts
-   (including `__post_init__`) becomes a `ValidationError`.
+### Writing: trust construction
 
-A `MemberKind.DATASET` field with `foreign is None` is a bare `LazyArray` member constructed
-directly; only `Eager()` is meaningful on it.
+`Group.model_dump_hdf5` does not re-validate. Field types, jaxtyping shapes and attribute models
+were checked when the instance was built, so `_write._plan_group` walks runtime `model_fields`.
+Typed attributes come from `model_dump(mode="python", by_alias=True, include=<declared fields>)`,
+so serializers and aliases are Pydantic's; Nullable field annotations determine which attributes holding `None`
+are left out (a required `Any` attribute holding `None` is an error, not silently skipped). The
+writer still checks what Pydantic cannot know: collection keys, `Glob` patterns on in-memory
+dicts, untyped attributes on an `extra="forbid"` group, and values h5py cannot store. An instance
+built with `model_construct` or mutated after construction is written as it is.
+
+Errors keep pydantic's wording; `_h5_error_path` walks the first error's `loc` through the
+model fields and annotations to produce the HDF5 path (`/values: Field required`, `/@count: ...`,
+`/runs/r1/values: ...`). A `loc` part it cannot place goes into the message. Errors raised
+directly as `h5t.ValidationError` already carry their path. `_check_group` checks every
+reachable declaration first; unresolved names retain native Pydantic errors.
+Hierarchy: `H5TError` → `SchemaError`, `ValidationError`.
 
 ## Testing
 
-`tests/conftest.py` holds the canonical schemas (`Result`, `Nested`, `EagerMeasurement`,
-`LazyMeasurement`), `write_result()`, and `open_fd_count()` (POSIX-only, used by every fd-leak
-assertion). Prefer extending these over new ad-hoc fixtures.
+`tests/conftest.py` holds the canonical schemas (`Result`, `ResultAttrs`, `Nested`,
+`NestedAttrs`, `MeasurementAttrs`), `write_result()`, and `open_fd_count()` (POSIX-only, used by
+every fd-leak assertion). Prefer extending these over new ad-hoc fixtures.
 
 - `tests/test_pep649.py` deliberately has **no** `from __future__ import annotations` and skips
-  below 3.14; its records are declared inside test functions. Do not add the future import.
+  below 3.14; its groups are declared inside test functions. Do not add the future import.
 - `tests/acceptance_example.py` is not collected by pytest; its annotated assignments fail
-  `ty check` if `h5t.load` stops returning precisely-typed records. Update it when the public
-  typing surface changes.
-- Handle-lifetime changes in `h5t.load` or `LazyArray.open` must keep the fd-leak tests green.
+  `ty check` if `model_validate_hdf5` stops returning precisely-typed groups and datasets. Update
+  it when the public typing surface changes.
+- Handle-lifetime changes in `Group.model_validate_hdf5` or `Dataset.open` must keep the fd-leak
+  tests green.

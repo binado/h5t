@@ -1,27 +1,36 @@
-"""Pydantic coercion, constraints, converters, and errors."""
+"""Pydantic coercion, constraints, validators, and errors."""
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import h5py
 import pytest
-from pydantic import Field
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+from pydantic import ValidationError as PydanticValidationError
 
 import h5t
 
 
 def test_coercion_literals_nested_containers_and_constraints(tmp_path: Path) -> None:
-    @h5t.group()
-    @dataclasses.dataclass
-    class Schema:
+    class SchemaAttrs(BaseModel):
         count: int
         mode: Literal["fast", "safe"]
         constrained: Annotated[int, Field(gt=0)]
-        payload: Annotated[dict[str, list[int]], h5t.Attr(converter=json.loads)]
+        payload: Annotated[dict[str, list[int]], BeforeValidator(json.loads)]
+
+    class Schema(h5t.Group[SchemaAttrs]):
+        pass
 
     path = tmp_path / "pydantic.h5"
     with h5py.File(path, "w") as file:
@@ -29,44 +38,216 @@ def test_coercion_literals_nested_containers_and_constraints(tmp_path: Path) -> 
         file.attrs["mode"] = "fast"
         file.attrs["constrained"] = 4
         file.attrs["payload"] = '{"numbers": [1, "2"]}'
-    value = h5t.load(Schema, path)
-    assert value.count == 3
-    assert value.payload == {"numbers": [1, 2]}
+    value = Schema.model_validate_hdf5(path)
+    assert value.attrs.count == 3
+    assert value.attrs.payload == {"numbers": [1, 2]}
 
 
-def test_converter_runs_before_validation_and_chains_failure(tmp_path: Path) -> None:
+def test_before_validator_runs_before_validation_and_surfaces_path(tmp_path: Path) -> None:
     calls: list[Any] = []
 
     def convert(value: Any) -> str:
         calls.append(value)
-        raise RuntimeError("broken decoder")
+        raise ValueError("broken decoder")
 
-    @h5t.group()
-    @dataclasses.dataclass
-    class Schema:
-        payload: Annotated[dict[str, int], h5t.Attr(converter=convert)]
+    class SchemaAttrs(BaseModel):
+        payload: Annotated[dict[str, int], BeforeValidator(convert)]
+
+    class Schema(h5t.Group[SchemaAttrs]):
+        pass
 
     path = tmp_path / "conversion.h5"
     with h5py.File(path, "w") as file:
         file.attrs["payload"] = "{}"
-    with pytest.raises(h5t.ConversionError, match="broken decoder") as caught:
-        h5t.load(Schema, path)
+    with pytest.raises(h5t.ValidationError, match="broken decoder") as caught:
+        Schema.model_validate_hdf5(path)
     assert calls == ["{}"]
-    assert isinstance(caught.value.__cause__, RuntimeError)
     assert caught.value.path == "/@payload"
 
 
 def test_pydantic_failure_is_concise_and_path_aware(tmp_path: Path) -> None:
-    @h5t.group()
-    @dataclasses.dataclass
-    class Schema:
-        payload: Annotated[dict[str, list[int]], h5t.Attr(converter=json.loads)]
+    class SchemaAttrs(BaseModel):
+        payload: Annotated[dict[str, list[int]], BeforeValidator(json.loads)]
+
+    class Schema(h5t.Group[SchemaAttrs]):
+        pass
 
     path = tmp_path / "invalid.h5"
     with h5py.File(path, "w") as file:
         file.attrs["payload"] = '{"values": ["not-an-int"]}'
     with pytest.raises(h5t.ValidationError) as caught:
-        h5t.load(Schema, path)
+        Schema.model_validate_hdf5(path)
     assert caught.value.path == "/@payload"
     assert "values.0" in caught.value.message
     assert "validation error" not in caught.value.message.lower()
+
+
+@pytest.fixture
+def attrs_file(tmp_path: Path) -> Path:
+    path = tmp_path / "attrs.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["name"] = "  Ada  "
+        file.attrs["count"] = 3
+    return path
+
+
+def test_wrap_field_validator_runs_on_load(attrs_file: Path) -> None:
+    class WrapAttrs(BaseModel):
+        name: str
+        count: int
+
+        @field_validator("name", mode="wrap")
+        @classmethod
+        def strip(cls, value: Any, handler: Any) -> str:
+            return handler(value).strip()
+
+    class Schema(h5t.Group[WrapAttrs]):
+        pass
+
+    assert Schema.model_validate_hdf5(attrs_file).attrs.name == "Ada"
+
+
+def test_before_field_validator_runs_on_load(attrs_file: Path) -> None:
+    class BeforeAttrs(BaseModel):
+        name: str
+        count: int
+
+        @field_validator("count", mode="before")
+        @classmethod
+        def double(cls, value: Any) -> Any:
+            return int(value) * 2
+
+    class Schema(h5t.Group[BeforeAttrs]):
+        pass
+
+    assert Schema.model_validate_hdf5(attrs_file).attrs.count == 6
+
+
+def test_star_field_validator_applies_to_every_attribute(attrs_file: Path) -> None:
+    seen: list[str] = []
+
+    class StarAttrs(BaseModel):
+        name: str
+        count: int
+
+        @field_validator("*")
+        @classmethod
+        def record(cls, value: Any) -> Any:
+            seen.append(type(value).__name__)
+            return value
+
+    class Schema(h5t.Group[StarAttrs]):
+        pass
+
+    Schema.model_validate_hdf5(attrs_file)
+    assert sorted(seen) == ["int", "str"]
+
+
+def test_after_field_validator_receives_validation_info(attrs_file: Path) -> None:
+    class InfoAttrs(BaseModel):
+        name: str
+        count: int
+
+        @field_validator("count")
+        @classmethod
+        def check(cls, value: int, info: ValidationInfo) -> int:
+            assert info.field_name == "count"
+            assert info.data["name"] == "  Ada  "
+            return value
+
+    class Schema(h5t.Group[InfoAttrs]):
+        pass
+
+    assert Schema.model_validate_hdf5(attrs_file).attrs.count == 3
+
+
+def test_frozen_attrs_model_loads_and_stays_frozen(attrs_file: Path) -> None:
+    class FrozenAttrs(BaseModel):
+        model_config = ConfigDict(frozen=True)
+
+        name: str
+        count: int
+
+    class Schema(h5t.Group[FrozenAttrs]):
+        pass
+
+    attrs = Schema.model_validate_hdf5(attrs_file).attrs
+    with pytest.raises(PydanticValidationError, match="frozen"):
+        attrs.count = 4  # type: ignore[misc]
+
+
+def test_frozen_group_loads_read_only_untyped_attrs(attrs_file: Path) -> None:
+    class Schema(h5t.Group):
+        model_config = ConfigDict(frozen=True)
+
+    loaded = Schema.model_validate_hdf5(attrs_file)
+    assert loaded.attrs["count"] == 3
+    with pytest.raises(TypeError):
+        loaded.attrs["count"] = 4  # type: ignore[index]
+    with pytest.raises(PydanticValidationError, match="frozen"):
+        loaded.attrs = {}
+
+
+@pytest.mark.parametrize("value", [None, "hello"])
+def test_optional_attrs_use_serialization_alias_when_written(
+    tmp_path: Path, value: str | None
+) -> None:
+    class AliasedAttrs(BaseModel):
+        note: str | None = Field(default=None, alias="input", serialization_alias="out")
+
+    class Schema(h5t.Group[AliasedAttrs]):
+        pass
+
+    path = tmp_path / "aliased.h5"
+    Schema(attrs=AliasedAttrs(input=value)).model_dump_hdf5(path)
+    with h5py.File(path) as file:
+        assert "input" not in file.attrs
+        if value is None:
+            assert "out" not in file.attrs
+        else:
+            assert file.attrs["out"] == value
+
+
+def test_loaded_attrs_equal_in_memory_model(attrs_file: Path) -> None:
+    class EqAttrs(BaseModel):
+        name: str
+        count: int
+
+    class Schema(h5t.Group[EqAttrs]):
+        pass
+
+    loaded = Schema.model_validate_hdf5(attrs_file)
+    assert loaded == Schema(attrs=EqAttrs(name="  Ada  ", count=3))
+
+
+def test_validator_bug_propagates_instead_of_becoming_validation_error(attrs_file: Path) -> None:
+    class BuggyAttrs(BaseModel):
+        name: str
+
+        @field_validator("name")
+        @classmethod
+        def explode(cls, value: str) -> str:
+            raise KeyError("bug")
+
+    class Schema(h5t.Group[BuggyAttrs]):
+        pass
+
+    with pytest.raises(KeyError):
+        Schema.model_validate_hdf5(attrs_file)
+
+
+def test_before_model_validator_on_group_sees_a_read_only_mapping_on_load(
+    attrs_file: Path,
+) -> None:
+    seen: list[type] = []
+
+    class Schema(h5t.Group):
+        @model_validator(mode="before")
+        @classmethod
+        def observe(cls, data: Any) -> Any:
+            seen.append(type(data))
+            assert not isinstance(data, dict)
+            return data
+
+    assert Schema.model_validate_hdf5(attrs_file).attrs["count"] == 3
+    assert len(seen) == 1

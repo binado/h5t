@@ -1,95 +1,145 @@
-"""Schema compilation and detached HDF5 loading."""
+"""``Group[T]`` declaration checks and detached HDF5 loading."""
 
 from __future__ import annotations
 
-import dataclasses
 import fnmatch
-import inspect
+import functools
+import operator
 import os
 import posixpath
 import re
-import sys
 import types
 import typing
-import weakref
-from collections.abc import Callable, Mapping
-from enum import Enum
+from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Annotated, Any, ClassVar, Literal
+from typing import Annotated, Any, Generic, Literal, Self
 
 import h5py
 import numpy as np
 from jaxtyping import AbstractArray, jaxtyped
-from pydantic import ConfigDict, InstanceOf, TypeAdapter
-from pydantic import ValidationError as PydanticValidationError
-
-from h5t._array import LazyArray
-from h5t._errors import ConversionError, SchemaError, ValidationError
-from h5t._spec import (
-    _NO_DEFAULT,
-    ArraySpec,
-    Attr,
-    ClassSpec,
-    Eager,
-    Extras,
-    FieldSpec,
-    ForeignSpec,
-    Glob,
-    MemberKind,
-    Name,
-    Payload,
-    RecordKind,
-    attr_path,
-    child_path,
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    GetCoreSchemaHandler,
+    ModelWrapValidatorHandler,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+    model_validator,
 )
+from pydantic import ValidationError as PydanticValidationError
+from pydantic.fields import FieldInfo
+from pydantic_core import PydanticCustomError, core_schema
+from typing_extensions import TypeVar
 
-_SCALAR_TYPES = (str, int, float, bool, bytes, complex)
+from h5t._array import Dataset, _is_mapping_type
+from h5t._errors import SchemaError, ValidationError
+from h5t._h5view import ATTRS_KEY, _ghost, _GroupView
+from h5t._spec import Glob, attr_path, child_path
+
+T = TypeVar("T", bound=BaseModel | Mapping[str, Any], default=Mapping[str, Any])
 
 
 def _schema_error(owner: type, field: str, message: str) -> SchemaError:
     return SchemaError(f"{owner.__name__}.{field}: {message}")
 
 
-_ANNOTATION_FILE = "<h5t annotation>"
+# ---------------------------------------------------------------------------
+# Array and jaxtyping integration with Pydantic
+# ---------------------------------------------------------------------------
 
 
-class _UnresolvedAnnotation(Exception):
-    """An annotation names something not defined yet, so compilation must defer.
-
-    Private to this module: raised while resolving annotations and turned into the
-    user-visible ``SchemaError`` by ``_compiled_record`` if the name is still missing
-    when the spec is finally read at load time.
-    """
-
-    def __init__(self, owner: type, name: str | None, message: str) -> None:
-        super().__init__(message)
-        self.owner = owner
-        self.name = name
+def _read_array(value: Any) -> Any:
+    """Turn an open ``h5py.Dataset`` into an ndarray; pass any other value through."""
+    if isinstance(value, h5py.Dataset):
+        return np.asarray(value[()])
+    return value
 
 
-def _raised_by_annotation(exc: NameError, cls: type) -> bool:
-    """Report whether ``exc`` came from the annotation expression itself, not a callee.
+def _is_supported_array_type(array_type: Any) -> bool:
+    """Report whether jaxtyping may back an array with ``array_type``."""
+    return array_type is np.ndarray or (
+        isinstance(array_type, type) and issubclass(array_type, Dataset)
+    )
 
-    Only an unbound name in the expression is a forward reference worth deferring for.
-    A ``NameError`` escaping a function the annotation calls is a bug in that function,
-    so it must take the ``SchemaError`` path instead. The frame that raised identifies
-    the two: a PEP 563 string annotation is compiled under ``_ANNOTATION_FILE``, and a
-    PEP 649 lazy annotation is evaluated by ``cls``'s own ``__annotate__`` function.
-    """
-    tb = exc.__traceback__
-    while tb is not None and tb.tb_next is not None:
-        tb = tb.tb_next
-    if tb is None:
-        return False
-    code = tb.tb_frame.f_code
-    if code.co_filename in (_ANNOTATION_FILE, "<string>"):
-        return True
-    # A class with no annotations of its own has ``__annotate__ is None``.
-    return code is getattr(getattr(cls, "__annotate__", None), "__code__", None)
+
+def _jaxtyping_pydantic_schema(
+    cls: type[AbstractArray], source_type: Any, handler: GetCoreSchemaHandler
+) -> core_schema.CoreSchema:
+    array_type = cls.array_type
+    if not _is_supported_array_type(array_type):
+        # Unsupported array types keep Pydantic's default schema at class-creation time;
+        # h5t rejects them with a SchemaError in ``_unwrap_jaxtyping`` at load/write time.
+        return handler(source_type)
+    # ``handler(Dataset[T])`` would fall back to a plain isinstance check on this path, so a
+    # Dataset-backed array asks the Dataset class for its own schema (the raw-h5py reader).
+    if array_type is np.ndarray:
+        base_schema = handler(array_type)
+    else:
+        base_schema = array_type.__get_pydantic_core_schema__(array_type, handler)
+    reads_ndarray = array_type is np.ndarray
+
+    def _validate_jaxtyping(value: Any) -> Any:
+        reason = cls.__instancecheck_str__(value)
+        if reason:
+            raise PydanticCustomError("jaxtyping", "{reason}", {"reason": reason})
+        return value
+
+    def _read_h5py(value: Any) -> Any:
+        # An ndarray-backed field is read eagerly, but only after jaxtyping has approved the
+        # shape and dtype from a metadata-only stand-in, so a mismatch never reads data.
+        if reads_ndarray and isinstance(value, h5py.Dataset):
+            reason = cls.__instancecheck_str__(_ghost(value))
+            if reason:
+                raise ValidationError(value.name, reason)
+            return _read_array(value)
+        # Attribute values arrive as Python scalars; a jaxtyping field wants an array.
+        if reads_ndarray and isinstance(value, _SCALAR_TYPES):
+            return np.asarray(value)
+        return value
+
+    return core_schema.no_info_before_validator_function(
+        _read_h5py,
+        core_schema.chain_schema(
+            [
+                base_schema,
+                core_schema.no_info_plain_validator_function(_validate_jaxtyping),
+            ]
+        ),
+    )
+
+
+_SCALAR_TYPES = (bool, int, float, complex, str, bytes, np.generic)
+
+
+class _NdarraySchema:
+    """``Annotated`` marker attaching `_read_array` to a plain ``np.ndarray`` annotation."""
+
+    def __get_pydantic_core_schema__(
+        self, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        return core_schema.no_info_before_validator_function(_read_array, handler(source_type))
+
+
+class _JaxtypingSchema:
+    """``Annotated`` marker attaching `_jaxtyping_pydantic_schema` to a jaxtyping array."""
+
+    def __init__(self, hint: type[AbstractArray]) -> None:
+        self.hint = hint
+
+    def __get_pydantic_core_schema__(
+        self, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        return _jaxtyping_pydantic_schema(self.hint, source_type, handler)
+
+
+# ---------------------------------------------------------------------------
+# Field classification helpers
+# ---------------------------------------------------------------------------
 
 
 def _split_annotation(owner: type, py_name: str, annotation: Any) -> tuple[Any, list[Any], bool]:
-    """Extract h5t/constraint metadata and optionality from an annotation."""
+    """Extract metadata and optionality from an annotation."""
     metadata: list[Any] = []
     optional = False
     core = annotation
@@ -116,35 +166,6 @@ def _split_annotation(owner: type, py_name: str, annotation: Any) -> tuple[Any, 
         return core, metadata, optional
 
 
-def _adapter_annotation(core: Any, metadata: list[Any], optional: bool) -> Any:
-    foreign = tuple(item for item in metadata if not isinstance(item, (Name, Attr, Eager, Glob)))
-    annotation = Annotated[core, *foreign] if foreign else core
-    return annotation | None if optional else annotation
-
-
-def _build_adapter(owner: type, py_name: str, annotation: Any) -> TypeAdapter[Any]:
-    try:
-        return TypeAdapter(annotation, config=ConfigDict(arbitrary_types_allowed=True))
-    except Exception as exc:
-        raise _schema_error(owner, py_name, f"cannot construct a validator: {exc}") from exc
-
-
-def _build_record_adapter(
-    owner: type, py_name: str, record_type: type, optional: bool
-) -> TypeAdapter[Any]:
-    """Build an instance-only adapter without inspecting a record's own fields."""
-    runtime_type = dict if typing.is_typeddict(record_type) else record_type
-    annotation: Any = InstanceOf.__class_getitem__(runtime_type)
-    if optional:
-        annotation = annotation | None
-    try:
-        # Passing config for a dataclass/BaseModel/TypedDict is rejected by pydantic.
-        # InstanceOf needs no arbitrary-types config and does not revalidate fields.
-        return TypeAdapter(annotation)
-    except Exception as exc:
-        raise _schema_error(owner, py_name, f"cannot construct a validator: {exc}") from exc
-
-
 def _marker(metadata: list[Any], marker_type: type, owner: type, py_name: str) -> Any | None:
     found = [item for item in metadata if isinstance(item, marker_type)]
     if len(found) > 1:
@@ -152,22 +173,13 @@ def _marker(metadata: list[Any], marker_type: type, owner: type, py_name: str) -
     return found[0] if found else None
 
 
-# PEP 695 aliases are 3.12+; on 3.11 the empty tuple makes every isinstance False.
 _alias_type = getattr(typing, "TypeAliasType", None)
 _TYPE_ALIAS_TYPES: tuple[type, ...] = (_alias_type,) if isinstance(_alias_type, type) else ()
 _MAX_ALIAS_DEPTH = 16
 
 
 def _is_ndarray_annotation(core: Any) -> bool:
-    """Report whether ``core`` denotes ``np.ndarray``, however many aliases deep.
-
-    numpy >= 2.5 defines ``npt.NDArray`` as a PEP 695 ``TypeAliasType``, which defers
-    its right-hand side -- deferring is what lets an alias recurse -- so
-    ``typing.get_origin`` stops at the alias itself. numpy <= 2.4 built the same name
-    out of eager substitution, leaving ``np.ndarray`` directly visible as the origin.
-    Expanding ``__value__`` sees through either shape, and through a user's own alias
-    of one. The walk is depth-bounded because a PEP 695 alias may be self-referential.
-    """
+    """Report whether ``core`` denotes ``np.ndarray``, however many aliases deep."""
     for _ in range(_MAX_ALIAS_DEPTH):
         if core is np.ndarray:
             return True
@@ -177,70 +189,24 @@ def _is_ndarray_annotation(core: Any) -> bool:
         if isinstance(core, _TYPE_ALIAS_TYPES):
             core = core.__value__
         elif isinstance(origin, _TYPE_ALIAS_TYPES):
-            # A subscripted alias: __value__ carries the parameter, which is dropped
-            # here along with the dtype the classification already ignores.
             core = origin.__value__
         else:
             return False
     return False
 
 
-def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> tuple[Any, ArraySpec | None]:
-    """Split a jaxtyping array type into its backing class and an ``ArraySpec``.
-
-    The backing class (``np.ndarray`` or a ``LazyArray`` subclass) is what the rest of
-    the compiler classifies; the jaxtyping class is kept to do the checking at load time.
-    Anything that is not a jaxtyping array is returned unchanged.
-    """
+def _unwrap_jaxtyping(owner: type, py_name: str, core: Any) -> Any:
+    """Replace a jaxtyping array type by its backing class; pass any other type through."""
     if not (isinstance(core, type) and issubclass(core, AbstractArray)):
-        return core, None
+        return core
     array_type = core.array_type
-    if not (
-        array_type is np.ndarray
-        or (isinstance(array_type, type) and issubclass(array_type, LazyArray))
-    ):
+    if not _is_supported_array_type(array_type):
         raise _schema_error(
             owner,
             py_name,
-            f"jaxtyping array type {array_type!r} is not supported; use np.ndarray or LazyArray",
+            f"jaxtyping array type {array_type!r} is not supported; use np.ndarray or Dataset",
         )
-    return array_type, ArraySpec(core, core.dtype, core.dim_str)
-
-
-def _check_array(spec: ArraySpec, candidate: Any, path: str) -> None:
-    """Ask jaxtyping whether ``candidate`` satisfies ``spec``; call inside a record scope.
-
-    ``candidate`` stands in for the dataset and only needs ``shape`` and ``dtype``: a
-    zero-stride ghost ndarray, or the ``LazyArray`` built from the same metadata. Named
-    dimensions bind in the enclosing ``jaxtyped("context")``.
-    """
-    reason = spec.hint.__instancecheck_str__(candidate)  # ty: ignore[unresolved-attribute]
-    if reason:
-        raise ValidationError(path, reason)
-
-
-def _ghost(node: h5py.Dataset) -> np.ndarray:
-    """Return an ndarray with ``node``'s shape and dtype that allocates one scalar only."""
-    return np.broadcast_to(np.empty((), node.dtype), node.shape)
-
-
-def _lazy_from_node(
-    lazy_type: type[LazyArray],
-    filename: str,
-    path: str,
-    node: h5py.Dataset,
-    *,
-    eager: bool,
-    array: ArraySpec | None,
-) -> LazyArray:
-    """Build a ``LazyArray``, validating its metadata before any payload is read."""
-    shape, dtype = tuple(node.shape), np.dtype(node.dtype)
-    lazy = lazy_type(filename, path, shape, dtype)
-    if array is not None:
-        _check_array(array, lazy, path)
-    if eager:
-        lazy = lazy_type(filename, path, shape, dtype, data=np.asarray(node[()]))
-    return lazy
+    return array_type
 
 
 def _is_mapping_annotation(core: Any) -> bool:
@@ -249,13 +215,7 @@ def _is_mapping_annotation(core: Any) -> bool:
     return isinstance(origin, type) and issubclass(origin, Mapping)
 
 
-def _is_scalar_annotation(core: Any) -> bool:
-    if core in _SCALAR_TYPES or typing.get_origin(core) is Literal:
-        return True
-    return isinstance(core, type) and (issubclass(core, Enum) or issubclass(core, np.generic))
-
-
-def _compile_glob(owner: type, py_name: str, marker: Glob) -> re.Pattern[str]:
+def _check_glob(owner: type, py_name: str, marker: Glob) -> re.Pattern[str]:
     pattern = marker.pattern
     if not isinstance(pattern, str) or not pattern:
         raise _schema_error(owner, py_name, "Glob requires a non-empty string pattern")
@@ -264,16 +224,71 @@ def _compile_glob(owner: type, py_name: str, marker: Glob) -> re.Pattern[str]:
     return re.compile(fnmatch.translate(pattern))
 
 
-def _collection_item(owner: type, py_name: str, core: Any) -> FieldSpec:
-    """Compile the item type of a ``dict[str, T]`` / ``Mapping[str, T]`` collection."""
+# ---------------------------------------------------------------------------
+# Attribute declaration checks (for T in Group[T] and Dataset[T])
+# ---------------------------------------------------------------------------
+
+
+def _extract_forbid_extras(model_cls: type[BaseModel]) -> bool:
+    raw = model_cls.model_config.get("extra", "ignore")
+    if raw is None or raw == "ignore":
+        return False
+    if raw == "forbid":
+        return True
+    raise SchemaError(f"{model_cls.__name__}: extra must be 'ignore' or 'forbid', got {raw!r}")
+
+
+def _check_attrs(model_type: type[BaseModel]) -> None:
+    if not model_type.__pydantic_complete__:
+        model_type.model_rebuild()
+    _prepare_attrs_model(model_type)
+    _extract_forbid_extras(model_type)
+
+    # This loop only rejects declarations h5t cannot store or load; Pydantic does the rest.
+    seen_h5_names: dict[str, str] = {}
+    for py_name, field_info in model_type.model_fields.items():
+        raw_ann = field_info.annotation
+        core, meta, _ = _split_annotation(model_type, py_name, raw_ann)
+        all_meta = [*meta, *field_info.metadata]
+        if any(isinstance(m, Glob) for m in all_meta):
+            raise _schema_error(
+                model_type, py_name, "Glob applies only to dict[str, T] collection fields"
+            )
+
+        h5_name = field_info.alias if field_info.alias is not None else py_name
+        if not isinstance(h5_name, str) or not h5_name:
+            raise _schema_error(model_type, py_name, "alias requires a non-empty string")
+        if h5_name in seen_h5_names:
+            raise SchemaError(
+                f"{model_type.__name__}: duplicate HDF5 attribute name {h5_name!r} for fields "
+                f"{seen_h5_names[h5_name]!r} and {py_name!r}"
+            )
+        seen_h5_names[h5_name] = py_name
+        core = _unwrap_jaxtyping(model_type, py_name, core)
+        if isinstance(core, type) and issubclass(core, (Group, Dataset)):
+            raise _schema_error(
+                model_type,
+                py_name,
+                f"attributes model cannot contain {core.__name__} fields",
+            )
+
+
+def _extract_alias(owner: type, py_name: str, field: FieldInfo) -> str:
+    h5_name = field.alias if field.alias is not None else py_name
+    if not isinstance(h5_name, str) or not h5_name:
+        raise _schema_error(owner, py_name, "alias requires a non-empty string")
+    return h5_name
+
+
+def _collection_item(owner: type, py_name: str, core: Any) -> Any:
+    """Check and return the item annotation of a collection."""
     origin = typing.get_origin(core) or core
     args = typing.get_args(core)
     if origin not in (dict, Mapping) or len(args) != 2:
         raise _schema_error(
             owner,
             py_name,
-            "a collection must be annotated dict[str, T] or Mapping[str, T]; "
-            "use Attr() for a dict-valued attribute",
+            "a collection must be annotated dict[str, T] or Mapping[str, T]",
         )
     key, item_annotation = args
     if key is not str:
@@ -281,897 +296,240 @@ def _collection_item(owner: type, py_name: str, core: Any) -> FieldSpec:
     _, item_metadata, item_optional = _split_annotation(owner, py_name, item_annotation)
     if item_optional:
         raise _schema_error(owner, py_name, "collection items cannot be optional")
-    for forbidden in (Name, Attr, Glob):
-        if any(isinstance(m, forbidden) for m in item_metadata):
-            raise _schema_error(
-                owner, py_name, f"{forbidden.__name__} cannot annotate a collection item"
-            )
-    item = _field_spec(owner, py_name, item_annotation, _NO_DEFAULT, dataset_owner=False)
-    if item.kind is MemberKind.ATTRIBUTE:
-        raise _schema_error(owner, py_name, "collection items must be groups or datasets")
-    if item.kind is MemberKind.COLLECTION:
+    if any(isinstance(m, Glob) for m in item_metadata):
+        raise _schema_error(owner, py_name, "Glob cannot annotate a collection item")
+    if any(isinstance(m, FieldInfo) and m.alias is not None for m in item_metadata):
+        raise _schema_error(owner, py_name, "alias cannot annotate a collection item")
+    item_core = _member_annotation(owner, py_name, item_annotation)
+    if _is_mapping_annotation(item_core):
         raise _schema_error(owner, py_name, "nested collections are not supported")
-    return item
+    return item_annotation
 
 
-def _reject_eager_on_eager_payload(
-    owner: type, py_name: str, eager_marker: Eager | None, foreign: ForeignSpec
-) -> None:
-    """Eager is only a prefetch hint for a LazyArray payload; an np.ndarray one already is."""
-    if eager_marker is not None and foreign.lazy_type is None:
-        raise _schema_error(owner, py_name, "Eager and Payload cannot be combined")
+def _member_annotation(owner: type, name: str, annotation: Any) -> Any:
+    core, _, _ = _split_annotation(owner, name, annotation)
+    core = _unwrap_jaxtyping(owner, name, core)
+    origin = typing.get_origin(core)
+    if isinstance(origin, type) and issubclass(origin, Dataset):
+        args = typing.get_args(core)
+        return origin if not args or isinstance(args[0], TypeVar) else origin[args[0]]
+    return core
 
 
-def _field_spec(
-    owner: type,
-    py_name: str,
-    annotation: Any,
-    default: Any,
-    *,
-    dataset_owner: bool,
-    default_factory: Callable[[], Any] | None = None,
-) -> FieldSpec:
-    core, metadata, optional = _split_annotation(owner, py_name, annotation)
-    name_marker = _marker(metadata, Name, owner, py_name)
-    attr_marker = _marker(metadata, Attr, owner, py_name)
-    eager_marker = _marker(metadata, Eager, owner, py_name)
-    payload_marker = _marker(metadata, Payload, owner, py_name)
-    glob_marker = _marker(metadata, Glob, owner, py_name)
-
-    h5_name = name_marker.name if name_marker is not None else py_name
-    if not isinstance(h5_name, str) or not h5_name:
-        raise _schema_error(owner, py_name, "Name requires a non-empty string")
-    if attr_marker is not None and attr_marker.converter is not None:
-        if not callable(attr_marker.converter):
-            raise _schema_error(owner, py_name, "Attr.converter must be callable")
-    if attr_marker is not None and attr_marker.serializer is not None:
-        if not callable(attr_marker.serializer):
-            raise _schema_error(owner, py_name, "Attr.serializer must be callable")
-    if attr_marker is not None and eager_marker is not None:
-        raise _schema_error(owner, py_name, "Attr and Eager cannot be combined")
-    if payload_marker is not None and attr_marker is not None:
-        raise _schema_error(owner, py_name, "Attr and Payload cannot be combined")
-
-    # A jaxtyping array is rewritten to its backing class (np.ndarray or LazyArray) so the
-    # branches below classify it as they would the unannotated type; only `array` differs.
-    core, array_spec = _unwrap_jaxtyping(owner, py_name, core)
-    if array_spec is not None and attr_marker is not None:
-        raise _schema_error(owner, py_name, "Attr cannot annotate a jaxtyping array field")
-
-    is_record = isinstance(core, type) and "__h5t_record__" in core.__dict__
-    is_lazy_array = isinstance(core, type) and issubclass(core, LazyArray)
-
-    if payload_marker is not None and is_lazy_array:
-        raise _schema_error(owner, py_name, "Payload cannot annotate a LazyArray field")
-
-    foreign: ForeignSpec | None = None
-    item: FieldSpec | None = None
-    glob: re.Pattern[str] | None = None
-    if attr_marker is not None:
-        if is_record or is_lazy_array:
-            raise _schema_error(owner, py_name, "Attr cannot annotate a record or LazyArray field")
-        kind = MemberKind.ATTRIBUTE
-        member_type = None
-    elif payload_marker is not None:
-        if not isinstance(core, type):
-            raise _schema_error(owner, py_name, "Payload requires a class annotation")
-        kind = MemberKind.DATASET
-        member_type = core
-        foreign = _foreign_spec(
-            core,
-            owner,
-            py_name,
-            kind=RecordKind.DATASET,
-            data=payload_marker.data,
-            attrs=payload_marker.attrs,
-            extras_raw=payload_marker.extras,
-        )
-        _reject_eager_on_eager_payload(owner, py_name, eager_marker, foreign)
-    elif is_record:
-        # An owner field naming a class decorated with @h5t.dataset or @h5t.group, with
-        # no explicit Payload(...) override at this use site.
-        member_type = core
-        if _record_kind(core) is RecordKind.GROUP:
-            kind = MemberKind.GROUP
-            # foreign stays None, resolved at load time by _load_group_values's GROUP
-            # branch instead. Resolving it here would recurse forever on a
-            # self-referential record (`child: Node | None`); real data bounds it.
-        else:
-            kind = MemberKind.DATASET
-            # Attributes-only, so this can never be pending and never cyclic.
-            foreign = _ensure_record_compiled(core)
-            _reject_eager_on_eager_payload(owner, py_name, eager_marker, foreign)
-    elif is_lazy_array:
-        # A child dataset read through LazyArray directly, with no attributes declared
-        # and no record type to construct. `member_type` keeps the exact class so a
-        # user's LazyArray subclass survives, exactly as ForeignSpec.lazy_type does.
-        kind = MemberKind.DATASET
-        member_type = core
+def _check_member(owner: type, name: str, annotation: Any, seen: set[type]) -> None:
+    core = _member_annotation(owner, name, annotation)
+    if isinstance(core, type) and issubclass(core, Group):
+        _check_group(core, seen)
+    elif isinstance(core, type) and issubclass(core, Dataset):
+        if core._h5t_attrs_type is not None:
+            _check_attrs(core._h5t_attrs_type)
     elif _is_ndarray_annotation(core):
-        # Accept npt.NDArray[...] aliases. The dtype parameter is not validated
-        # (the adapter degrades to an isinstance check), so normalize to the
-        # plain type to keep declaration equivalence dtype-agnostic.
-        kind = MemberKind.ARRAY
-        member_type = None
-        core = np.ndarray
-    elif _is_scalar_annotation(core):
-        kind = MemberKind.ATTRIBUTE
-        member_type = None
+        pass
     elif _is_mapping_annotation(core):
-        # No Attr marker (that branch ran first): a collection, i.e. one child group
-        # whose children become the items of a dict.
-        kind = MemberKind.COLLECTION
-        member_type = None
-        item = _collection_item(owner, py_name, core)
-        glob = _compile_glob(owner, py_name, glob_marker) if glob_marker is not None else None
+        _check_member(owner, name, _collection_item(owner, name, core), seen)
     else:
         raise _schema_error(
             owner,
-            py_name,
-            f"unsupported annotation {core!r}; containers require Attr()",
+            name,
+            f"unsupported child field annotation {core!r}; group fields must be "
+            "Group, Dataset, np.ndarray, or dict[str, T] (declare HDF5 attributes on Group[Attrs])",
         )
 
-    if glob_marker is not None and kind is not MemberKind.COLLECTION:
-        raise _schema_error(owner, py_name, "Glob applies only to dict[str, T] collection fields")
 
-    if eager_marker is not None and kind is not MemberKind.DATASET:
-        raise _schema_error(owner, py_name, "Eager applies only to dataset fields")
-    if dataset_owner and kind is not MemberKind.ATTRIBUTE:
-        raise _schema_error(owner, py_name, "a dataset record may declare only attributes")
-    if kind is not MemberKind.ATTRIBUTE and "/" in h5_name:
-        raise _schema_error(owner, py_name, "a child Name cannot contain '/'")
+def _field_glob(owner: type, name: str, field: FieldInfo) -> re.Pattern[str] | None:
+    core, metadata, _ = _split_annotation(owner, name, field.annotation)
+    marker = _marker([*metadata, *field.metadata], Glob, owner, name)
+    if marker is None:
+        return None
+    if not _is_mapping_annotation(core):
+        raise _schema_error(owner, name, "Glob applies only to dict[str, T] collection fields")
+    return _check_glob(owner, name, marker)
 
-    if kind is MemberKind.COLLECTION:
-        # The adapter only checks a default; each item is validated by its own adapter.
-        adapter_ann = dict
-        adapter = _build_record_adapter(owner, py_name, dict, optional)
-    elif foreign is not None or is_record or is_lazy_array:
-        # Validate only the constructed/default value's runtime type. A normal
-        # configured TypeAdapter is rejected for dataclasses/BaseModels/TypedDicts,
-        # while an unconfigured full adapter would revalidate the record's fields.
-        # `is_record` also covers GROUP-kind records resolved lazily at load time.
-        # `is_lazy_array` covers a bare LazyArray (or subclass) member: a user's
-        # `@dataclass(init=False)` subclass of LazyArray is itself a dataclass, so
-        # `_build_adapter`'s config= path would SchemaError at decorate time.
-        adapter_ann = core
-        adapter = _build_record_adapter(owner, py_name, core, optional)
-    else:
-        adapter_ann = _adapter_annotation(core, metadata, optional)
-        adapter = _build_adapter(owner, py_name, adapter_ann)
 
-    return FieldSpec(
-        py_name=py_name,
-        h5_name=h5_name,
-        kind=kind,
-        annotation=adapter_ann,
-        adapter=adapter,
-        optional=optional,
-        default=default,
-        converter=attr_marker.converter if attr_marker is not None else None,
-        serializer=attr_marker.serializer if attr_marker is not None else None,
-        eager=eager_marker is not None,
-        member_type=member_type,
-        foreign=foreign,
-        default_factory=default_factory,
-        array=array_spec,
-        item=item,
-        glob=glob,
+def _resolve_group_attrs_type(group_cls: type[Group[Any]]) -> type[BaseModel] | None:
+    """Determine the attributes model for ``group_cls`` from its resolved ``attrs`` field."""
+    attrs_ann: Any = group_cls.model_fields["attrs"].annotation
+    if attrs_ann is None or attrs_ann is Any or isinstance(attrs_ann, TypeVar):
+        return None
+    if _is_mapping_type(attrs_ann):
+        return None
+    if isinstance(attrs_ann, type) and issubclass(attrs_ann, BaseModel):
+        if issubclass(attrs_ann, Group):
+            raise _schema_error(
+                group_cls, "attrs", "Group[...] type argument cannot be a Group subclass"
+            )
+        return attrs_ann
+    raise _schema_error(
+        group_cls,
+        "attrs",
+        f"attrs must be a BaseModel subclass or Mapping[str, Any], got {attrs_ann!r}",
     )
 
 
-_ForeignCacheKey = tuple[RecordKind, str | None, str | None, Extras]
-_FOREIGN_CACHE: weakref.WeakKeyDictionary[
-    type, weakref.WeakValueDictionary[_ForeignCacheKey, ForeignSpec]
-] = weakref.WeakKeyDictionary()
-
-
-@dataclasses.dataclass(frozen=True)
-class _PendingRecord:
-    """A ``@h5t.group`` record whose annotations could not resolve yet.
-
-    Only a ``GROUP``-kind record can end up here: a ``DATASET``-kind record may declare
-    only attributes, so it can never forward-reference another schema type and always
-    resolves eagerly (see ``_foreign_spec``). ``kind`` is duplicated from the eventual
-    ``ForeignSpec`` deliberately -- it lets ``_record_kind`` answer GROUP-vs-DATASET
-    without compiling anything, which is what keeps a self-referential group record
-    (``child: Node | None``) from recursing at compile time.
-    """
-
-    kind: RecordKind
-    data: str | None
-    attrs: str | None
-    extras_raw: str
-    py_name: str
-    localns: Mapping[str, Any] | None
-
-
-def _record_kind(cls: type) -> RecordKind:
-    """Return the kind of a decorated record, compiled or still pending."""
-    return cls.__dict__["__h5t_record__"].kind
-
-
-def _ensure_record_compiled(cls: type) -> ForeignSpec:
-    """Return ``cls``'s ``ForeignSpec``, retrying a pending one with its ``localns``.
-
-    Caches the result back onto ``cls.__h5t_record__``. A renewed ``_UnresolvedAnnotation``
-    propagates uncaught, so a ``GROUP``-kind owner record's own ``_ensure_record_compiled``
-    retry defers too.
-    """
-    marker = cls.__dict__["__h5t_record__"]
-    if isinstance(marker, ForeignSpec):
-        return marker
-    pending = typing.cast(_PendingRecord, marker)
-    foreign = _foreign_spec(
-        cls,
-        cls,
-        pending.py_name,
-        kind=pending.kind,
-        data=pending.data,
-        attrs=pending.attrs,
-        extras_raw=pending.extras_raw,
-        localns=pending.localns,
-    )
-    setattr(cls, "__h5t_record__", foreign)  # noqa: B010 -- cls is an arbitrary user class
-    return foreign
-
-
-def _unresolved_schema_error(exc: _UnresolvedAnnotation) -> SchemaError:
-    return SchemaError(f"{exc.owner.__name__}: could not resolve annotations: {exc}")
-
-
-def _compiled_record(cls: type) -> ForeignSpec:
-    """Return ``cls``'s compiled record spec, or ``SchemaError`` if still unresolved.
-
-    ``_ensure_record_compiled`` lets ``_UnresolvedAnnotation`` propagate so a compile-time
-    owner can still defer. Load-time callers are past that point: a renewed failure is a
-    ``SchemaError``.
-    """
-    try:
-        return _ensure_record_compiled(cls)
-    except _UnresolvedAnnotation as exc:
-        raise _unresolved_schema_error(exc) from exc
-
-
-def _compile_foreign_fields(
-    record_type: type,
-    owner: type,
-    py_name: str,
-    *,
-    kind: RecordKind,
-    data: str | None,
-    attrs: str | None,
-    extras: Extras,
-    localns: Mapping[str, Any] | None,
-) -> ForeignSpec:
-    """Compile ``record_type``'s own fields (and payload, for a ``DATASET`` record).
-
-    Left for ``_foreign_spec`` to catch: an ``_UnresolvedAnnotation`` raised while
-    resolving a base's annotations. Nothing here converts it, so the policy of
-    "eager SchemaError for DATASET, defer for GROUP" lives in exactly one place.
-    """
-    is_dataclass_type = dataclasses.is_dataclass(record_type)
-    dc_fields = {f.name: f for f in dataclasses.fields(record_type)} if is_dataclass_type else {}
-
-    annotations: dict[str, Any] = {}
-    annotation_owners: dict[str, type] = {}
-    for base in reversed(record_type.__mro__):
-        if base is object:
+def _check_group(group_cls: type[Group[Any]], seen: set[type] | None = None) -> None:
+    """Check reachable declarations using only Pydantic's current model metadata."""
+    if seen is None:
+        seen = set()
+    if group_cls in seen:
+        return
+    seen.add(group_cls)
+    if not group_cls.__pydantic_complete__:
+        group_cls.model_rebuild()
+    _extract_forbid_extras(group_cls)
+    attrs_type = _resolve_group_attrs_type(group_cls)
+    if attrs_type is not None:
+        _check_attrs(attrs_type)
+    names: dict[str, str] = {}
+    for name, field in group_cls.model_fields.items():
+        if name == "attrs":
             continue
-        base_annotations = _resolved_annotations(base, localns)
-        for field_name, field_annotation in base_annotations.items():
-            if field_name.startswith("_") or typing.get_origin(field_annotation) is ClassVar:
-                continue
-            if is_dataclass_type:
-                dc_field = dc_fields.get(field_name)
-                if dc_field is not None and not dc_field.init:
-                    continue  # derived; cannot be passed to the constructor
-            annotations[field_name] = field_annotation
-            annotation_owners[field_name] = base
-
-    try:
-        signature = inspect.signature(record_type)
-    except (TypeError, ValueError):
-        signature = None
-    except Exception as exc:
-        raise _schema_error(owner, py_name, f"cannot inspect constructor: {exc}") from exc
-
-    lazy_type: type[LazyArray] | None = None
-    payload_array: ArraySpec | None = None
-    if kind is RecordKind.DATASET:
-        assert data is not None
-        if data not in annotations:
-            raise _schema_error(
-                owner, py_name, f"Payload data {data!r} is not a field of {record_type.__name__}"
-            )
-        payload_annotation = annotations.pop(data)
-        payload_core, _, _ = _split_annotation(record_type, data, payload_annotation)
-        payload_core, payload_array = _unwrap_jaxtyping(record_type, data, payload_core)
-        if _is_ndarray_annotation(payload_core):
-            lazy_type = None
-        elif isinstance(payload_core, type) and issubclass(payload_core, LazyArray):
-            lazy_type = payload_core
-        else:
-            raise _schema_error(
-                owner, py_name, f"Payload field {data!r} must be annotated np.ndarray or LazyArray"
-            )
-
-    if attrs is not None:
-        if attrs not in annotations:
-            raise _schema_error(
-                owner, py_name, f"Payload attrs {attrs!r} is not a field of {record_type.__name__}"
-            )
-        attrs_annotation = annotations.pop(attrs)
-        attrs_core, _, _ = _split_annotation(record_type, attrs, attrs_annotation)
-        if not _is_mapping_annotation(attrs_core):
-            raise _schema_error(
-                owner, py_name, f"Payload attrs field {attrs!r} must be annotated Mapping"
-            )
-
-    fields: dict[str, FieldSpec] = {}
-    for field_name, field_annotation in annotations.items():
-        default: Any = _NO_DEFAULT
-        default_factory: Callable[[], Any] | None = None
-        dc_field = dc_fields.get(field_name) if is_dataclass_type else None
-        if dc_field is not None:
-            if dc_field.default is not dataclasses.MISSING:
-                default = dc_field.default
-            elif dc_field.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
-                default_factory = dc_field.default_factory
-        else:
-            declaring_type = annotation_owners[field_name]
-            default = declaring_type.__dict__.get(field_name, _NO_DEFAULT)
-            if default is _NO_DEFAULT and signature is not None:
-                parameter = signature.parameters.get(field_name)
-                if parameter is not None and parameter.default is not inspect.Parameter.empty:
-                    default = parameter.default
-        fields[field_name] = _field_spec(
-            record_type,
-            field_name,
-            field_annotation,
-            default,
-            dataset_owner=(kind is RecordKind.DATASET),
-            default_factory=default_factory,
-        )
-
-    _check_duplicate_names(record_type.__name__, fields)
-    return ForeignSpec(
-        record_type=record_type,
-        spec=ClassSpec(tuple(fields.values()), extras),
-        kind=kind,
-        data=data if kind is RecordKind.DATASET else None,
-        attrs=attrs,
-        lazy_type=lazy_type,
-        signature=signature,
-        payload_array=payload_array,
-    )
-
-
-def _foreign_spec(
-    record_type: type,
-    owner: type,
-    py_name: str,
-    *,
-    kind: RecordKind,
-    data: str | None,
-    attrs: str | None,
-    extras_raw: str,
-    localns: Mapping[str, Any] | None = None,
-) -> ForeignSpec:
-    """Compile a plain ``record_type`` into a ``Payload``/``group`` record's fields.
-
-    Cached per ``(kind, data, attrs, extras)``, since the same foreign class may be
-    reused as a target from more than one field or schema. An
-    ``Annotated[T, Payload(...)]`` use site resolves ``record_type``'s annotations
-    against its module globals only (``localns=None``): there is no defining frame to
-    read at a distant use site, so an unresolved annotation is always a ``SchemaError``.
-    The ``@h5t.dataset``/``@h5t.group`` decorators read their caller's locals once, for
-    this immediate compile, and pass them as ``localns``; a deferred ``@h5t.group``
-    retries with only the ``localns=`` the user gave it.
-
-    A ``DATASET``-kind record's own fields can only be attributes, so it can never
-    forward-reference another schema type: compiling it here regardless of deferral is
-    safe, and an unresolved name is always a genuine ``SchemaError``. A ``GROUP``-kind
-    record has no such restriction, so an ``_UnresolvedAnnotation`` there must propagate
-    uncaught instead -- the caller (the ``group()`` decorator, or a retry from
-    ``_ensure_record_compiled``) is the one that knows how to defer.
-    """
-    try:
-        extras = Extras(extras_raw)
-    except ValueError:
-        raise _schema_error(
-            owner, py_name, f"extras must be 'ignore' or 'forbid', got {extras_raw!r}"
-        ) from None
-
-    cache = _FOREIGN_CACHE.get(record_type)
-    if cache is None:
-        cache = weakref.WeakValueDictionary()
-        _FOREIGN_CACHE[record_type] = cache
-    cache_key: _ForeignCacheKey = (kind, data, attrs, extras)
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    try:
-        foreign = _compile_foreign_fields(
-            record_type,
-            owner,
-            py_name,
-            kind=kind,
-            data=data,
-            attrs=attrs,
-            extras=extras,
-            localns=localns,
-        )
-    except _UnresolvedAnnotation as exc:
-        if kind is RecordKind.GROUP:
-            raise
-        raise _schema_error(
-            owner, py_name, f"{record_type.__name__} has unresolved annotations: {exc}"
-        ) from exc
-
-    cache[cache_key] = foreign
-    return foreign
-
-
-_C = typing.TypeVar("_C", bound=type)
-
-
-def _transient_locals(localns: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Read the decorator caller's locals once, for the immediate compile only.
-
-    ``sys._getframe(2)`` is the frame that applied the decorator (this helper is called
-    from ``decorator``, which the ``class`` statement's caller invoked). The copy is
-    never stored, so nothing it names outlives the compile; an explicit ``localns``
-    wins over it.
-    """
-    namespace = dict(sys._getframe(2).f_locals)
-    if localns:
-        namespace.update(localns)
-    return namespace
-
-
-def dataset(
-    data: str,
-    attrs: str | None = None,
-    extras: Literal["ignore", "forbid"] = "ignore",
-    localns: Mapping[str, Any] | None = None,
-) -> Callable[[_C], _C]:
-    """Mark a plain class as an h5t dataset record.
-
-    A dataset record has one field that holds the data; every other field is read from
-    the dataset's attributes. The class is checked immediately, so a mistake raises
-    `SchemaError` right at the decorator.
-
-    Parameters
-    ----------
-    data : str
-        The field that receives the data: ``np.ndarray`` (read now) or `LazyArray`
-        (read later).
-    attrs : str, optional
-        A ``Mapping``-annotated field that receives all of the dataset's attributes.
-    extras : {"ignore", "forbid"}
-        Whether to ignore (default) or reject attributes the class doesn't declare.
-    localns : mapping, optional
-        Extra names that annotations may refer to, for names the decorating code can't
-        see. See :doc:`/user_guide/compilation`.
-
-    Returns
-    -------
-    callable
-        A class decorator returning the class itself.
-
-    Raises
-    ------
-    SchemaError
-        The declaration is incoherent or unsupported.
-
-    Examples
-    --------
-    >>> import dataclasses, h5t
-    >>> @h5t.dataset(data="values")
-    ... @dataclasses.dataclass
-    ... class Measurement:
-    ...     unit: str
-    ...     values: h5t.LazyArray
-    """
-    # Typed Callable[[_C], _C] (not Callable[[type], type]) so a decorated class keeps its
-    # precise type for static checkers, e.g. through h5t.load's TypeVar return.
-
-    def decorator(cls: _C) -> _C:
-        foreign = _foreign_spec(
-            cls,
-            cls,
-            data,
-            kind=RecordKind.DATASET,
-            data=data,
-            attrs=attrs,
-            extras_raw=extras,
-            localns=_transient_locals(localns),
-        )
-        setattr(cls, "__h5t_record__", foreign)  # noqa: B010 -- cls is an arbitrary user class
-        return cls
-
-    return decorator
-
-
-def group(
-    attrs: str | None = None,
-    extras: Literal["ignore", "forbid"] = "ignore",
-    localns: Mapping[str, Any] | None = None,
-) -> Callable[[_C], _C]:
-    """Mark a plain class as an h5t group record, loadable via `load`.
-
-    A group record can have attributes, arrays, datasets and nested groups, and may refer
-    to classes defined later or to itself (``child: Node | None``); in that case it is
-    checked the first time it is used. See :doc:`/user_guide/compilation`.
-
-    Parameters
-    ----------
-    attrs : str, optional
-        A ``Mapping``-annotated field that receives all of the group's attributes.
-    extras : {"ignore", "forbid"}
-        Whether to ignore (default) or reject children and attributes the class doesn't
-        declare.
-    localns : mapping, optional
-        Extra names that annotations may refer to. Needed only for a class defined inside
-        a function that refers to a later local class, e.g. ``localns={"Child": Child}``.
-
-    Returns
-    -------
-    callable
-        A class decorator returning the class itself.
-
-    Raises
-    ------
-    SchemaError
-        The declaration is incoherent or unsupported.
-
-    Examples
-    --------
-    >>> import dataclasses, h5t
-    >>> @h5t.group(extras="forbid")
-    ... @dataclasses.dataclass
-    ... class Result:
-    ...     version: int
-    ...     note: str | None = None
-    """
-    # The deferred retry is done by _ensure_record_compiled the first time the record is
-    # used as a field or loaded.
-
-    def decorator(cls: _C) -> _C:
-        # Plant the pending marker first: the class's own name is seeded into the
-        # annotation namespace, so a self-reference resolves to `cls` immediately and
-        # `_field_spec` must already see it as a GROUP-kind record.
-        pending = _PendingRecord(
-            kind=RecordKind.GROUP,
-            data=None,
-            attrs=attrs,
-            extras_raw=extras,
-            py_name=cls.__name__,
-            localns=localns,
-        )
-        setattr(cls, "__h5t_record__", pending)  # noqa: B010
-        try:
-            foreign = _foreign_spec(
-                cls,
-                cls,
-                cls.__name__,
-                kind=RecordKind.GROUP,
-                data=None,
-                attrs=attrs,
-                extras_raw=extras,
-                localns=_transient_locals(localns),
-            )
-        except _UnresolvedAnnotation:
-            return cls
-        except BaseException:
-            delattr(cls, "__h5t_record__")
-            raise
-        setattr(cls, "__h5t_record__", foreign)  # noqa: B010
-        return cls
-
-    return decorator
-
-
-def _annotation_failure(cls: type, exc: Exception) -> Exception:
-    """Classify a failure to resolve ``cls``'s annotations."""
-    if isinstance(exc, NameError) and _raised_by_annotation(exc, cls):
-        return _UnresolvedAnnotation(cls, exc.name, str(exc))
-    return SchemaError(f"{cls.__name__}: could not resolve annotations: {exc}")
-
-
-def _resolved_annotations(cls: type, localns: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Return ``cls``'s own annotations with strings and lazy values evaluated.
-
-    Names resolve against the defining module, then ``localns`` (always seeded with the
-    class's own name, so a function-local record can reference itself).
-    """
-    namespace: dict[str, Any] = {cls.__name__: cls}
-    if localns:
-        namespace.update(localns)
-    try:
-        if sys.version_info >= (3, 14):
-            # Deferred: annotationlib exists only on 3.14+. Format.VALUE, not STRING or
-            # FORWARDREF, which would run a user's annotation helper under a swallowing
-            # try/except and hide its bug.
-            import annotationlib
-
-            raw = annotationlib.get_annotations(cls, format=annotationlib.Format.VALUE)
-            module = sys.modules.get(cls.__module__)
-            globalns = vars(module) if module is not None else {}
-            return {
-                name: eval(compile(value, _ANNOTATION_FILE, "eval"), globalns, namespace)
-                if isinstance(value, str)
-                else value
-                for name, value in raw.items()
-            }
-        own = inspect.get_annotations(cls)
-        hints = typing.get_type_hints(cls, localns=namespace, include_extras=True)
-        return {name: hints[name] for name in own}
-    except Exception as exc:
-        raise _annotation_failure(cls, exc) from exc
-
-
-def _check_duplicate_names(label: str, fields: Mapping[str, FieldSpec]) -> None:
-    attr_names: dict[str, str] = {}
-    child_names: dict[str, str] = {}
-    for py_name, field in fields.items():
-        namespace = attr_names if field.kind is MemberKind.ATTRIBUTE else child_names
-        if field.h5_name in namespace:
+        h5_name = _extract_alias(group_cls, name, field)
+        if "/" in h5_name:
+            raise _schema_error(group_cls, name, "a child alias cannot contain '/'")
+        if h5_name in names:
             raise SchemaError(
-                f"{label}: duplicate HDF5 name {field.h5_name!r} for fields "
-                f"{namespace[field.h5_name]!r} and {py_name!r}"
+                f"{group_cls.__name__}: duplicate HDF5 name {h5_name!r} for fields "
+                f"{names[h5_name]!r} and {name!r}"
             )
-        namespace[field.h5_name] = py_name
+        names[h5_name] = name
+        _field_glob(group_cls, name, field)
+        _check_member(group_cls, name, field.annotation, seen)
 
 
-def _short_pydantic_error(exc: PydanticValidationError) -> str:
+def _rewrite_annotation(tp: Any) -> Any:
+    """Attach `_NdarraySchema` or `_JaxtypingSchema` to array leaves in ``tp``."""
+    origin = typing.get_origin(tp)
+    args = typing.get_args(tp)
+    if origin is Annotated:
+        head, *meta = args
+        if any(isinstance(m, (_NdarraySchema, _JaxtypingSchema)) for m in meta):
+            return tp
+        new_head = _rewrite_annotation(head)
+        return Annotated[(new_head, *meta)] if new_head is not head else tp
+    if isinstance(tp, type) and issubclass(tp, AbstractArray):
+        if (
+            isinstance(tp.array_type, type)
+            and issubclass(tp.array_type, Dataset)
+            and tp.array_type._h5t_attrs_type is not None
+        ):
+            _prepare_attrs_model(tp.array_type._h5t_attrs_type)
+        return Annotated[tp, _JaxtypingSchema(tp)]
+    if isinstance(tp, type) and issubclass(tp, Dataset) and tp._h5t_attrs_type is not None:
+        _prepare_attrs_model(tp._h5t_attrs_type)
+        return tp
+    if _is_ndarray_annotation(tp):
+        return Annotated[tp, _NdarraySchema()]
+    if isinstance(tp, _TYPE_ALIAS_TYPES):
+        inner = _rewrite_annotation(tp.__value__)
+        return inner if inner is not tp.__value__ else tp
+    if not args or origin is None:
+        return tp
+    new_args = tuple(_rewrite_annotation(a) for a in args)
+    if all(a is b for a, b in zip(args, new_args, strict=True)):
+        return tp
+    if origin in (typing.Union, types.UnionType):
+        return functools.reduce(operator.or_, new_args)
+    return origin[new_args[0] if len(new_args) == 1 else new_args]
+
+
+def _rewrite_field(field: FieldInfo) -> bool:
+    if any(isinstance(m, (_NdarraySchema, _JaxtypingSchema)) for m in field.metadata):
+        return False
+    new_ann = _rewrite_annotation(field.annotation)
+    if new_ann is not field.annotation:
+        field.annotation = new_ann
+        return True
+    return False
+
+
+def _prepare_attrs_model(model_type: type[BaseModel]) -> bool:
+    if not model_type.__pydantic_complete__:
+        return False
+    changed = False
+    for field in model_type.model_fields.values():
+        if _rewrite_field(field):
+            changed = True
+    if changed:
+        model_type.model_rebuild(force=True, _types_namespace={model_type.__name__: model_type})
+    return changed
+
+
+def _prepare_group_fields(group_cls: type[Group[Any]]) -> None:
+    attrs_ann: Any = group_cls.model_fields["attrs"].annotation
+    if (
+        isinstance(attrs_ann, type)
+        and issubclass(attrs_ann, BaseModel)
+        and not issubclass(attrs_ann, Group)
+    ):
+        _prepare_attrs_model(attrs_ann)
+    for name, field in group_cls.model_fields.items():
+        if name != "attrs":
+            _rewrite_field(field)
+
+
+def _first_error_parts(exc: PydanticValidationError) -> tuple[tuple[Any, ...], str]:
+    """Return the first error's ``(loc, message)`` pair."""
     errors = exc.errors(include_url=False, include_context=False, include_input=False)
     if not errors:
-        return str(exc).splitlines()[0]
+        return (), str(exc).splitlines()[0]
     first = errors[0]
-    location = ".".join(str(part) for part in first.get("loc", ()))
-    message = str(first.get("msg", "invalid value"))
-    return f"{location}: {message}" if location else message
+    return tuple(first.get("loc", ())), str(first.get("msg", "invalid value"))
 
 
-def _validate_value(field: FieldSpec, value: Any, path: str) -> Any:
-    try:
-        return field.adapter.validate_python(value)
-    except PydanticValidationError as exc:
-        raise ValidationError(path, _short_pydantic_error(exc)) from exc
-
-
-def _missing_value(field: FieldSpec, path: str) -> Any:
-    if field.has_default:
-        return _validate_value(field, field.default, path)
-    if field.default_factory is not None:
-        return _validate_value(field, field.default_factory(), path)
-    if field.optional:
-        return None
-    kind = field.kind.value
-    raise ValidationError(path, f"required {kind} {field.h5_name!r} is missing")
-
-
-def _raw_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
-    return {str(name): node.attrs[name] for name in node.attrs}
-
-
-def _check_group_extras(spec: ClassSpec, group: h5py.Group, path: str) -> None:
-    if spec.extras is Extras.IGNORE:
-        return
-    attrs = {field.h5_name for field in spec.fields if field.kind is MemberKind.ATTRIBUTE}
-    children = {field.h5_name for field in spec.fields if field.kind is not MemberKind.ATTRIBUTE}
-    for name in group.attrs:
-        rendered = str(name)
-        if rendered not in attrs:
-            raise ValidationError(attr_path(path, rendered), "unexpected attribute")
-    for name in group.keys():
-        rendered = str(name)
-        if rendered not in children:
-            raise ValidationError(child_path(path, rendered), "unexpected child node")
-
-
-def _check_dataset_extras(spec: ClassSpec, dataset: h5py.Dataset, path: str) -> None:
-    if spec.extras is Extras.IGNORE:
-        return
-    attrs = {field.h5_name for field in spec.fields}
-    for name in dataset.attrs:
-        rendered = str(name)
-        if rendered not in attrs:
-            raise ValidationError(attr_path(path, rendered), "unexpected attribute")
-
-
-def _load_attribute(
-    field: FieldSpec,
-    raw: Mapping[str, Any],
-    attrs: dict[str, Any],
-    parent_path: str,
-) -> Any:
-    path = attr_path(parent_path, field.h5_name)
-    if field.h5_name not in raw:
-        value = _missing_value(field, path)
-    else:
-        value = raw[field.h5_name]
-        if field.converter is not None:
-            try:
-                value = field.converter(value)
-            except Exception as exc:
-                raise ConversionError(path, f"attribute converter failed: {exc}") from exc
-        value = _validate_value(field, value, path)
-    attrs[field.h5_name] = value
-    return value
-
-
-def _construct_record(foreign: ForeignSpec, values: dict[str, Any], path: str) -> Any:
-    """Build ``foreign.record_type(**values)``, mapping constructor failures to h5t errors.
-
-    Argument-binding failures are schema/record mismatches and become ``SchemaError``.
-    Failures raised after entering user code are data problems at this node's path and
-    become ``ValidationError``.
-    """
-    if foreign.signature is not None:
-        try:
-            foreign.signature.bind(**values)
-        except TypeError as exc:
-            raise SchemaError(
-                f"{foreign.record_type.__name__}: cannot construct from loaded fields: {exc}"
-            ) from exc
-    try:
-        return foreign.record_type(**values)
-    except (ValidationError, SchemaError):
-        raise
-    except TypeError as exc:
-        # Without an inspectable signature, a Python binding error has no constructor
-        # frame. If user code was entered, the traceback continues beyond this frame.
-        if foreign.signature is None and exc.__traceback__ is not None:
-            if exc.__traceback__.tb_next is None:
-                raise SchemaError(
-                    f"{foreign.record_type.__name__}: cannot construct from loaded fields: {exc}"
-                ) from exc
-        raise ValidationError(
-            path, f"{foreign.record_type.__name__} constructor failed: {exc}"
-        ) from exc
-    except Exception as exc:
-        raise ValidationError(
-            path, f"{foreign.record_type.__name__} constructor failed: {exc}"
-        ) from exc
-
-
-def _load_foreign_dataset(
-    foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str, *, eager: bool = False
-) -> Any:
-    """Load ``node`` into an instance of ``foreign.record_type`` via its constructor."""
-    # A dataset record is its own binding scope: named dims bind from its payload only.
-    with jaxtyped("context"):
-        return _load_foreign_dataset_in_scope(foreign, node, filename, path, eager=eager)
-
-
-def _load_foreign_dataset_in_scope(
-    foreign: ForeignSpec, node: h5py.Dataset, filename: str, path: str, *, eager: bool
-) -> Any:
-    spec = foreign.spec
-    _check_dataset_extras(spec, node, path)
-    raw = _raw_attrs(node)
-    attrs = dict(raw)
-    values: dict[str, Any] = {}
-    for field in spec.fields:
-        values[field.py_name] = _load_attribute(field, raw, attrs, path)
-
-    assert foreign.data is not None
-    if foreign.lazy_type is not None:
-        values[foreign.data] = _lazy_from_node(
-            foreign.lazy_type,
-            filename,
-            path,
-            node,
-            eager=eager,
-            array=foreign.payload_array,
+def _h5_error_path(model: type[Group[Any]], root: str, loc: tuple[Any, ...]) -> tuple[str, str]:
+    """Translate error locations by traversing model fields and their annotations."""
+    path = root
+    current: type[Group[Any]] | None = model
+    i = 0
+    while i < len(loc) and current is not None:
+        part = loc[i]
+        if part == ATTRS_KEY:
+            if i + 1 < len(loc):
+                return attr_path(path, str(loc[i + 1])), _dotted(loc[i + 2 :])
+            return path, ""
+        owner = current
+        entry = next(
+            (
+                (name, field)
+                for name, field in owner.model_fields.items()
+                if name != "attrs" and (field.alias or name) == part
+            ),
+            None,
         )
-    else:
-        if foreign.payload_array is not None:
-            _check_array(foreign.payload_array, _ghost(node), path)
-        values[foreign.data] = np.asarray(node[()])
-    if foreign.attrs is not None:
-        values[foreign.attrs] = MappingProxyType(attrs)
-
-    return _construct_record(foreign, values, path)
-
-
-def _load_member(field: FieldSpec, node: Any, filename: str, path: str) -> Any:
-    """Load one non-attribute, non-collection member from ``node`` and validate it."""
-    if field.kind is MemberKind.GROUP:
-        if not isinstance(node, h5py.Group):
-            raise ValidationError(path, "expected a group, found a dataset")
-        assert field.member_type is not None
-        # A GROUP-kind record's ForeignSpec is deliberately not resolved at compile
-        # time (see _field_spec), so this is where a pending one is retried.
-        # `_compiled_record` turns a still-unresolved name into SchemaError.
-        value = _load_foreign_group(_compiled_record(field.member_type), node, filename, path)
-    elif field.kind is MemberKind.DATASET:
-        if not isinstance(node, h5py.Dataset):
-            raise ValidationError(path, "expected a dataset, found a group")
-        if field.foreign is not None:
-            value = _load_foreign_dataset(field.foreign, node, filename, path, eager=field.eager)
-        else:
-            # A bare LazyArray member: no record type, no declared attributes.
-            assert field.member_type is not None
-            value = _lazy_from_node(
-                typing.cast(type[LazyArray], field.member_type),
-                filename,
-                path,
-                node,
-                eager=field.eager,
-                array=field.array,
-            )
-    else:
-        if not isinstance(node, h5py.Dataset):
-            raise ValidationError(path, "expected a dataset, found a group")
-        if field.array is not None:
-            _check_array(field.array, _ghost(node), path)
-        value = np.asarray(node[()])
-    return _validate_value(field, value, path)
+        path = child_path(path, str(part))
+        i += 1
+        current = None
+        if entry is None:
+            break
+        name, field = entry
+        core = _member_annotation(owner, name, field.annotation)
+        if _is_mapping_annotation(core) and i < len(loc):
+            path = child_path(path, str(loc[i]))
+            i += 1
+            core = _member_annotation(owner, name, _collection_item(owner, name, core))
+        if isinstance(core, type) and issubclass(core, Group):
+            current = core
+        elif (
+            isinstance(core, type)
+            and issubclass(core, Dataset)
+            and core._h5t_attrs_type is not None
+            and i < len(loc)
+        ):
+            return attr_path(path, str(loc[i])), _dotted(loc[i + 1 :])
+    return path, _dotted(loc[i:])
 
 
-def _load_collection(field: FieldSpec, node: Any, filename: str, path: str) -> dict[str, Any]:
-    """Load each (glob-matching) child of the collection's group as one item."""
-    if not isinstance(node, h5py.Group):
-        raise ValidationError(path, "expected a group, found a dataset")
-    assert field.item is not None
-    items: dict[str, Any] = {}
-    for name in node.keys():
-        key = str(name)
-        if field.glob is not None and field.glob.match(key) is None:
-            continue
-        items[key] = _load_member(field.item, node[name], filename, child_path(path, key))
-    return items
+def _dotted(loc: tuple[Any, ...]) -> str:
+    return ".".join(str(part) for part in loc)
 
 
-def _load_group_values(
-    spec: ClassSpec, group: h5py.Group, filename: str, path: str
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Load ``spec``'s fields from ``group``, returning ``(values, attrs snapshot)``."""
-    # Named dimensions unify across this record's own array fields only; a nested record
-    # calls back in here and so opens a scope of its own.
-    with jaxtyped("context"):
-        return _load_group_values_in_scope(spec, group, filename, path)
-
-
-def _load_group_values_in_scope(
-    spec: ClassSpec, group: h5py.Group, filename: str, path: str
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    _check_group_extras(spec, group, path)
-    raw = _raw_attrs(group)
-    attrs = dict(raw)
-    values: dict[str, Any] = {}
-
-    for field in spec.fields:
-        if field.kind is MemberKind.ATTRIBUTE:
-            values[field.py_name] = _load_attribute(field, raw, attrs, path)
-            continue
-
-        member_path = child_path(path, field.h5_name)
-        if field.h5_name not in group:
-            values[field.py_name] = _missing_value(field, member_path)
-            continue
-        node = group[field.h5_name]
-        if field.kind is MemberKind.COLLECTION:
-            values[field.py_name] = _load_collection(field, node, filename, member_path)
-        else:
-            values[field.py_name] = _load_member(field, node, filename, member_path)
-
-    return values, attrs
-
-
-def _load_foreign_group(foreign: ForeignSpec, group: h5py.Group, filename: str, path: str) -> Any:
-    """Load ``group`` into an instance of ``foreign.record_type`` via its constructor."""
-    values, attrs = _load_group_values(foreign.spec, group, filename, path)
-    if foreign.attrs is not None:
-        values[foreign.attrs] = MappingProxyType(attrs)
-    return _construct_record(foreign, values, path)
-
-
-_T = typing.TypeVar("_T")
+def _first_error(
+    exc: PydanticValidationError, model: type[Group[Any]], root: str
+) -> ValidationError:
+    """Convert the first Pydantic error into an `h5t.ValidationError` at its HDF5 path."""
+    loc, message = _first_error_parts(exc)
+    path, rest = _h5_error_path(model, root, loc)
+    return ValidationError(path, f"{rest}: {message}" if rest else message)
 
 
 def _filesystem_path(path: str | os.PathLike[str]) -> str:
@@ -1192,65 +550,184 @@ def _normalize_root(root: str) -> str:
     return normalized
 
 
-def load(schema: type[_T], path: str | os.PathLike[str], root: str = "/") -> _T:
-    """Load a group record from an HDF5 file and close the file.
+# ---------------------------------------------------------------------------
+# Group base class
+# ---------------------------------------------------------------------------
 
-    The file is closed before ``load`` returns, even on error, so the result doesn't
-    depend on it. (A `LazyArray` remembers the file name so it can read its data later.)
 
-    Parameters
+class Group(BaseModel, Generic[T]):
+    """Base class for typed, detached HDF5 group schemas.
+
+    Subclass ``h5t.Group`` (for untyped ``Mapping[str, Any]`` attributes) or
+    ``h5t.Group[AttrsModel]`` (where ``AttrsModel`` is a `pydantic.BaseModel` subclass
+    describing the group's HDF5 attributes). Every field declared on a ``Group``
+    subclass represents an immediate HDF5 child node: a nested `Group`, a `Dataset`, an
+    eager ``np.ndarray``, or a ``dict[str, ...]`` collection of children.
+
+    Attributes
     ----------
-    schema : type
-        A class decorated with ``@h5t.group``. (A ``@h5t.dataset`` class describes a
-        dataset, so it can't be loaded directly.)
-    path : str or os.PathLike
-        The HDF5 file to read.
-    root : str
-        Absolute path of the group to load.
+    attrs : T
+        The group's HDF5 attributes (`BaseModel` instance or read-only `Mapping`).
 
-    Returns
-    -------
-    object
-        An instance of ``schema``.
-
-    Raises
-    ------
-    SchemaError
-        ``schema`` is not a group record, or one of its annotations can't be resolved.
-    ValidationError
-        The file does not conform to the schema (including a missing ``root``).
-    ConversionError
-        An ``Attr(converter=...)`` raised.
-    ValueError
-        ``root`` is not an absolute path.
+    Notes
+    -----
+    ``Field(alias="...")`` on a child field or an attribute field sets its on-disk HDF5
+    name. ``extra="forbid"`` in ``model_config`` rejects undeclared child nodes (and, on
+    ``T``, undeclared attributes); only ``"ignore"`` and ``"forbid"`` are supported.
+    Annotate a ``dict[str, ...]`` field with `Glob` to restrict which child names it
+    collects.
 
     Examples
     --------
-    >>> import dataclasses, h5t
-    >>> @h5t.group()
-    ... @dataclasses.dataclass
-    ... class Result:
+    >>> import numpy as np
+    >>> from pydantic import BaseModel
+    >>> import h5t
+    >>> class RunAttrs(BaseModel):
     ...     version: int
-    >>> h5t.save(Result(version=1), "result.h5", mode="w")
-    >>> h5t.load(Result, "result.h5").version
-    1
+    >>> class Run(h5t.Group[RunAttrs]):
+    ...     values: np.ndarray
     """
-    if not (isinstance(schema, type) and "__h5t_record__" in schema.__dict__):
-        raise SchemaError(f"{schema!r} is not a decorated record (@h5t.dataset/@h5t.group)")
-    # Compile a deferred record before touching the filesystem.
-    foreign = _compiled_record(schema)
-    if foreign.kind is not RecordKind.GROUP:
-        raise SchemaError(
-            f"{schema.__name__} is a dataset record (@h5t.dataset); h5t.load needs a "
-            "@h5t.group record"
-        )
 
-    normalized_root = _normalize_root(root)
-    filename = _filesystem_path(path)
-    with h5py.File(filename, mode="r") as h5file:
-        node = h5file.get(normalized_root)
-        if node is None:
-            raise ValidationError(normalized_root, "root group does not exist")
-        if not isinstance(node, h5py.Group):
-            raise ValidationError(normalized_root, "expected a group, found a dataset")
-        return typing.cast(_T, _load_foreign_group(foreign, node, filename, normalized_root))
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        populate_by_name=True,
+        extra="ignore",
+    )
+
+    attrs: T = Field(default_factory=dict, validate_default=True, validation_alias=ATTRS_KEY)  # type: ignore[assignment]
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: Any, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        _prepare_group_fields(cls)
+        return handler(source)
+
+    @field_validator("attrs", mode="wrap", check_fields=False)
+    @classmethod
+    def _h5t_attrs_scope(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
+        # Attribute dims must not bind together with the dims of the group's children.
+        with jaxtyped("context"):
+            return handler(value)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _h5t_jaxtyping_scope(cls, values: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        is_view = isinstance(values, _GroupView)
+        untyped = is_view and _resolve_group_attrs_type(cls) is None
+        if untyped and _extract_forbid_extras(cls):
+            name = next(iter(values.node.attrs), None)
+            if name is not None:
+                path = attr_path(values.node.name, str(name))
+                raise ValidationError(path, "unexpected attribute")
+        with jaxtyped("context"):
+            model = handler(values)
+        if untyped:
+            # Untyped attributes of a loaded group are a read-only snapshot.
+            object.__setattr__(
+                model, "attrs", MappingProxyType(dict(typing.cast(Mapping[str, Any], model.attrs)))
+            )
+        return model
+
+    @classmethod
+    def model_validate_hdf5(
+        cls,
+        path: str | os.PathLike[str],
+        root: str = "/",
+    ) -> Self:
+        """Validate and load an HDF5 group into a detached instance of ``cls``.
+
+        The HDF5 file is closed before ``model_validate_hdf5`` returns, even on error.
+        Child `Dataset` fields remain lazy and remember the file path so slices or the full
+        array can be read on demand.
+
+        Parameters
+        ----------
+        path : str or os.PathLike
+            The HDF5 file to read.
+        root : str
+            Absolute path of the group to load (default ``"/"``).
+
+        Returns
+        -------
+        Self
+            A validated instance of ``cls``.
+
+        Raises
+        ------
+        SchemaError
+            An HDF5 declaration is unsupported. Pydantic model-building errors propagate unchanged.
+        ValidationError
+            The file does not conform to the schema (including a missing ``root``).
+        ValueError
+            ``root`` is not an absolute HDF5 path.
+        OSError
+            The file cannot be opened.
+        TypeError
+            ``path`` is not a string or path-like object.
+        """
+        _check_group(cls)
+        normalized_root = _normalize_root(root)
+        filename = _filesystem_path(path)
+        with h5py.File(filename, mode="r") as h5file:
+            node = h5file.get(normalized_root)
+            if node is None:
+                raise ValidationError(normalized_root, "root group does not exist")
+            if not isinstance(node, h5py.Group):
+                raise ValidationError(normalized_root, "expected a group, found a dataset")
+            try:
+                return cls.model_validate(_GroupView(node))
+            except PydanticValidationError as exc:
+                raise _first_error(exc, cls, normalized_root) from exc
+
+    def model_dump_hdf5(
+        self,
+        path: str | os.PathLike[str],
+        root: str = "/",
+        mode: Literal["w-", "x", "w", "a"] = "w-",
+        overwrite: bool = False,
+    ) -> None:
+        """Write ``self`` under ``root`` in ``path``, following its schema.
+
+        Field types, array shapes and attribute values were validated by Pydantic when
+        ``self`` was constructed and are not checked again here, so an instance built with
+        ``model_construct`` or modified afterwards is written as it is. Only what HDF5
+        itself imposes is checked: collection keys, `Glob` patterns, and attribute values
+        h5py can store. The group tree is fully planned before the file is opened, so a
+        failed check never touches the target file. If writing fails midway, any
+        created groups or files are rolled back. ``overwrite=True`` deletes the existing
+        content of ``root`` before writing, as ``del group[name]`` does in h5py; the old
+        content is not restored if the write then fails. A problem during rollback itself
+        is attached to the raised exception as a note.
+
+        Parameters
+        ----------
+        path : str or os.PathLike
+            Target HDF5 file.
+        root : str
+            Absolute group path to write under; missing intermediate groups are created.
+        mode : {"w-", "x", "w", "a"}
+            ``"w-"`` (default) and ``"x"`` fail if the file exists, ``"w"`` truncates (the previous
+            file is discarded even if the write then fails), ``"a"`` writes into an
+            existing file or creates one.
+        overwrite : bool
+            Delete the contents of a non-empty ``root`` group and write over it.
+
+        Raises
+        ------
+        ValidationError
+            A value cannot be stored in HDF5 (an invalid collection key, a `Glob` mismatch,
+            an unstorable or unserializable attribute), or ``root`` is occupied.
+        SchemaError
+            The group class has an invalid HDF5 declaration.
+        ValueError
+            ``mode`` or ``root`` is invalid.
+        OSError
+            The file cannot be created or opened (for example it exists in ``"w-"``/``"x"``
+            mode).
+        TypeError
+            ``path`` is not a string or path-like object.
+        """
+        from h5t._write import _dump_group
+
+        _dump_group(self, path, root=root, mode=mode, overwrite=overwrite)

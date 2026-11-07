@@ -1,67 +1,63 @@
-Compilation and forward references
-==================================
+Model lifecycle and forward references
+======================================
 
-Eager compilation
------------------
+Pydantic owns model construction
+--------------------------------
 
-The decorators compile the schema at the decorator call. Annotations resolve against the
-module globals, the decorating function's locals (read once, never stored), the explicit
-``localns=`` argument, and the class's own name (so self-reference works). A bad
-declaration therefore raises :class:`h5t.SchemaError` at the decorator, right where the
-mistake is.
+Subclassing :class:`h5t.Group` builds an ordinary Pydantic model. Pydantic resolves
+annotations and provides ``model_fields``; h5t has no separate compiled schema or
+annotation namespace. Ordinary in-memory construction uses Pydantic validation.
 
-``@h5t.dataset`` records never defer: they declare attributes only, so they cannot
-forward-reference another schema type.
+HDF5 declaration checks run when loading or writing, before the destination or source
+file is opened. They reject unsupported child annotations, duplicate HDF5 names,
+invalid aliases and ``Glob`` markers, and unsupported attribute and extra-field policies.
+Loading checks all reachable group declarations, including optional children and
+collection items. Recursive schemas are checked once per operation.
 
-Deferral for group records
---------------------------
+An invalid HDF5 declaration raises :class:`h5t.SchemaError`. Pydantic model-building
+errors propagate unchanged, including ``PydanticUndefinedAnnotation`` for unresolved
+names. Type-owned schema hooks (such as those for datasets and jaxtyping arrays) can
+still reject unsupported types while Pydantic builds the model.
 
-A ``@h5t.group`` record that names a record defined later in its module, or references
-itself, compiles on first use (when it is loaded, saved, or used as a field of another
-record).
+Forward references
+------------------
+
+Before inspecting an incomplete model, h5t calls its ``model_rebuild()``. Module-level
+forward references and self-references follow Pydantic's normal rules:
 
 .. code-block:: python
 
-   import dataclasses
-
-   import h5py
-
    import h5t
 
+   class Node(h5t.Group):
+       child: "Node | None" = None
 
-   @h5t.group()
-   @dataclasses.dataclass
-   class Node:
-       name: str
-       child: "Child | None" = None      # defined below: compilation is deferred
+For unresolved function-local dependencies, rebuild explicitly once the types exist:
 
+.. code-block:: python
 
-   @h5t.group()
-   @dataclasses.dataclass
-   class Child:
-       label: str
+   import numpy as np
+   import h5t
 
+   def make_schema():
+       class Parent(h5t.Group):
+           child: "Child"
 
-   with h5py.File("tree.h5", "w") as f:
-       f.attrs["name"] = "root"
-       f.create_group("child").attrs["label"] = "leaf"
+       class Child(h5t.Group):
+           values: np.ndarray
 
-   print(h5t.load(Node, "tree.h5"))
+       Parent.model_rebuild(_types_namespace={"Child": Child})
+       return Parent
 
-Function-local records and ``localns``
---------------------------------------
+The former ``localns=`` class keyword is removed without a compatibility shim. Replace
+it with ``Model.model_rebuild(_types_namespace={...})``. h5t does not inspect caller
+frames, retain custom namespaces, or clear Pydantic's parent namespace.
 
-A record declared inside a function sees that function's locals when the decorator runs,
-so ordinary function-local records and self-references just work. A deferred
-``@h5t.group`` record is retried later *without* them: if it both forward-references a
-name and uses a function-local type, pass the type explicitly with
-``@h5t.group(localns={"Child": Child})``. ``@h5t.dataset`` accepts ``localns=`` too.
+Writing runtime subclasses
+--------------------------
 
-Notes
------
-
-- A ``NameError`` raised by a *function an annotation calls* is a bug in that function,
-  not a forward reference, and is reported as a :class:`h5t.SchemaError`.
-- A still-unresolved name at load time becomes a :class:`h5t.SchemaError`.
-- A group-kind member's record is resolved at load time, which is what makes
-  ``child: Node | None`` possible without infinite recursion.
+Writing inspects each group's runtime class. A child declared as a base ``Group`` but
+holding a subclass writes the subclass's additional fields too, including collection
+items. Typed attributes likewise use their runtime model's declared fields and
+serializers. Computed fields are excluded, and nullable attributes holding ``None``
+are omitted. Values are not revalidated during writing.

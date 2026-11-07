@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 import importlib
 import sys
-from typing import NoReturn
+from typing import Any, NoReturn
 
-from h5t._compile import load
+from h5t._compile import Group
 from h5t._errors import SchemaError, ValidationError
 
 
@@ -16,32 +16,44 @@ def _fail(message: str) -> NoReturn:
     raise SystemExit(2)
 
 
-def _load_schema(ref: str) -> type:
+def _describe(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _load_schema(ref: str, *, show_traceback: bool = False) -> type[Group[Any]]:
     module_name, separator, class_name = ref.partition(":")
     if not separator or not module_name or not class_name:
         _fail(f"--schema must look like pkg.module:ClassName, got {ref!r}")
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:
-        _fail(f"could not import module {module_name!r}: {exc}")
+        if show_traceback:
+            raise
+        _fail(f"could not import module {module_name!r}: {_describe(exc)}")
     try:
         schema = getattr(module, class_name)
     except AttributeError:
         _fail(f"module {module_name!r} has no attribute {class_name!r}")
-    if not (isinstance(schema, type) and "__h5t_record__" in schema.__dict__):
-        _fail(f"{ref!r} is not a decorated record (@h5t.dataset/@h5t.group)")
+    if not (isinstance(schema, type) and issubclass(schema, Group) and schema is not Group):
+        _fail(f"{ref!r} is not an h5t.Group subclass")
     return schema
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
-    schema = _load_schema(args.schema)
+    schema = _load_schema(args.schema, show_traceback=args.traceback)
     try:
-        load(schema, args.file, root=args.root)
+        schema.model_validate_hdf5(args.file, root=args.root)
     except ValidationError as exc:
         print(f"invalid: {args.file} against {schema.__name__}: {exc}")
         return 1
-    except (OSError, ValueError, TypeError, SchemaError) as exc:
-        _fail(f"could not check {args.file!r}: {exc}")
+    except Exception as exc:
+        # A bug in user code (e.g. a validator raising KeyError) is not a validation
+        # failure: report it as a usage/runtime error (exit 2), never exit 1.
+        if args.traceback:
+            raise
+        if isinstance(exc, OSError | ValueError | SchemaError):
+            _fail(f"could not check {args.file!r}: {_describe(exc)}")
+        _fail(f"unexpected {type(exc).__name__} while checking {args.file!r}: {exc}")
     print(f"ok: {args.file} validates against {schema.__name__} at {args.root}")
     return 0
 
@@ -50,13 +62,16 @@ def main(argv: list[str] | None = None) -> int:
     """Run the command line interface and return its process exit code."""
     parser = argparse.ArgumentParser(
         prog="h5t",
-        description="Validate and materialize an HDF5 group schema.",
+        description="Validate an HDF5 file against a group schema.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     check = subparsers.add_parser("check", help="check an HDF5 file against a group schema")
     check.add_argument("file", help="path to the HDF5 file")
     check.add_argument("--schema", required=True, help="schema reference, e.g. pkg.schemas:Result")
     check.add_argument("--root", default="/", help="absolute HDF5 group path (default: /)")
+    check.add_argument(
+        "--traceback", action="store_true", help="show the full traceback for unexpected errors"
+    )
     check.set_defaults(func=_cmd_check)
     args = parser.parse_args(argv)
     return int(args.func(args))
