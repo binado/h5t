@@ -171,7 +171,7 @@ def _plan_group(group: Group[Any], path: str) -> _GroupPlan:
         attrs,
         path,
         forbid_untyped_extras=(
-            _extract_forbid_extras(owner, owner) and _resolve_group_attrs_type(owner) is None
+            _extract_forbid_extras(owner) and _resolve_group_attrs_type(owner) is None
         ),
     )
     for name, field in owner.model_fields.items():

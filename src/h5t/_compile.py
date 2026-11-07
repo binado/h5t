@@ -210,19 +210,19 @@ def _check_glob(owner: type, py_name: str, marker: Glob) -> re.Pattern[str]:
 # ---------------------------------------------------------------------------
 
 
-def _extract_forbid_extras(model_cls: type[BaseModel], owner: type) -> bool:
+def _extract_forbid_extras(model_cls: type[BaseModel]) -> bool:
     raw = model_cls.model_config.get("extra", "ignore")
     if raw is None or raw == "ignore":
         return False
     if raw == "forbid":
         return True
-    raise SchemaError(f"{owner.__name__}: extra must be 'ignore' or 'forbid', got {raw!r}")
+    raise SchemaError(f"{model_cls.__name__}: extra must be 'ignore' or 'forbid', got {raw!r}")
 
 
 def _check_attrs(model_type: type[BaseModel]) -> None:
     if not model_type.__pydantic_complete__:
         model_type.model_rebuild()
-    _extract_forbid_extras(model_type, model_type)
+    _extract_forbid_extras(model_type)
 
     # This loop only rejects declarations h5t cannot store or load; Pydantic does the rest.
     seen_h5_names: dict[str, str] = {}
@@ -355,7 +355,7 @@ def _check_group(group_cls: type[Group[Any]], seen: set[type] | None = None) -> 
     seen.add(group_cls)
     if not group_cls.__pydantic_complete__:
         group_cls.model_rebuild()
-    _extract_forbid_extras(group_cls, group_cls)
+    _extract_forbid_extras(group_cls)
     attrs_type = _resolve_group_attrs_type(group_cls)
     if attrs_type is not None:
         _check_attrs(attrs_type)
@@ -559,7 +559,7 @@ class Group(BaseModel, Generic[T]):
     def _h5t_jaxtyping_scope(cls, values: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
         is_view = isinstance(values, _GroupView)
         untyped = is_view and _resolve_group_attrs_type(cls) is None
-        if untyped and _extract_forbid_extras(cls, cls):
+        if untyped and _extract_forbid_extras(cls):
             name = next(iter(values.node.attrs), None)
             if name is not None:
                 path = attr_path(values.node.name, str(name))
