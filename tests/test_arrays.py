@@ -9,7 +9,7 @@ import h5py
 import numpy as np
 import pytest
 from jaxtyping import AbstractArray, AbstractDtype, Float, Float64, Num, Shaped
-from pydantic import BaseModel, ConfigDict, TypeAdapter
+from pydantic import BaseModel, ConfigDict, PydanticSchemaGenerationError, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 import h5t
@@ -296,11 +296,40 @@ def test_invalid_shape_string_error_propagates() -> None:
             x: Float[np.ndarray, "n, m"]
 
 
-def test_unsupported_array_type_is_a_schema_error() -> None:
-    with pytest.raises(h5t.SchemaError, match=r"not supported"):
+def test_unsupported_array_type_is_a_schema_error(tmp_path: Path) -> None:
+    # The class itself builds (the annotation only concerns h5t); the declaration check
+    # fires at operation time, from _unwrap_jaxtyping via _check_group.
+    class R(h5t.Group):
+        x: Float[list, "n"]  # ty: ignore
 
-        class R(h5t.Group):
-            x: Float[list, "n"]  # ty: ignore
+    with pytest.raises(h5t.SchemaError, match=r"not supported"):
+        R.model_validate_hdf5(write(tmp_path / "a.h5", x=np.zeros(3)))
+    with pytest.raises(h5t.SchemaError, match=r"not supported"):
+        R.model_construct(x=[1, 2]).model_dump_hdf5(tmp_path / "b.h5")
+
+
+def test_foreign_jaxtyping_models_do_not_break_when_h5t_is_imported() -> None:
+    # The schema hook is installed on jaxtyping's base class, so Pydantic consults it for
+    # *every* model in the process. A model h5t never sees, annotated with a foreign array
+    # type, must keep the schema it would have without h5t (an isinstance check).
+    class DuckArray:
+        def __init__(self, shape: tuple[int, ...]) -> None:
+            self.shape = shape
+            self.dtype = np.dtype("float32")
+
+    class Foreign(BaseModel):
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+
+        x: Float[DuckArray, "n"]
+
+    assert Foreign(x=DuckArray((3,))).x.shape == (3,)
+    with pytest.raises(PydanticValidationError):
+        Foreign(x=object())
+    with pytest.raises(PydanticSchemaGenerationError):
+        # Without arbitrary_types_allowed the error is Pydantic's own, as without h5t.
+
+        class Strict(BaseModel):
+            x: Float[DuckArray, "n"]
 
 
 def test_type_adapter_rejects_jaxtyping_mismatch_before_reading(

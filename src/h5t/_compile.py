@@ -59,9 +59,13 @@ def _jaxtyping_pydantic_schema(
 ) -> core_schema.CoreSchema:
     array_type = cls.array_type
     if not _is_supported_array_type(array_type):
-        raise SchemaError(
-            f"jaxtyping array type {array_type!r} is not supported; use np.ndarray or Dataset"
-        )
+        # This hook lives on jaxtyping's base class, so Pydantic calls it for *every* model
+        # in the process, including ones h5t never sees. A foreign array type (jax, torch,
+        # ...) keeps the schema it would have without h5t: an isinstance check (or a
+        # schema-generation error when ``arbitrary_types_allowed`` is off). h5t rejects
+        # these annotations itself, in ``_unwrap_jaxtyping``, once they appear in a Group
+        # or attrs model.
+        return handler(source_type)
     # ``handler(Dataset[T])`` would fall back to a plain isinstance check on this path, so a
     # Dataset-backed array asks the Dataset class for its own schema (the raw-h5py reader).
     if array_type is np.ndarray:

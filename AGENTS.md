@@ -58,7 +58,11 @@ with an operation-local visited set before opening a file; recursive schemas ter
 
 - HDF5 declaration restrictions raise `SchemaError` at load/write time.
 - Pydantic model-building and unresolved-annotation errors propagate unchanged.
-- Type-owned schema hooks may reject unsupported types during model construction.
+- The jaxtyping schema hook is installed on `AbstractArray` itself, so it runs for every
+  Pydantic model in the process. It converts only `np.ndarray`- and `Dataset`-backed arrays
+  and defers every other array type to Pydantic's default schema, so models h5t never sees
+  (jax, torch, ...) behave as if h5t were not imported; the unsupported-type `SchemaError`
+  comes from `_unwrap_jaxtyping` at load/write time instead.
 - `localns=` is removed. Resolve local dependencies explicitly with
   `Model.model_rebuild(_types_namespace={...})`; do not inspect frames or clear namespaces.
 - The writer checks runtime group and attribute model declarations during planning,

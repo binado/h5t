@@ -38,6 +38,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Importing h5t no longer breaks unrelated Pydantic models that use jaxtyping over other
+  array backends (jax, torch, ...): the schema hook installed on `jaxtyping.AbstractArray`
+  defers unsupported array types to Pydantic's default schema, and h5t raises its
+  `SchemaError` at load/write time instead (via `_unwrap_jaxtyping`).
+
 - Plain ndarray aliases, including chained PEP 695 aliases, read HDF5 datasets through
   the Pydantic schema reader hook.
 
