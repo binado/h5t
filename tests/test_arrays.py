@@ -9,7 +9,7 @@ import h5py
 import numpy as np
 import pytest
 from jaxtyping import AbstractArray, AbstractDtype, Float, Float64, Num, Shaped
-from pydantic import BaseModel, ConfigDict, PydanticSchemaGenerationError, TypeAdapter
+from pydantic import BaseModel, ConfigDict, PydanticSchemaGenerationError
 from pydantic import ValidationError as PydanticValidationError
 
 import h5t
@@ -309,9 +309,10 @@ def test_unsupported_array_type_is_a_schema_error(tmp_path: Path) -> None:
 
 
 def test_foreign_jaxtyping_models_do_not_break_when_h5t_is_imported() -> None:
-    # The schema hook is installed on jaxtyping's base class, so Pydantic consults it for
-    # *every* model in the process. A model h5t never sees, annotated with a foreign array
-    # type, must keep the schema it would have without h5t (an isinstance check).
+    # h5t does not mutate jaxtyping's base class, so foreign models keep their native
+    # Pydantic schema behavior.
+    assert not hasattr(AbstractArray, "__get_pydantic_core_schema__")
+
     class DuckArray:
         def __init__(self, shape: tuple[int, ...]) -> None:
             self.shape = shape
@@ -332,11 +333,13 @@ def test_foreign_jaxtyping_models_do_not_break_when_h5t_is_imported() -> None:
             x: Float[DuckArray, "n"]
 
 
-def test_type_adapter_rejects_jaxtyping_mismatch_before_reading(
+def test_ndarray_jaxtyping_rejects_mismatch_before_reading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    class R(h5t.Group):
+        x: Float[np.ndarray, "n n"]
+
     path = write(tmp_path / "a.h5", x=np.zeros((2, 3)))
-    adapter = TypeAdapter(Float[np.ndarray, "n n"], config=ConfigDict(arbitrary_types_allowed=True))
     reads: list[object] = []
     real_getitem = h5py.Dataset.__getitem__
 
@@ -345,16 +348,7 @@ def test_type_adapter_rejects_jaxtyping_mismatch_before_reading(
         return real_getitem(self, *args, **kwargs)
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", spy)
-    with h5py.File(path, "r") as f, pytest.raises(h5t.ValidationError) as info:
-        adapter.validate_python(f["x"])
+    with pytest.raises(h5t.ValidationError) as info:
+        R.model_validate_hdf5(path)
     assert info.value.path == "/x"
     assert reads == []
-
-
-def test_type_adapter_reads_matching_h5py_array(tmp_path: Path) -> None:
-    path = write(tmp_path / "a.h5", x=np.eye(2))
-    adapter = TypeAdapter(Float[np.ndarray, "n n"], config=ConfigDict(arbitrary_types_allowed=True))
-    with h5py.File(path, "r") as f:
-        out = adapter.validate_python(f["x"])
-    assert isinstance(out, np.ndarray)
-    assert out.shape == (2, 2)

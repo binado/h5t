@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import fnmatch
+import functools
+import operator
 import os
 import posixpath
 import re
@@ -43,8 +45,15 @@ def _schema_error(owner: type, field: str, message: str) -> SchemaError:
 
 
 # ---------------------------------------------------------------------------
-# jaxtyping integration with Pydantic
+# Array and jaxtyping integration with Pydantic
 # ---------------------------------------------------------------------------
+
+
+def _read_array(value: Any) -> Any:
+    """Turn an open ``h5py.Dataset`` into an ndarray; pass any other value through."""
+    if isinstance(value, h5py.Dataset):
+        return np.asarray(value[()])
+    return value
 
 
 def _is_supported_array_type(array_type: Any) -> bool:
@@ -59,12 +68,8 @@ def _jaxtyping_pydantic_schema(
 ) -> core_schema.CoreSchema:
     array_type = cls.array_type
     if not _is_supported_array_type(array_type):
-        # This hook lives on jaxtyping's base class, so Pydantic calls it for *every* model
-        # in the process, including ones h5t never sees. A foreign array type (jax, torch,
-        # ...) keeps the schema it would have without h5t: an isinstance check (or a
-        # schema-generation error when ``arbitrary_types_allowed`` is off). h5t rejects
-        # these annotations itself, in ``_unwrap_jaxtyping``, once they appear in a Group
-        # or attrs model.
+        # Unsupported array types keep Pydantic's default schema at class-creation time;
+        # h5t rejects them with a SchemaError in ``_unwrap_jaxtyping`` at load/write time.
         return handler(source_type)
     # ``handler(Dataset[T])`` would fall back to a plain isinstance check on this path, so a
     # Dataset-backed array asks the Dataset class for its own schema (the raw-h5py reader).
@@ -107,11 +112,25 @@ def _jaxtyping_pydantic_schema(
 _SCALAR_TYPES = (bool, int, float, complex, str, bytes, np.generic)
 
 
-setattr(  # noqa: B010
-    AbstractArray,
-    "__get_pydantic_core_schema__",
-    classmethod(_jaxtyping_pydantic_schema),
-)
+class _NdarraySchema:
+    """``Annotated`` marker attaching `_read_array` to a plain ``np.ndarray`` annotation."""
+
+    def __get_pydantic_core_schema__(
+        self, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        return core_schema.no_info_before_validator_function(_read_array, handler(source_type))
+
+
+class _JaxtypingSchema:
+    """``Annotated`` marker attaching `_jaxtyping_pydantic_schema` to a jaxtyping array."""
+
+    def __init__(self, hint: type[AbstractArray]) -> None:
+        self.hint = hint
+
+    def __get_pydantic_core_schema__(
+        self, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        return _jaxtyping_pydantic_schema(self.hint, source_type, handler)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +241,7 @@ def _extract_forbid_extras(model_cls: type[BaseModel]) -> bool:
 def _check_attrs(model_type: type[BaseModel]) -> None:
     if not model_type.__pydantic_complete__:
         model_type.model_rebuild()
+    _prepare_attrs_model(model_type)
     _extract_forbid_extras(model_type)
 
     # This loop only rejects declarations h5t cannot store or load; Pydantic does the rest.
@@ -376,40 +396,75 @@ def _check_group(group_cls: type[Group[Any]], seen: set[type] | None = None) -> 
         _check_member(group_cls, name, field.annotation, seen)
 
 
-def _read_array(value: Any) -> Any:
-    """Turn an open ``h5py.Dataset`` into an ndarray; pass any other value through."""
-    if isinstance(value, h5py.Dataset):
-        return np.asarray(value[()])
-    return value
+def _rewrite_annotation(tp: Any) -> Any:
+    """Attach `_NdarraySchema` or `_JaxtypingSchema` to array leaves in ``tp``."""
+    origin = typing.get_origin(tp)
+    args = typing.get_args(tp)
+    if origin is Annotated:
+        head, *meta = args
+        if any(isinstance(m, (_NdarraySchema, _JaxtypingSchema)) for m in meta):
+            return tp
+        new_head = _rewrite_annotation(head)
+        return Annotated[(new_head, *meta)] if new_head is not head else tp
+    if isinstance(tp, type) and issubclass(tp, AbstractArray):
+        if (
+            isinstance(tp.array_type, type)
+            and issubclass(tp.array_type, Dataset)
+            and tp.array_type._h5t_attrs_type is not None
+        ):
+            _prepare_attrs_model(tp.array_type._h5t_attrs_type)
+        return Annotated[tp, _JaxtypingSchema(tp)]
+    if isinstance(tp, type) and issubclass(tp, Dataset) and tp._h5t_attrs_type is not None:
+        _prepare_attrs_model(tp._h5t_attrs_type)
+        return tp
+    if _is_ndarray_annotation(tp):
+        return Annotated[tp, _NdarraySchema()]
+    if isinstance(tp, _TYPE_ALIAS_TYPES):
+        inner = _rewrite_annotation(tp.__value__)
+        return inner if inner is not tp.__value__ else tp
+    if not args or origin is None:
+        return tp
+    new_args = tuple(_rewrite_annotation(a) for a in args)
+    if all(a is b for a, b in zip(args, new_args, strict=True)):
+        return tp
+    if origin in (typing.Union, types.UnionType):
+        return functools.reduce(operator.or_, new_args)
+    return origin[new_args[0] if len(new_args) == 1 else new_args]
 
 
-def _with_array_readers(schema: Any, handler: GetCoreSchemaHandler) -> Any:
-    """Return ``schema`` with every ``np.ndarray`` instance check preceded by `_read_array`.
+def _rewrite_field(field: FieldInfo) -> bool:
+    if any(isinstance(m, (_NdarraySchema, _JaxtypingSchema)) for m in field.metadata):
+        return False
+    new_ann = _rewrite_annotation(field.annotation)
+    if new_ann is not field.annotation:
+        field.annotation = new_ann
+        return True
+    return False
 
-    Pydantic knows ``np.ndarray`` only as an ``isinstance`` check, so a raw ``h5py.Dataset``
-    would be rejected. Rewriting those nodes where the schema is generated covers plain
-    arrays, collections of them and any other nesting, without touching the built model.
-    """
-    if isinstance(schema, dict):
-        target = schema
-        seen_refs: set[str] = set()
-        while target.get("type") == "definition-ref":
-            # PEP 695 array aliases live in Pydantic's definitions rather than in the
-            # model schema. Wrap their reference; recursive group refs remain untouched.
-            ref = typing.cast(core_schema.DefinitionReferenceSchema, target)["schema_ref"]
-            if ref in seen_refs:
-                break
-            seen_refs.add(ref)
-            try:
-                target = handler.resolve_ref_schema(target)
-            except LookupError:
-                break  # a recursive model's definition may still be under construction
-        if target.get("type") == "is-instance" and target.get("cls") is np.ndarray:
-            return core_schema.no_info_before_validator_function(_read_array, schema)
-        return {key: _with_array_readers(value, handler) for key, value in schema.items()}
-    if isinstance(schema, list):
-        return [_with_array_readers(item, handler) for item in schema]
-    return schema
+
+def _prepare_attrs_model(model_type: type[BaseModel]) -> bool:
+    if not model_type.__pydantic_complete__:
+        return False
+    changed = False
+    for field in model_type.model_fields.values():
+        if _rewrite_field(field):
+            changed = True
+    if changed:
+        model_type.model_rebuild(force=True, _types_namespace={model_type.__name__: model_type})
+    return changed
+
+
+def _prepare_group_fields(group_cls: type[Group[Any]]) -> None:
+    attrs_ann: Any = group_cls.model_fields["attrs"].annotation
+    if (
+        isinstance(attrs_ann, type)
+        and issubclass(attrs_ann, BaseModel)
+        and not issubclass(attrs_ann, Group)
+    ):
+        _prepare_attrs_model(attrs_ann)
+    for name, field in group_cls.model_fields.items():
+        if name != "attrs":
+            _rewrite_field(field)
 
 
 def _first_error_parts(exc: PydanticValidationError) -> tuple[tuple[Any, ...], str]:
@@ -545,7 +600,8 @@ class Group(BaseModel, Generic[T]):
     def __get_pydantic_core_schema__(
         cls, source: Any, handler: GetCoreSchemaHandler
     ) -> core_schema.CoreSchema:
-        return _with_array_readers(handler(source), handler)
+        _prepare_group_fields(cls)
+        return handler(source)
 
     @field_validator("attrs", mode="wrap", check_fields=False)
     @classmethod

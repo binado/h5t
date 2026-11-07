@@ -58,11 +58,12 @@ with an operation-local visited set before opening a file; recursive schemas ter
 
 - HDF5 declaration restrictions raise `SchemaError` at load/write time.
 - Pydantic model-building and unresolved-annotation errors propagate unchanged.
-- The jaxtyping schema hook is installed on `AbstractArray` itself, so it runs for every
-  Pydantic model in the process. It converts only `np.ndarray`- and `Dataset`-backed arrays
-  and defers every other array type to Pydantic's default schema, so models h5t never sees
-  (jax, torch, ...) behave as if h5t were not imported; the unsupported-type `SchemaError`
-  comes from `_unwrap_jaxtyping` at load/write time instead.
+- Neither `np.ndarray` nor `jaxtyping.AbstractArray` is monkey-patched. Instead,
+  `_prepare_group_fields` (called in `Group.__get_pydantic_core_schema__`) and
+  `_prepare_attrs_model` recursively wrap array leaves in `model_fields` with `Annotated`
+  markers (`_NdarraySchema` and `_JaxtypingSchema`). Foreign models h5t never sees (jax,
+  torch, ...) are never touched; the unsupported-type `SchemaError` comes from
+  `_unwrap_jaxtyping` at load/write time.
 - `localns=` is removed. Resolve local dependencies explicitly with
   `Model.model_rebuild(_types_namespace={...})`; do not inspect frames or clear namespaces.
 - The writer checks runtime group and attribute model declarations during planning,
@@ -104,11 +105,10 @@ Each *type* converts raw input itself:
 - `Dataset[T]` builds a lazy `Dataset` from an `h5py.Dataset` (typed attrs are validated in their
   own jaxtyping scope via `handler.generate_schema(attrs_type)`; failures flow out in `loc` and
   are formatted by `_h5_error_path` as `<path>@<attr>`).
-- jaxtyping arrays: see above.
-- plain `np.ndarray` fields (and collections of them): `Group.__get_pydantic_core_schema__`
-  rewrites every `np.ndarray` `is-instance` node in the generated core schema (`_with_array_readers`)
-  so `_read_array` runs first. Array alias references are resolved through the schema
-handler, including chained PEP 695 aliases. No `FieldInfo` mutation is needed.
+- jaxtyping arrays and plain `np.ndarray` fields (including collections and chained PEP 695
+  aliases of them): `_rewrite_annotation` wraps each array leaf in `Annotated[..., _JaxtypingSchema | _NdarraySchema]`
+  before Pydantic builds the model's core schema, so `_read_h5py` or `_read_array` runs via
+  Pydantic's standard `Annotated` hook without walking or rewriting raw `CoreSchema` dicts.
 - `Glob.__get_pydantic_core_schema__` filters only a `_GroupView` (`fnmatch.fnmatchcase`).
 - `Group._h5t_jaxtyping_scope` rejects any attribute on a `extra="forbid"` group with untyped
   attrs, and freezes loaded untyped attrs into a `MappingProxyType`.
