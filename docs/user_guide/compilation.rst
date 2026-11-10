@@ -10,7 +10,7 @@ annotation namespace. Ordinary in-memory construction uses Pydantic validation.
 
 HDF5 declaration checks run when loading or writing, before the destination or source
 file is opened. They reject unsupported child annotations, duplicate HDF5 names,
-invalid aliases and ``Glob`` markers, and unsupported attribute and extra-field policies.
+invalid aliases, and unsupported attribute and extra-field policies.
 Loading checks all reachable group declarations, including optional children and
 collection items. Recursive schemas are checked once per operation.
 

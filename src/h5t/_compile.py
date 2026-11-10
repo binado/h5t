@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import fnmatch
 import functools
 import operator
 import os
 import posixpath
-import re
 import types
 import typing
 from collections.abc import Mapping
@@ -33,9 +31,8 @@ from pydantic_core import PydanticCustomError, core_schema
 from typing_extensions import TypeVar
 
 from h5t._array import Dataset, _is_mapping_type
-from h5t._errors import SchemaError, ValidationError
+from h5t._errors import SchemaError, ValidationError, attr_path, child_path
 from h5t._h5view import ATTRS_KEY, _ghost, _GroupView
-from h5t._spec import Glob, attr_path, child_path
 
 T = TypeVar("T", bound=BaseModel | Mapping[str, Any], default=Mapping[str, Any])
 
@@ -166,13 +163,6 @@ def _split_annotation(owner: type, py_name: str, annotation: Any) -> tuple[Any, 
         return core, metadata, optional
 
 
-def _marker(metadata: list[Any], marker_type: type, owner: type, py_name: str) -> Any | None:
-    found = [item for item in metadata if isinstance(item, marker_type)]
-    if len(found) > 1:
-        raise _schema_error(owner, py_name, f"{marker_type.__name__} may appear only once")
-    return found[0] if found else None
-
-
 _alias_type = getattr(typing, "TypeAliasType", None)
 _TYPE_ALIAS_TYPES: tuple[type, ...] = (_alias_type,) if isinstance(_alias_type, type) else ()
 _MAX_ALIAS_DEPTH = 16
@@ -215,15 +205,6 @@ def _is_mapping_annotation(core: Any) -> bool:
     return isinstance(origin, type) and issubclass(origin, Mapping)
 
 
-def _check_glob(owner: type, py_name: str, marker: Glob) -> re.Pattern[str]:
-    pattern = marker.pattern
-    if not isinstance(pattern, str) or not pattern:
-        raise _schema_error(owner, py_name, "Glob requires a non-empty string pattern")
-    if "/" in pattern:
-        raise _schema_error(owner, py_name, "a Glob pattern cannot contain '/'")
-    return re.compile(fnmatch.translate(pattern))
-
-
 # ---------------------------------------------------------------------------
 # Attribute declaration checks (for T in Group[T] and Dataset[T])
 # ---------------------------------------------------------------------------
@@ -248,12 +229,7 @@ def _check_attrs(model_type: type[BaseModel]) -> None:
     seen_h5_names: dict[str, str] = {}
     for py_name, field_info in model_type.model_fields.items():
         raw_ann = field_info.annotation
-        core, meta, _ = _split_annotation(model_type, py_name, raw_ann)
-        all_meta = [*meta, *field_info.metadata]
-        if any(isinstance(m, Glob) for m in all_meta):
-            raise _schema_error(
-                model_type, py_name, "Glob applies only to dict[str, T] collection fields"
-            )
+        core, _, _ = _split_annotation(model_type, py_name, raw_ann)
 
         h5_name = field_info.alias if field_info.alias is not None else py_name
         if not isinstance(h5_name, str) or not h5_name:
@@ -296,8 +272,6 @@ def _collection_item(owner: type, py_name: str, core: Any) -> Any:
     _, item_metadata, item_optional = _split_annotation(owner, py_name, item_annotation)
     if item_optional:
         raise _schema_error(owner, py_name, "collection items cannot be optional")
-    if any(isinstance(m, Glob) for m in item_metadata):
-        raise _schema_error(owner, py_name, "Glob cannot annotate a collection item")
     if any(isinstance(m, FieldInfo) and m.alias is not None for m in item_metadata):
         raise _schema_error(owner, py_name, "alias cannot annotate a collection item")
     item_core = _member_annotation(owner, py_name, item_annotation)
@@ -334,16 +308,6 @@ def _check_member(owner: type, name: str, annotation: Any, seen: set[type]) -> N
             f"unsupported child field annotation {core!r}; group fields must be "
             "Group, Dataset, np.ndarray, or dict[str, T] (declare HDF5 attributes on Group[Attrs])",
         )
-
-
-def _field_glob(owner: type, name: str, field: FieldInfo) -> re.Pattern[str] | None:
-    core, metadata, _ = _split_annotation(owner, name, field.annotation)
-    marker = _marker([*metadata, *field.metadata], Glob, owner, name)
-    if marker is None:
-        return None
-    if not _is_mapping_annotation(core):
-        raise _schema_error(owner, name, "Glob applies only to dict[str, T] collection fields")
-    return _check_glob(owner, name, marker)
 
 
 def _resolve_group_attrs_type(group_cls: type[Group[Any]]) -> type[BaseModel] | None:
@@ -392,7 +356,6 @@ def _check_group(group_cls: type[Group[Any]], seen: set[type] | None = None) -> 
                 f"{names[h5_name]!r} and {name!r}"
             )
         names[h5_name] = name
-        _field_glob(group_cls, name, field)
         _check_member(group_cls, name, field.annotation, seen)
 
 
@@ -574,8 +537,6 @@ class Group(BaseModel, Generic[T]):
     ``Field(alias="...")`` on a child field or an attribute field sets its on-disk HDF5
     name. ``extra="forbid"`` in ``model_config`` rejects undeclared child nodes (and, on
     ``T``, undeclared attributes); only ``"ignore"`` and ``"forbid"`` are supported.
-    Annotate a ``dict[str, ...]`` field with `Glob` to restrict which child names it
-    collects.
 
     Examples
     --------
@@ -692,13 +653,10 @@ class Group(BaseModel, Generic[T]):
         Field types, array shapes and attribute values were validated by Pydantic when
         ``self`` was constructed and are not checked again here, so an instance built with
         ``model_construct`` or modified afterwards is written as it is. Only what HDF5
-        itself imposes is checked: collection keys, `Glob` patterns, and attribute values
-        h5py can store. The group tree is fully planned before the file is opened, so a
-        failed check never touches the target file. If writing fails midway, any
-        created groups or files are rolled back. ``overwrite=True`` deletes the existing
-        content of ``root`` before writing, as ``del group[name]`` does in h5py; the old
-        content is not restored if the write then fails. A problem during rollback itself
-        is attached to the raised exception as a note.
+        itself imposes is checked: collection keys and attribute values h5py can store.
+        The group tree is fully planned before the file is opened, so a failed check
+        never touches the target file. ``overwrite=True`` deletes the existing content of
+        ``root`` before writing, as ``del group[name]`` does in h5py.
 
         Parameters
         ----------
@@ -707,17 +665,16 @@ class Group(BaseModel, Generic[T]):
         root : str
             Absolute group path to write under; missing intermediate groups are created.
         mode : {"w-", "x", "w", "a"}
-            ``"w-"`` (default) and ``"x"`` fail if the file exists, ``"w"`` truncates (the previous
-            file is discarded even if the write then fails), ``"a"`` writes into an
-            existing file or creates one.
+            ``"w-"`` (default) and ``"x"`` fail if the file exists, ``"w"`` truncates,
+            ``"a"`` writes into an existing file or creates one.
         overwrite : bool
             Delete the contents of a non-empty ``root`` group and write over it.
 
         Raises
         ------
         ValidationError
-            A value cannot be stored in HDF5 (an invalid collection key, a `Glob` mismatch,
-            an unstorable or unserializable attribute), or ``root`` is occupied.
+            A value cannot be stored in HDF5 (an invalid collection key or an unstorable
+            or unserializable attribute), or ``root`` is occupied.
         SchemaError
             The group class has an invalid HDF5 declaration.
         ValueError

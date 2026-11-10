@@ -81,7 +81,6 @@ def test_lazy_data_and_indexing_observe_file_and_cache(result_file: Path) -> Non
     with h5py.File(result_file, "a") as file:
         file["measurement"][...] = np.arange(5) + 30
     assert measurement.data is first
-    assert measurement.read() is first
     assert measurement[:] is first
     assert np.array_equal(measurement[:2], [20, 21])
     assert np.array_equal(np.asarray(measurement), first)
@@ -130,7 +129,7 @@ def test_deleted_source_preserves_snapshot_but_live_access_fails(result_file: Pa
     assert measurement.shape == (5,)
     assert measurement.attrs.unit == "m"
     with pytest.raises(h5t.ValidationError, match="cannot open the source file") as caught:
-        measurement.read()
+        _ = measurement.data
     assert caught.value.path == "/measurement"
 
 
@@ -148,7 +147,7 @@ def test_no_descriptors_leak_on_success_or_failure(tmp_path: Path) -> None:
 
     def exercise() -> None:
         Result.model_validate_hdf5(good)
-        Owner.model_validate_hdf5(good).measurement.read()
+        _ = Owner.model_validate_hdf5(good).measurement.data
         Owner.model_validate_hdf5(good).values[:2]
         with pytest.raises(h5t.ValidationError):
             Result.model_validate_hdf5(bad)
@@ -211,7 +210,7 @@ def test_open_detects_source_changes_since_load(
         elif mutate == "replaced-by-group":
             file.create_group("measurement")
     with pytest.raises(h5t.ValidationError, match=match) as caught:
-        measurement.read()
+        _ = measurement.data
     if path is not None:
         assert caught.value.path == path
 

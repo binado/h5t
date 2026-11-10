@@ -36,8 +36,7 @@ Options
 ``root`` and ``overwrite``
     Missing intermediate groups are created. A ``root`` group that already has members or
     attributes raises :class:`h5t.ValidationError` unless ``overwrite=True``, which
-    deletes its contents first and writes over them, as ``del group[name]`` does in h5py
-    (destructive, and not undone if the write then fails).
+    deletes its contents first and writes over them, as ``del group[name]`` does in h5py.
 
 Attribute serialization
 -----------------------
@@ -50,16 +49,14 @@ Attribute serialization
 - A ``None`` optional attribute is omitted from the file.
 - An untyped ``Group`` or ``Dataset`` writes its ``attrs`` mapping entries directly as raw
   HDF5 attributes.
-- Collection keys must be non-empty, contain no ``/`` and match the field's ``Glob``.
+- Collection keys must be non-empty, contain no ``/``, and not be ``"."`` or ``".."``.
 
-Validation first, rollback on failure
--------------------------------------
+Two-phase planning
+------------------
 
-The whole group tree is validated, jaxtyping shapes are checked, and every :class:`h5t.Dataset`
-data is read *before* the file is opened, so an invalid model never touches the target
-(and saving into the file a lazy ``Dataset`` came from is safe). If the write itself fails,
-the new file is removed; with ``mode="a"`` the group that ``model_dump_hdf5`` created is
-removed on a best-effort basis.
+The whole group tree is planned and every :class:`h5t.Dataset` data is read *before* the
+file is opened, so a failed check never touches the target file (and saving into the file a
+lazy ``Dataset`` came from is safe).
 
 Lazy datasets are copied: an uncached ``Dataset`` is read from its source file at save time,
 without caching it on your instance.

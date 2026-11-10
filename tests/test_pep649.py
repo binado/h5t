@@ -124,7 +124,7 @@ def test_a_lazy_schema_loads_from_a_file(tmp_path: Path) -> None:
     assert np.array_equal(loaded.values, np.arange(4))
     assert loaded.measurement.attrs.unit == "m"
     assert loaded.measurement.attrs.scale == 1.0
-    assert np.array_equal(loaded.measurement.read(), np.arange(5))
+    assert np.array_equal(loaded.measurement.data, np.arange(5))
     assert loaded.nested.attrs.answer == 42
     assert loaded.attrs.optional_note is None
 

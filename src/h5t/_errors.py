@@ -1,6 +1,16 @@
-"""Public exception types for declaration checks and detached HDF5 I/O."""
+"""Public exception types and HDF5 path helpers."""
 
 from __future__ import annotations
+
+
+def child_path(parent: str, name: str) -> str:
+    """Join an absolute group path and one immediate child name."""
+    return f"/{name}" if parent == "/" else f"{parent.rstrip('/')}/{name}"
+
+
+def attr_path(parent: str, name: str) -> str:
+    """Return a display path for an HDF5 attribute."""
+    return f"{parent.rstrip('/') or '/'}@{name}"
 
 
 class H5TError(Exception):

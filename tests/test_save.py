@@ -171,8 +171,8 @@ def test_datasets_and_lazy_datasets(tmp_path: Path) -> None:
     dst = tmp_path / "dst.h5"
     holder.model_dump_hdf5(dst)
     again = Holder.model_validate_hdf5(dst)
-    assert np.array_equal(again.typed.read(), np.arange(4))
-    assert np.array_equal(again.samples.read(), np.arange(4))
+    assert np.array_equal(again.typed.data, np.arange(4))
+    assert np.array_equal(again.samples.data, np.arange(4))
     assert again.typed.attrs.unit == "m"
 
 
@@ -190,7 +190,7 @@ def test_load_save_load_result_file(tmp_path: Path) -> None:
     first.model_dump_hdf5(src, root="/copy", mode="a")
     second = Snap.model_validate_hdf5(src, root="/copy")
     assert second.attrs["undeclared"] == "raw"
-    assert np.array_equal(second.measurement.read(), np.arange(5))
+    assert np.array_equal(second.measurement.data, np.arange(5))
     assert np.array_equal(second.values, np.arange(4))
 
     dst = tmp_path / "dst.h5"
@@ -252,17 +252,7 @@ def test_unstorable_attribute_requires_serializer(tmp_path: Path) -> None:
     assert info.value.path == "/@config"
 
 
-def test_glob_mismatch_rejected(tmp_path: Path) -> None:
-    class Globbed(h5t.Group):
-        snaps: Annotated[dict[str, Item], h5t.Glob("snap_*")]
-
-    Globbed(snaps={"snap_1": Item(attrs=ItemAttrs(n=1))}).model_dump_hdf5(tmp_path / "ok.h5")
-    with pytest.raises(h5t.ValidationError, match="Glob") as info:
-        Globbed(snaps={"other": Item(attrs=ItemAttrs(n=1))}).model_dump_hdf5(tmp_path / "bad.h5")
-    assert info.value.path == "/snaps/other"
-
-
-def test_apply_failure_cleans_up(tmp_path: Path) -> None:
+def test_apply_failure_closes_file(tmp_path: Path) -> None:
     class Strings(h5t.Group):
         names: np.ndarray
 
@@ -272,17 +262,7 @@ def test_apply_failure_cleans_up(tmp_path: Path) -> None:
     with pytest.raises(h5t.ValidationError) as info:
         bad.model_dump_hdf5(target)
     assert info.value.path == "/names"
-    assert not target.exists()
     assert open_fd_count() == before
-
-    make_doc().model_dump_hdf5(target)
-    snapshot = target.read_bytes()
-    with pytest.raises(h5t.ValidationError):
-        bad.model_dump_hdf5(target, root="/a/b", mode="a")
-    with h5py.File(target) as f:
-        assert "a" not in f
-    assert Doc.model_validate_hdf5(target).attrs.version == 3
-    assert snapshot
 
 
 def test_modes(tmp_path: Path) -> None:
@@ -372,64 +352,6 @@ def test_no_fd_leak(tmp_path: Path) -> None:
     assert open_fd_count() == before
 
 
-class _Names(h5t.Group):
-    names: np.ndarray
-
-
-@pytest.fixture
-def unwritable_names() -> _Names:
-    """A valid plan whose apply phase fails: unicode arrays are not HDF5-writable."""
-    return _Names(names=np.array(["a", "b"]))
-
-
-@pytest.mark.parametrize("root", ["/", "/a/b"])
-def test_failed_overwrite_is_destructive_like_h5py(
-    tmp_path: Path, root: str, unwritable_names: _Names
-) -> None:
-    target = tmp_path / "doc.h5"
-    _Names(names=np.arange(3)).model_dump_hdf5(target, root=root)
-    with h5py.File(target, "a") as f:
-        f[root].attrs["marker"] = "old"
-    with pytest.raises(h5t.ValidationError) as info:
-        unwritable_names.model_dump_hdf5(target, root=root, mode="a", overwrite=True)
-    assert info.value.path == f"{root.rstrip('/')}/names"
-    with h5py.File(target) as f:
-        assert list(f[root].keys()) == []
-        assert list(f[root].attrs) == []
-
-
-@pytest.mark.parametrize("rollback_exc", [KeyError, OSError, ValueError, RuntimeError, TypeError])
-def test_rollback_failure_is_attached_to_the_original_error(
-    tmp_path: Path,
-    unwritable_names: _Names,
-    monkeypatch: pytest.MonkeyPatch,
-    rollback_exc: type[Exception],
-) -> None:
-    from h5t import _write
-
-    def broken_rollback(self: _write._Undo, file: h5py.File) -> None:
-        raise rollback_exc("cannot undo")
-
-    target = tmp_path / "doc.h5"
-    make_doc().model_dump_hdf5(target)
-    monkeypatch.setattr(_write._Undo, "rollback", broken_rollback)
-    with pytest.raises(h5t.ValidationError) as info:
-        unwritable_names.model_dump_hdf5(target, root="/a/b", mode="a")
-    assert any("rollback failed" in note for note in info.value.__notes__)
-
-
-def test_partial_file_removal_failure_is_attached_to_the_original_error(
-    tmp_path: Path, unwritable_names: _Names, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def broken_remove(path: object) -> None:
-        raise PermissionError("read-only directory")
-
-    monkeypatch.setattr("os.remove", broken_remove)
-    with pytest.raises(h5t.ValidationError) as info:
-        unwritable_names.model_dump_hdf5(tmp_path / "doc.h5")
-    assert any("partially written file" in note for note in info.value.__notes__)
-
-
 class _TypedDatasetGroup(h5t.Group):
     measurement: h5t.Dataset[MeasurementAttrs]
 
@@ -447,39 +369,8 @@ def test_dump_of_dataset_whose_source_file_was_deleted_leaves_no_file(tmp_path: 
     assert not target.exists()
 
 
-class _PartialAttrs(BaseModel):
-    label: str
-
-
-class _Partial(h5t.Group[_PartialAttrs]):
-    ok: np.ndarray
-    names: np.ndarray
-
-
-@pytest.fixture
-def partly_writable() -> _Partial:
-    """Writes attrs and one child before the unicode array fails in the apply phase."""
-    return _Partial(attrs=_PartialAttrs(label="new"), ok=np.arange(3), names=np.array(["a", "b"]))
-
-
-@pytest.mark.parametrize("root", ["/", "/a/b"])
-def test_dump_into_existing_empty_root_failing_midway_leaves_root_empty(
-    tmp_path: Path, root: str, partly_writable: _Partial
-) -> None:
-    target = tmp_path / "doc.h5"
-    with h5py.File(target, "w") as f:
-        f.require_group(root)
-    with pytest.raises(h5t.ValidationError):
-        partly_writable.model_dump_hdf5(target, root=root, mode="a")
-    with h5py.File(target) as f:
-        assert list(f[root].keys()) == []
-        assert list(f[root].attrs) == []
-
-
 @pytest.mark.parametrize("value", ["a\x00b", np.zeros(70_000)], ids=["embedded-nul", "too-large"])
-def test_dump_attr_h5py_rejects_reports_attribute_path_and_removes_file(
-    tmp_path: Path, value: object
-) -> None:
+def test_dump_attr_h5py_rejects_reports_attribute_path(tmp_path: Path, value: object) -> None:
     class Attrs(BaseModel):
         model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -489,7 +380,6 @@ def test_dump_attr_h5py_rejects_reports_attribute_path_and_removes_file(
     with pytest.raises(h5t.ValidationError, match="cannot write attribute") as info:
         h5t.Group[Attrs](attrs=Attrs(v=value)).model_dump_hdf5(target)
     assert info.value.path == "/@v"
-    assert not target.exists()
 
 
 def test_dump_required_any_attr_with_none_value_reports_attribute_path(tmp_path: Path) -> None:

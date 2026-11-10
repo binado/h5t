@@ -272,16 +272,6 @@ class Dataset(Generic[T]):
             self._h5t_data = value
         return typing.cast(np.ndarray, self._h5t_data)
 
-    def read(self) -> np.ndarray:
-        """Return the complete array; an alias of `data`.
-
-        Returns
-        -------
-        numpy.ndarray
-            The same cached array as `data`.
-        """
-        return self.data
-
     def __getitem__(self, key: Any) -> np.ndarray:
         """Read ``key`` with ``h5py``-style indexing and return a NumPy array.
 

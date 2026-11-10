@@ -205,4 +205,4 @@ def test_dataset_member_preserves_a_custom_subclass(result_file: Path) -> None:
     loaded = Owner.model_validate_hdf5(result_file)
     assert type(loaded.measurement) is Tracked
     assert loaded.absent is None
-    assert np.array_equal(loaded.measurement.read(), np.arange(5))
+    assert np.array_equal(loaded.measurement.data, np.arange(5))

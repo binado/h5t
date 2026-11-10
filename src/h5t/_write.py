@@ -5,7 +5,7 @@ dtypes, attribute models), so the writer does not check any of that again. Phase
 walks runtime model fields on the instance and builds a tree of what to write, checking only
 what HDF5 itself imposes (child names, storable attribute values) and reading the data of
 every lazy `Dataset`. It never touches the target file. Phase 2 (*apply*) opens the file and
-writes the tree, rolling back what it wrote if anything fails.
+writes the tree.
 """
 
 from __future__ import annotations
@@ -29,14 +29,12 @@ from h5t._compile import (
     _check_group,
     _extract_alias,
     _extract_forbid_extras,
-    _field_glob,
     _filesystem_path,
     _normalize_root,
     _resolve_group_attrs_type,
     _split_annotation,
 )
-from h5t._errors import SchemaError, ValidationError
-from h5t._spec import attr_path, child_path
+from h5t._errors import SchemaError, ValidationError, attr_path, child_path
 
 
 @dataclasses.dataclass
@@ -148,7 +146,7 @@ def _plan_member(value: Any, path: str) -> _GroupPlan | _DatasetPlan:
     return _DatasetPlan(data=np.asarray(value), attrs={})
 
 
-def _plan_collection(value: Mapping[str, Any], path: str, pattern: Any = None) -> _GroupPlan:
+def _plan_collection(value: Mapping[str, Any], path: str) -> _GroupPlan:
     plan = _GroupPlan()
     for key, item in value.items():
         item_path = child_path(path, str(key))
@@ -156,8 +154,6 @@ def _plan_collection(value: Mapping[str, Any], path: str, pattern: Any = None) -
             raise ValidationError(
                 item_path, "collection key must be a non-empty str without '/' and not '.' or '..'"
             )
-        if pattern is not None and pattern.match(key) is None:
-            raise ValidationError(item_path, "collection key does not match the field's Glob")
         plan.children[key] = _plan_member(item, item_path)
     return plan
 
@@ -182,12 +178,7 @@ def _plan_group(group: Group[Any], path: str) -> _GroupPlan:
         value = _read_field(owner, group, name)
         if value is None and _split_annotation(owner, name, field.annotation)[2]:
             continue
-        if isinstance(value, Mapping):
-            plan.children[h5_name] = _plan_collection(
-                value, member_path, _field_glob(owner, name, field)
-            )
-        else:
-            plan.children[h5_name] = _plan_member(value, member_path)
+        plan.children[h5_name] = _plan_member(value, member_path)
     return plan
 
 
@@ -222,42 +213,8 @@ def _write_plan(group: h5py.Group, plan: _GroupPlan, path: str) -> None:
             _write_attrs(node, child.attrs, cpath)
 
 
-def _clear(node: h5py.Group) -> None:
-    node.clear()
-    node.attrs.clear()
-
-
-@dataclasses.dataclass
-class _Undo:
-    """What to remove if writing fails; filled in *before* the file is mutated."""
-
-    delete: str | None = None
-    clear: str | None = None
-
-    def rollback(self, file: h5py.File) -> None:
-        if self.delete is not None:
-            if self.delete in file:
-                del file[self.delete]
-        elif self.clear is not None:
-            _clear(typing.cast(h5py.Group, file[self.clear]))
-
-
-def _first_missing(file: h5py.File, root: str) -> str:
-    current = ""
-    for part in root.strip("/").split("/"):
-        current = f"{current}/{part}"
-        if current not in file:
-            return current
-    return root
-
-
-def _prepare_target(file: h5py.File, root: str, overwrite: bool, undo: _Undo) -> None:
-    """Make ``root`` writable, clearing it first when ``overwrite`` is set.
-
-    ``undo`` is updated before each mutation so a failure midway can still be rolled
-    back. Like ``del group[name]`` in h5py, clearing existing content is destructive and
-    is not undone if the write then fails; rollback only empties the group again.
-    """
+def _prepare_target(file: h5py.File, root: str, overwrite: bool) -> h5py.Group:
+    """Return ``root`` ready to write into, clearing it first when ``overwrite`` is set."""
     try:
         node = file.get(root)
     except (TypeError, ValueError, KeyError) as exc:
@@ -267,12 +224,12 @@ def _prepare_target(file: h5py.File, root: str, overwrite: bool, undo: _Undo) ->
             raise ValidationError(root, "expected a group, found a dataset")
         if (len(node) or len(node.attrs)) and not overwrite:
             raise ValidationError(root, "group already exists and is not empty")
-        undo.clear = root
-        _clear(node)
-        return
-    undo.delete = _first_missing(file, root)
+        if overwrite:
+            node.clear()
+            node.attrs.clear()
+        return node
     try:
-        file.require_group(root)
+        return file.require_group(root)
     except (TypeError, ValueError, OSError) as exc:
         raise ValidationError(root, f"cannot create root: {exc}") from exc
 
@@ -284,40 +241,9 @@ def _apply(
     plan: _GroupPlan,
     overwrite: bool,
 ) -> None:
-    created_file = mode != "a" or not os.path.exists(filename)
-    undo = _Undo()
     with h5py.File(filename, mode) as h5file:
-        try:
-            _prepare_target(h5file, root, overwrite, undo)
-            _write_plan(typing.cast(h5py.Group, h5file[root]), plan, root)
-        except BaseException as exc:
-            _roll_back(h5file, filename, undo, created_file, exc)
-            raise
-
-
-def _roll_back(
-    h5file: h5py.File,
-    filename: str,
-    undo: _Undo,
-    created_file: bool,
-    exc: BaseException,
-) -> None:
-    """Undo a failed write, attaching any rollback problem to ``exc`` as a note."""
-    if created_file:
-        h5file.close()
-        try:
-            os.remove(filename)
-        except OSError as remove_exc:
-            exc.add_note(
-                f"h5t: could not remove the partially written file {filename!r}: {remove_exc}"
-            )
-        return
-    try:
-        undo.rollback(h5file)
-    except Exception as rollback_exc:
-        exc.add_note(
-            f"h5t: rollback failed, {filename!r} may contain partially written data: {rollback_exc}"
-        )
+        target = _prepare_target(h5file, root, overwrite)
+        _write_plan(target, plan, root)
 
 
 def _dump_group(

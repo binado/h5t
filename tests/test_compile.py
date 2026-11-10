@@ -9,7 +9,7 @@ from typing import Annotated, Any
 import h5py
 import numpy as np
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field
 
 import h5t
 from h5t._compile import _read_array
@@ -21,10 +21,6 @@ from h5t._compile import _read_array
         ("value: list[int]", "unsupported child field annotation"),
         ("value: int", "unsupported child field annotation"),
         ("value: Annotated[np.ndarray, Field(alias='a/b')]", "cannot contain"),
-        (
-            "value: Annotated[dict[str, Child], h5t.Glob('a'), h5t.Glob('b')]",
-            "may appear only once",
-        ),
     ],
 )
 def test_invalid_declarations(declaration: str, match: str) -> None:
@@ -77,6 +73,7 @@ def test_removed_api_is_absent() -> None:
         "Eager",
         "Payload",
         "ConversionError",
+        "Glob",
     )
     for name in removed:
         assert not hasattr(h5t, name)
@@ -135,7 +132,7 @@ def test_generic_group_with_open_typevar_dataset_compiles_and_loads(tmp_path: Pa
 def test_plain_array_fields_are_read_from_raw_datasets(tmp_path: Path) -> None:
     class Plain(h5t.Group):
         values: np.ndarray
-        runs: Annotated[dict[str, np.ndarray], h5t.Glob("r*")]
+        runs: dict[str, np.ndarray]
 
     class Sub(Plain):
         pass
@@ -157,19 +154,6 @@ def test_plain_array_fields_are_read_from_raw_datasets(tmp_path: Path) -> None:
         assert loaded.values.tolist() == [0, 1, 2]
     assert isinstance(Plain.model_validate_hdf5(path).runs["r1"], np.ndarray)
     assert _read_array(np.zeros(2)).shape == (2,)
-
-
-def test_glob_filters_only_a_live_group_view(tmp_path: Path) -> None:
-    from h5t._h5view import _GroupView
-
-    path = tmp_path / "g.h5"
-    with h5py.File(path, "w") as f:
-        for name in ("a1", "a2", "b1"):
-            f[name] = np.zeros(1)
-    adapter = TypeAdapter(Annotated[dict[str, Any], h5t.Glob("a*")])
-    with h5py.File(path, "r") as f:
-        assert sorted(adapter.validate_python(_GroupView(f))) == ["a1", "a2"]
-    assert sorted(adapter.validate_python({"a1": 1, "b1": 2})) == ["a1", "b1"]
 
 
 def test_explicit_namespace_rebuild_and_self_reference(tmp_path: Path) -> None:

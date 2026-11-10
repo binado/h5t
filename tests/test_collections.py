@@ -1,4 +1,4 @@
-"""Dynamic collections: ``dict[str, T]`` fields and the ``h5t.Glob`` filter."""
+"""Dynamic collections: ``dict[str, T]`` fields."""
 
 from __future__ import annotations
 
@@ -135,19 +135,6 @@ def test_group_items_bind_independently(tmp_path: Path) -> None:
     assert set(Root.model_validate_hdf5(_write(tmp_path / "a.h5", build)).mats) == {"a", "b"}
 
 
-def test_glob_filters_case_sensitively_and_skips_unmatched(tmp_path: Path) -> None:
-    def build(f: h5py.File) -> None:
-        g = f.create_group("chains")
-        for n in ("chain_1", "chain_2", "Chain_3", "other", "chain_10"):
-            g.create_dataset(n, data=np.arange(2))
-
-    class Root(h5t.Group):
-        chains: Annotated[dict[str, h5t.Dataset], h5t.Glob("chain_?")]
-
-    out = Root.model_validate_hdf5(_write(tmp_path / "a.h5", build))
-    assert set(out.chains) == {"chain_1", "chain_2"}
-
-
 def test_empty_group_gives_empty_dict(tmp_path: Path) -> None:
     class Root(h5t.Group):
         snaps: dict[str, Snapshot]
@@ -248,10 +235,6 @@ def test_extras_forbid_allows_collection(tmp_path: Path) -> None:
         (dict[str, dict[str, Snapshot]], "nested collections"),
         (dict[str, Snapshot | None], "cannot be optional"),
         (dict[str, Annotated[Snapshot, Field(alias="x")]], "alias cannot annotate"),
-        (dict[str, Annotated[Snapshot, h5t.Glob("x")]], "Glob cannot annotate"),
-        (Annotated[np.ndarray, h5t.Glob("x")], "Glob applies only"),
-        (Annotated[dict[str, Snapshot], h5t.Glob("a/b")], "cannot contain"),
-        (Annotated[dict[str, Snapshot], h5t.Glob("")], "non-empty"),
     ],
 )
 def test_schema_errors(annotation: Any, message: str) -> None:

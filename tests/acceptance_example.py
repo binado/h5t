@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Any
 
 import numpy as np
 from jaxtyping import Float
@@ -44,7 +44,6 @@ class Result(h5t.Group[ResultAttrs]):
     nested: Nested
     untyped: UntypedGroup
     snaps: dict[str, Nested]
-    chains: Annotated[dict[str, h5t.Dataset], h5t.Glob("chain_?")]
 
 
 result: Result = Result.model_validate_hdf5(Path("result.h5"))

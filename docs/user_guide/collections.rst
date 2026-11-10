@@ -10,12 +10,6 @@ Attributes on the collection's own group are ignored.
 ``T`` is any :class:`h5t.Group` subclass, :class:`h5t.Dataset` (or ``Dataset[Attrs]``),
 ``np.ndarray``, or jaxtyping array.
 
-Filtering with ``Glob``
------------------------
-
-``Annotated[..., h5t.Glob("chain_?")]`` keeps only children whose name matches the
-shell-style pattern (case-sensitive; it may not be empty or contain ``/``).
-
 .. code-block:: python
 
    from typing import Annotated
@@ -27,7 +21,7 @@ shell-style pattern (case-sensitive; it may not be empty or contain ``/``).
    import h5t
 
    with h5py.File("runs.h5", "w") as f:
-       for name in ("chain_1", "chain_2", "other"):
+       for name in ("chain_1", "chain_2"):
            f.create_dataset(f"chains/{name}", data=np.arange(3.0))
        f.create_group("snaps/s1").attrs["step"] = 1
        f.create_group("snaps/s2").attrs["step"] = 2
@@ -43,7 +37,7 @@ shell-style pattern (case-sensitive; it may not be empty or contain ``/``).
 
    class Run(h5t.Group):
        snaps: dict[str, Snapshot]
-       chains: Annotated[dict[str, h5t.Dataset], h5t.Glob("chain_?")]
+       chains: dict[str, h5t.Dataset]
        raw: Annotated[dict[str, Snapshot], Field(alias="Raw Data")] = Field(
            default_factory=dict
        )
@@ -58,8 +52,8 @@ Rules and limits
 - A missing group follows the usual rules (a default or ``default_factory``, else a
   :class:`h5t.ValidationError`; ``| None`` alone does not make it optional).
 - Keys must be ``str``. Items cannot be scalars, optional, nested collections, or carry
-  ``Field(alias=...)`` / ``Glob``.
+  ``Field(alias=...)``.
 - Array and ``Dataset`` items share the owner group's jaxtyping dimension bindings; nested
   ``Group`` items bind independently.
-- On :meth:`h5t.Group.model_dump_hdf5`, collection keys must be non-empty, contain no ``/``
-  and match the field's ``Glob``; otherwise the item would not load back.
+- On :meth:`h5t.Group.model_dump_hdf5`, collection keys must be non-empty, contain no ``/``,
+  and not be ``"."`` or ``".."``; otherwise the item would not load back.

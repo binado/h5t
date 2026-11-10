@@ -3,13 +3,11 @@
 from h5t._array import Dataset
 from h5t._compile import Group
 from h5t._errors import H5TError, SchemaError, ValidationError
-from h5t._spec import Glob
 
 __version__ = "0.4.0"
 
 __all__ = [
     "Dataset",
-    "Glob",
     "Group",
     "H5TError",
     "SchemaError",

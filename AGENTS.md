@@ -30,22 +30,22 @@ groups are **detached**: every file handle is closed before `model_validate_hdf5
 demand. Both `Group[T]` and `Dataset[T]` are generic over `T` (defaulting to `Mapping[str, Any]`
 or accepting a `pydantic.BaseModel` subclass for strongly typed `.attrs: T`).
 
-Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_spec`/`_errors` → `_h5view`
+Dependency direction: `_cli`/`_write` → `_compile` → `_array`/`_errors` → `_h5view`
 (a leaf: imports only h5py/numpy). The one
 reverse edge is `Group.model_dump_hdf5`, which imports `_write` inside the method to avoid a
 real import cycle (the style guide allows deferred imports for that).
 
-- **`_spec.py`** — `Glob` marker and HDF5 path formatters.
+- **`_errors.py`** — `H5TError`, `SchemaError`, `ValidationError`, and HDF5 path formatters.
 - **`_h5view.py`** — `_GroupView`, a read-only `Mapping` over an open `h5py.Group`, plus the raw
-  attribute helpers (`_raw_attrs`, `_normalized_attrs`) and `_ghost`.
+  attribute helpers (`_normalized_attrs`) and `_ghost`.
 - **`_array.py`** — `Dataset[T]`, the detached lazily-read dataset with typed `.attrs: T`,
-  `h5py`-style indexing (`ds[()]`, `ds[:]`, `ds[:10]`), `.data`, `.read()`, `.open()`, and
+  `h5py`-style indexing (`ds[()]`, `ds[:]`, `ds[:10]`), `.data`, `.open()`, and
   `__array__()`.
 - **`_compile.py`** — `Group[T]`, stateless declaration checks over Pydantic metadata,
   annotation helpers, jaxtyping core-schema hook, and the loader (`model_validate_hdf5`).
 - **`_write.py`** — `Group.model_dump_hdf5`: a *plan* phase that walks an in-memory `Group`
   tree without touching the file (it trusts construction-time validation and checks only what
-  HDF5 imposes), then an *apply* phase that writes and rolls back on failure.
+  HDF5 imposes), then an *apply* phase that writes it.
 - **`_cli.py`** — `h5t check`: import `pkg.mod:Class`, call `Class.model_validate_hdf5`, exit 0
   (ok) / 1 (`ValidationError`) / 2 (import, schema, usage, or I/O error).
 
@@ -109,7 +109,6 @@ Each *type* converts raw input itself:
   aliases of them): `_rewrite_annotation` wraps each array leaf in `Annotated[..., _JaxtypingSchema | _NdarraySchema]`
   before Pydantic builds the model's core schema, so `_read_h5py` or `_read_array` runs via
   Pydantic's standard `Annotated` hook without walking or rewriting raw `CoreSchema` dicts.
-- `Glob.__get_pydantic_core_schema__` filters only a `_GroupView` (`fnmatch.fnmatchcase`).
 - `Group._h5t_jaxtyping_scope` rejects any attribute on a `extra="forbid"` group with untyped
   attrs, and freezes loaded untyped attrs into a `MappingProxyType`.
 
@@ -125,8 +124,8 @@ were checked when the instance was built, so `_write._plan_group` walks runtime 
 Typed attributes come from `model_dump(mode="python", by_alias=True, include=<declared fields>)`,
 so serializers and aliases are Pydantic's; Nullable field annotations determine which attributes holding `None`
 are left out (a required `Any` attribute holding `None` is an error, not silently skipped). The
-writer still checks what Pydantic cannot know: collection keys, `Glob` patterns on in-memory
-dicts, untyped attributes on an `extra="forbid"` group, and values h5py cannot store. An instance
+writer still checks what Pydantic cannot know: collection keys, untyped attributes on an
+`extra="forbid"` group, and values h5py cannot store. An instance
 built with `model_construct` or mutated after construction is written as it is.
 
 Errors keep pydantic's wording; `_h5_error_path` walks the first error's `loc` through the

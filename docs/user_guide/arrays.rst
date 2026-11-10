@@ -43,7 +43,6 @@ Using a ``Dataset``
    first_hundred = samples[:100]  # partial slice reads only those elements from disk
    complete = samples[()]         # full read via [()], [:], or .data reads and caches
    assert samples.data is complete
-   assert samples.read() is complete
 
    with samples.open() as live:   # explicit live h5py.Dataset handle; closed on exit
        tail = live[-10:]
@@ -67,7 +66,7 @@ A loaded group is a snapshot, with deliberate lazy-read semantics for :class:`h5
   ``np.ndarray`` fields reflect the file during :meth:`h5t.Group.model_validate_hdf5`.
 - A ``Dataset``'s partial slice (``ds[:10]``) reads from the file on demand without caching the
   full array.
-- A ``Dataset``'s first full read (``ds[()]``, ``ds[:]``, ``.data``, or ``.read()``) reads the
+- A ``Dataset``'s first full read (``ds[()]``, ``ds[:]``, or ``.data``) reads the
   complete array from the file at that moment and caches it permanently on the instance.
 - ``.open()`` always opens the current file and yields the live ``h5py.Dataset``.
 - :meth:`h5t.Group.model_dump_hdf5` copies lazy datasets: an uncached ``Dataset`` is read from
