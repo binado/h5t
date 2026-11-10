@@ -1,36 +1,40 @@
 h5t
 ===
 
-``h5t`` turns HDF5 groups into plain, typed Python objects, and writes them back using
-the same description. You describe the layout of your file once as a class; h5t reads it,
-checks it, and closes the file for you. Large arrays can be loaded lazily, so you only
-pay for the data you actually use.
+``h5t`` turns HDF5 groups into typed, detached Pydantic objects, and writes them back using
+the same description. You describe the layout of your file once as an :class:`h5t.Group`
+subclass; ``h5t`` reads it, validates attributes with Pydantic, and closes the file for you.
+Shapes and dtypes are checked only for fields you annotate with jaxtyping (see
+:doc:`user_guide/jaxtyping`). Plain ``np.ndarray`` fields are read eagerly; child
+:class:`h5t.Dataset` fields are loaded lazily, so you only pay for the slices you actually
+read.
 
 .. code-block:: python
 
-   import dataclasses
-
    import numpy as np
+   from pydantic import BaseModel
 
    import h5t
 
 
-   @h5t.group()
-   @dataclasses.dataclass
-   class Result:
+   class ResultAttrs(BaseModel):
        version: int
+
+
+   class Result(h5t.Group[ResultAttrs]):
        values: np.ndarray
 
 
-   h5t.save(Result(version=1, values=np.arange(3.0)), "result.h5", mode="w")
-   result = h5t.load(Result, "result.h5")
-   print(result.version, result.values)
+   group = Result(attrs=ResultAttrs(version=1), values=np.arange(3.0))
+   group.model_dump_hdf5("result.h5", mode="w")
+   result = Result.model_validate_hdf5("result.h5")
+   print(result.attrs.version, result.values)
 
 Where to start
 --------------
 
 - :doc:`getting_started/index`: install ``h5t`` and save and load your first file.
-- :doc:`user_guide/index`: how to describe your files, work with arrays and collections,
+- :doc:`user_guide/index`: how to describe your files, work with datasets and collections,
   write files, and check them from the command line.
 - :doc:`reference/index`: every function and class.
 

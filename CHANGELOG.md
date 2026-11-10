@@ -7,6 +7,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** Pydantic now owns the model lifecycle. HDF5 declaration checks run on
+  load/write before file access, rather than at class definition. Native Pydantic
+  model-building and unresolved-annotation errors propagate unchanged (CLI exit 2).
+  Removed `localns=`; use `Model.model_rebuild(_types_namespace={...})` instead.
+- Nested groups and typed attributes are written using their runtime model fields,
+  including subclass fields in direct children and collection items. Removed the
+  compiled schema IR, caches, and custom Group metaclass.
+
+- **Breaking:** the API is rebuilt around generic Pydantic models: `h5t.Group[T]` and
+  `h5t.Dataset[T]` replace the `@h5t.group`/`@h5t.dataset` records. Load with
+  `Group.model_validate_hdf5(path)` and write with `group.model_dump_hdf5(path)`; the typed
+  attribute model is `.attrs: T`. Loaded groups are detached (all file handles are closed
+  before loading returns); a `Dataset` reads slices or the full array lazily.
+- `overwrite=True` behaves like h5py: it deletes the target group's contents and then
+  writes, so a failed overwrite leaves the group empty.
+- Attribute validators no longer run again when dumping.
+- **Breaking:** loading is a single Pydantic validation pass over a lazy view of the HDF5
+  group. Errors use Pydantic's wording with the location translated to an HDF5 path, e.g.
+  `/values: Field required` or `/@count: Input should be a valid integer`.
+- **Breaking:** Pydantic's field semantics apply on load: `T | None` without a default is
+  required (write `= None`), and a declared default is not re-validated unless
+  `validate_default=True`.
+- **Breaking:** a `mode="before"` model validator on a `Group` receives a read-only mapping
+  view of the HDF5 group instead of a dict. Attributes are looked up under the reserved key
+  `"/attrs"`; a *child* named `attrs` is never read as the attributes, and is reported as an
+  undeclared child under `extra="forbid"`.
+
+### Fixed
+
+- Importing h5t no longer breaks unrelated Pydantic models that use jaxtyping over other
+  array backends (jax, torch, ...): the schema hook installed on `jaxtyping.AbstractArray`
+  defers unsupported array types to Pydantic's default schema, and h5t raises its
+  `SchemaError` at load/write time instead (via `_unwrap_jaxtyping`).
+
+- Plain ndarray aliases, including chained PEP 695 aliases, read HDF5 datasets through
+  the Pydantic schema reader hook.
+
+- Generic groups with `Dataset[T]` fields compile.
+- A failing rollback of any exception type can no longer mask the original write error.
+
 ### Documentation
 
 - Sphinx documentation site (getting started, user guide, API reference) for Read the Docs.

@@ -2,72 +2,76 @@
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Any
 
 import numpy as np
 from jaxtyping import Float
+from pydantic import BaseModel
 
 import h5t
 
 
-@dataclasses.dataclass
-class Recording:
+class RecordingAttrs(BaseModel):
     unit: str
-    payload: np.ndarray
-    attrs: Mapping[str, Any]
 
 
-@h5t.dataset(data="payload", attrs="attrs")
-@dataclasses.dataclass
-class DecoratedRecording:
-    unit: str
-    payload: np.ndarray
-    attrs: Mapping[str, Any]
-
-
-@h5t.group()
-@dataclasses.dataclass
-class Nested:
+class NestedAttrs(BaseModel):
     label: str
 
 
-@h5t.group()
-@dataclasses.dataclass
-class Result:
+class ResultAttrs(BaseModel):
     version: int
-    values: np.ndarray
-    samples: h5t.LazyArray
-    eager: Annotated[h5t.LazyArray, h5t.Eager()]
-    fisher: Float[np.ndarray, "n n"]
-    lazy_fisher: Float[h5t.LazyArray, "n _"]
-    nested: Nested
-    snaps: dict[str, Nested]
-    recording: DecoratedRecording
-    marked: Annotated[Recording, h5t.Payload("payload", attrs="attrs")]
-    optional: str | None
+    optional: str | None = None
     defaulted: int = 3
 
 
-result: Result = h5t.load(Result, Path("result.h5"))
+class Nested(h5t.Group[NestedAttrs]):
+    pass
+
+
+class UntypedGroup(h5t.Group):
+    values: np.ndarray
+
+
+class Result(h5t.Group[ResultAttrs]):
+    values: np.ndarray
+    samples: h5t.Dataset
+    fisher: Float[np.ndarray, "n n"]
+    lazy_fisher: Float[h5t.Dataset, "n _"]
+    recording: Float[h5t.Dataset[RecordingAttrs], "n"]
+    nested: Nested
+    untyped: UntypedGroup
+    snaps: dict[str, Nested]
+
+
+result: Result = Result.model_validate_hdf5(Path("result.h5"))
 fisher: np.ndarray = result.fisher
-lazy_fisher: h5t.LazyArray = result.lazy_fisher
-version: int = result.version
+lazy_fisher: h5t.Dataset[Mapping[str, Any]] = result.lazy_fisher
+version: int = result.attrs.version
+optional: str | None = result.attrs.optional
+defaulted: int = result.attrs.defaulted
 snaps: dict[str, Nested] = result.snaps
 values: np.ndarray = result.values
-samples: h5t.LazyArray = result.samples
+samples: h5t.Dataset[Mapping[str, Any]] = result.samples
+samples_attrs: Mapping[str, Any] = result.samples.attrs
 data: np.ndarray = result.samples.data
-shape: tuple[int, ...] = result.eager.shape
+sliced: np.ndarray = result.samples[:10]
+shape: tuple[int, ...] = result.samples.shape
 nested: Nested = result.nested
-label: str = result.nested.label
-optional: str | None = result.optional
-defaulted: int = result.defaulted
-recording: DecoratedRecording = result.recording
-unit: str = result.recording.unit
-payload: np.ndarray = result.recording.payload
-attrs: Mapping[str, Any] = result.recording.attrs
-marked_payload: np.ndarray = result.marked.payload
+label: str = result.nested.attrs.label
+untyped_attrs: Mapping[str, Any] = result.untyped.attrs
+recording: h5t.Dataset[RecordingAttrs] = result.recording
+unit: str = result.recording.attrs.unit
+full: np.ndarray = result.recording[()]
 
-saved: None = h5t.save(result, Path("out.h5"), root="/run", mode="a", overwrite=True)
+saved: None = result.model_dump_hdf5(Path("out.h5"), root="/run", mode="a", overwrite=True)
+
+
+# Negative cases: each line must stay a type error, so the ignores below fail
+# ``ty check`` (unused-ignore) if the public typing surface loosens.
+bad_unit: int = result.recording.attrs.unit  # ty: ignore[invalid-assignment]
+bad_version: str = result.attrs.version  # ty: ignore[invalid-assignment]
+bad_untyped: h5t.Dataset[RecordingAttrs] = result.samples  # ty: ignore[invalid-assignment]
+bad_mode: None = result.model_dump_hdf5(Path("out.h5"), mode="r")  # ty: ignore[invalid-argument-type]

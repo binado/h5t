@@ -1,6 +1,16 @@
-"""Public exception types for schema compilation and detached loading."""
+"""Public exception types and HDF5 path helpers."""
 
 from __future__ import annotations
+
+
+def child_path(parent: str, name: str) -> str:
+    """Join an absolute group path and one immediate child name."""
+    return f"/{name}" if parent == "/" else f"{parent.rstrip('/')}/{name}"
+
+
+def attr_path(parent: str, name: str) -> str:
+    """Return a display path for an HDF5 attribute."""
+    return f"{parent.rstrip('/') or '/'}@{name}"
 
 
 class H5TError(Exception):
@@ -10,12 +20,14 @@ class H5TError(Exception):
 class SchemaError(H5TError):
     """A schema class declaration is incoherent or unsupported.
 
-    Usually raised right where the class is decorated.
+    Raised during HDF5 operations, before opening the file. Type-owned schema hooks
+    may also raise this while Pydantic builds a model. Native Pydantic model-building
+    and unresolved-annotation errors propagate unchanged.
     """
 
 
 class ValidationError(H5TError):
-    """An HDF5 node (or a record being saved) does not conform to its schema.
+    """An HDF5 node (or a group being dumped) does not conform to its schema.
 
     The message starts with where the problem is in the file.
 
@@ -38,10 +50,3 @@ class ValidationError(H5TError):
         super().__init__(f"{path}: {message}")
         self.path = path
         self.message = message
-
-
-class ConversionError(ValidationError):
-    """An ``Attr`` converter or serializer raised.
-
-    A subclass of `ValidationError`, so it carries the same ``path`` and ``message``.
-    """

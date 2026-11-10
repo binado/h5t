@@ -1,58 +1,54 @@
-Arrays and lazy payloads
+Arrays and lazy datasets
 ========================
 
-Three ways to declare a dataset field
--------------------------------------
+Two ways to declare a dataset field
+-----------------------------------
 
 ``np.ndarray``
-    The complete payload is read into an ndarray while the file is open.
+    The complete array is read eagerly into an ``ndarray`` while the file is open, and any
+    attributes on the dataset are ignored.
 
-:class:`h5t.LazyArray`
+:class:`h5t.Dataset` / ``h5t.Dataset[T]``
     A detached snapshot of the dataset's metadata (``filename``, ``path``, ``shape``,
-    ``dtype``). The payload is read on first access. A ``LazyArray`` subclass is accepted
-    too.
+    ``dtype``) and validated ``attrs: T``. The array data is read on demand when indexed
+    or accessed via ``.data``. Custom ``Dataset`` subclasses are preserved too.
 
-:class:`h5t.Eager`
-    ``Annotated[LazyArray, Eager()]`` is still a ``LazyArray``, but its payload is cached
-    during ``h5t.load``. Combined with :class:`h5t.Payload` it is allowed only when the
-    payload field is a ``LazyArray``; an ``np.ndarray`` payload is already eager.
-
-``LazyArray`` can be a member annotation directly (a child dataset with no attributes),
-or the payload field of a dataset record.
-
-Using a ``LazyArray``
----------------------
+Using a ``Dataset``
+-------------------
 
 .. code-block:: python
 
-   import dataclasses
-
    import h5py
    import numpy as np
+   from pydantic import BaseModel
 
    import h5t
 
    with h5py.File("arrays.h5", "w") as f:
-       f["samples"] = np.arange(1000.0)
+       ds = f.create_dataset("samples", data=np.arange(1000.0))
+       ds.attrs["unit"] = "V"
 
 
-   @h5t.group()
-   @dataclasses.dataclass
-   class Run:
-       samples: h5t.LazyArray
+   class SampleAttrs(BaseModel):
+       unit: str
 
 
-   lazy = h5t.load(Run, "arrays.h5").samples
-   print(lazy.filename, lazy.path, lazy.shape, lazy.dtype, lazy.ndim)
+   class Run(h5t.Group):
+       samples: h5t.Dataset[SampleAttrs]
 
-   complete = lazy.data           # first access reads and caches an ndarray
-   assert lazy.read() is complete
 
-   with lazy.open() as live:      # fresh file view; closed on exit
-       first_hundred = live[:100]
+   samples = Run.model_validate_hdf5("arrays.h5").samples
+   print(samples.filename, samples.path, samples.shape, samples.dtype, samples.attrs.unit)
 
-``h5t.load`` closes every handle on normal and exceptional exits, and so does
-:meth:`h5t.LazyArray.open`.
+   first_hundred = samples[:100]  # partial slice reads only those elements from disk
+   complete = samples[()]         # full read via [()], [:], or .data reads and caches
+   assert samples.data is complete
+
+   with samples.open() as live:   # explicit live h5py.Dataset handle; closed on exit
+       tail = live[-10:]
+
+:meth:`h5t.Group.model_validate_hdf5` closes every file handle on normal and exceptional
+exits, and so does :meth:`h5t.Dataset.open`.
 
 ``NDArray`` aliases
 -------------------
@@ -64,13 +60,14 @@ real array type. The dtype parameter is not validated: use :doc:`jaxtyping` for 
 Snapshot consistency
 --------------------
 
-A loaded record is a snapshot, with one deliberate exception:
+A loaded group is a snapshot, with deliberate lazy-read semantics for :class:`h5t.Dataset`:
 
-- Group and dataset attributes, dataset shape/dtype/path, eager datasets and plain
-  arrays reflect the file during loading (``h5t.load()``).
-- A lazy dataset's first ``.data`` / ``.read()`` observes the file at that later moment
-  and caches the resulting array permanently.
-- ``.open()`` always opens the current file and current dataset. It may therefore observe
-  replacements or fail if the source was changed or deleted.
-- ``h5t.save`` copies lazy payloads: an uncached one is read from its source file at
-  save time, without caching it on your record.
+- Group and dataset ``attrs``, dataset ``shape`` / ``dtype`` / ``path``, and plain
+  ``np.ndarray`` fields reflect the file during :meth:`h5t.Group.model_validate_hdf5`.
+- A ``Dataset``'s partial slice (``ds[:10]``) reads from the file on demand without caching the
+  full array.
+- A ``Dataset``'s first full read (``ds[()]``, ``ds[:]``, or ``.data``) reads the
+  complete array from the file at that moment and caches it permanently on the instance.
+- ``.open()`` always opens the current file and yields the live ``h5py.Dataset``.
+- :meth:`h5t.Group.model_dump_hdf5` copies lazy datasets: an uncached ``Dataset`` is read from
+  its source file at dump time without caching it on your instance.
