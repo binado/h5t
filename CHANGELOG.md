@@ -30,8 +30,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rejects attributes on a group with untyped attributes; declare `Group[T]` with
   `extra="forbid"` on `T` for that.
 - **Breaking:** untyped group attributes are read-only when the group is built in memory
-  too (`Group(attrs={...}).attrs` is a `MappingProxyType`), as they already were after
-  loading. Build a new group to change them.
+  too, as they already were after loading. Build a new group to change them.
+- Untyped attributes of a `Group` or `Dataset` are a read-only `dict` rather than a
+  `MappingProxyType`, so such groups can be deep-copied, pickled and dumped with
+  `model_dump()`/`model_dump_json()` without a serializer warning.
 - **Breaking:** untyped `Dataset` attributes are converted to Python values (`int`, `str`,
   ...) as untyped group attributes already were, instead of NumPy scalars.
 - Nested groups and typed attributes are written using their runtime model fields,

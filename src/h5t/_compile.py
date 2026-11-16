@@ -7,7 +7,6 @@ import posixpath
 import types
 import typing
 from collections.abc import Mapping
-from types import MappingProxyType
 from typing import Annotated, Any, Generic, Literal, Self
 
 import h5py
@@ -30,7 +29,7 @@ from typing_extensions import TypeVar
 
 from h5t._array import Dataset, T, _is_mapping_type
 from h5t._errors import SchemaError, ValidationError, _located_error
-from h5t._h5view import ATTRS_KEY, _ghost, _GroupView
+from h5t._h5view import ATTRS_KEY, _FrozenAttrs, _ghost, _GroupView
 
 
 def _schema_error(owner: type, field: str, message: str) -> SchemaError:
@@ -385,9 +384,9 @@ class Group(BaseModel, Generic[T]):
         # Attribute dims must not bind together with the dims of the group's children.
         with jaxtyped("context"):
             attrs = handler(value)
-        # Untyped attributes are a read-only snapshot, loaded or built in memory. Pydantic
-        # validated them into a new dict, so the caller's own mapping is not frozen.
-        return MappingProxyType(attrs) if isinstance(attrs, dict) else attrs
+        # Untyped attributes are a read-only snapshot, loaded or built in memory. The copy
+        # leaves the caller's own mapping neither frozen nor aliased.
+        return _FrozenAttrs(attrs) if isinstance(attrs, Mapping) else attrs
 
     @model_validator(mode="wrap")
     @classmethod

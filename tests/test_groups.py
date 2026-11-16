@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import copy
+import json
+import pickle
+import warnings
 from pathlib import Path
+from typing import Any
 
 import h5py
 import numpy as np
@@ -113,6 +118,57 @@ def test_untyped_group_attrs_are_read_only_in_memory_and_loaded(tmp_path: Path) 
     assert loaded == group
     with pytest.raises(TypeError):
         loaded.attrs["count"] = 2  # type: ignore[index]
+
+
+@pytest.mark.parametrize("loaded", [False, True])
+def test_group_with_untyped_attrs_copies_pickles_and_dumps(tmp_path: Path, loaded: bool) -> None:
+    group = h5t.Group(attrs={"count": 1})
+    if loaded:
+        group.model_dump_hdf5(tmp_path / "attrs.h5")
+        group = h5t.Group.model_validate_hdf5(tmp_path / "attrs.h5")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # Pydantic warns about a mapping it cannot serialize
+        assert group.model_dump() == {"attrs": {"count": 1}}
+        assert json.loads(group.model_dump_json()) == {"attrs": {"count": 1}}
+    for clone in (
+        group.model_copy(deep=True),
+        copy.deepcopy(group),
+        pickle.loads(pickle.dumps(group)),
+    ):
+        assert clone == group
+        with pytest.raises(TypeError):
+            clone.attrs["count"] = 2  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda attrs: attrs.update(count=2),
+        lambda attrs: attrs.pop("count"),
+        lambda attrs: attrs.popitem(),
+        lambda attrs: attrs.clear(),
+        lambda attrs: attrs.setdefault("other", 1),
+        lambda attrs: attrs.__delitem__("count"),
+        lambda attrs: attrs.__ior__({"other": 1}),
+    ],
+)
+def test_untyped_attrs_reject_every_mutating_method(mutate: Any) -> None:
+    for attrs in (
+        h5t.Group(attrs={"count": 1}).attrs,
+        h5t.Dataset(np.zeros(2), {"count": 1}).attrs,
+    ):
+        with pytest.raises(TypeError, match="read-only"):
+            mutate(attrs)
+        assert attrs == {"count": 1}
+
+
+def test_dataset_with_untyped_attrs_copies_and_pickles() -> None:
+    dataset = h5t.Dataset(np.arange(3), {"unit": "m"})
+    for clone in (copy.deepcopy(dataset), pickle.loads(pickle.dumps(dataset))):
+        assert clone == dataset
+        with pytest.raises(TypeError):
+            clone.attrs["unit"] = "s"  # type: ignore[index]
 
 
 def test_forward_reference_to_a_group_defined_later_in_the_module_resolves(tmp_path: Path) -> None:

@@ -7,7 +7,6 @@ import typing
 import weakref
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from types import MappingProxyType
 from typing import Any, ClassVar, Generic, Self
 
 import h5py
@@ -19,7 +18,7 @@ from pydantic_core import PydanticCustomError, core_schema
 from typing_extensions import TypeVar
 
 from h5t._errors import SchemaError, ValidationError, _located_error
-from h5t._h5view import _GroupView, _normalized_attrs
+from h5t._h5view import _FrozenAttrs, _GroupView, _normalized_attrs
 
 _DATA_NOT_LOADED = object()
 
@@ -175,8 +174,7 @@ class Dataset(Generic[T]):
         elif isinstance(attrs, BaseModel):
             self._h5t_attrs = typing.cast(T, attrs)
         else:
-            raw_map = {} if attrs is None else dict(attrs)
-            self._h5t_attrs = typing.cast(T, MappingProxyType(raw_map))
+            self._h5t_attrs = typing.cast(T, _FrozenAttrs({} if attrs is None else attrs))
 
     @classmethod
     def _from_node(cls, node: h5py.Dataset, attrs: Any) -> Self:
@@ -364,7 +362,7 @@ class Dataset(Generic[T]):
 
             def validate_untyped(value: Any) -> Dataset[Any]:
                 if isinstance(value, h5py.Dataset):
-                    return cls._from_node(value, MappingProxyType(_normalized_attrs(value)))
+                    return cls._from_node(value, _FrozenAttrs(_normalized_attrs(value)))
                 return _require_dataset(value, cls)
 
             return core_schema.no_info_plain_validator_function(validate_untyped)

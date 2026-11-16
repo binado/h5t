@@ -3,13 +3,33 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, NoReturn
 
 import h5py
 import numpy as np
 
 # Not a legal child name (it contains ``/``), so it can never collide with a member.
 ATTRS_KEY = "/attrs"
+
+
+class _FrozenAttrs(dict[str, Any]):
+    """Untyped HDF5 attributes: a ``dict`` that cannot be modified.
+
+    Being a real ``dict`` that owns its items (unlike ``types.MappingProxyType``, a view),
+    it can be copied, deep-copied, pickled and dumped by Pydantic.
+    """
+
+    __slots__ = ()
+
+    def _read_only(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise TypeError("untyped attrs are read-only; build a new Group or Dataset instead")
+
+    __setitem__ = __delitem__ = __ior__ = _read_only
+    clear = pop = popitem = setdefault = update = _read_only
+
+    def __reduce__(self) -> tuple[type[_FrozenAttrs], tuple[dict[str, Any]]]:
+        # The default protocol would refill the copy through ``__setitem__``.
+        return type(self), (dict(self),)
 
 
 def _normalized_attrs(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
