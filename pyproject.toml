@@ -25,8 +25,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "h5py>=3.10",
-    "jaxtyping>=0.2.36",
+    "h5py>=3.13",
+    "jaxtyping>=0.2.38",
     "numpy>=1.26",
     "pydantic>=2.11,<3",
 ]
@@ -44,9 +44,9 @@ h5t = "h5t._cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "hypothesis>=6",
+    "hypothesis>=6.83",
     "ty>=0.0.74",
-    "ruff>=0.6",
+    "ruff>=0.13",
 ]
 docs = [
     "sphinx>=8.2",
