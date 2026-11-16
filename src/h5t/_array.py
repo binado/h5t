@@ -47,6 +47,25 @@ def _readonly(array: np.ndarray) -> np.ndarray:
     return view
 
 
+def _attrs_equal(left: BaseModel | Mapping[str, Any], right: BaseModel | Mapping[str, Any]) -> bool:
+    if isinstance(left, BaseModel) or isinstance(right, BaseModel):
+        if not isinstance(left, BaseModel) or not isinstance(right, BaseModel):
+            return False
+        if type(left) is not type(right):
+            return False
+        # Read fields directly: serializers must not affect attribute equality.
+        left = {name: getattr(left, name) for name in type(left).model_fields}
+        right = {name: getattr(right, name) for name in type(right).model_fields}
+    if left.keys() != right.keys():
+        return False
+    return all(
+        np.array_equal(left[key], right[key])
+        if isinstance(left[key], np.ndarray) or isinstance(right[key], np.ndarray)
+        else left[key] == right[key]
+        for key in left
+    )
+
+
 def _require_dataset(value: Any, expected: type[Dataset[Any]]) -> Any:
     """Return ``value`` if it is an ``expected`` instance, or raise a Pydantic error."""
     if isinstance(value, _GroupView):
@@ -340,7 +359,11 @@ class Dataset(Generic[T]):
         if not isinstance(other, Dataset):
             return NotImplemented
         # Cheap metadata first: only equal-looking datasets pay for reading both arrays.
-        if self.shape != other.shape or self.dtype != other.dtype or self.attrs != other.attrs:
+        if (
+            self.shape != other.shape
+            or self.dtype != other.dtype
+            or not _attrs_equal(self.attrs, other.attrs)
+        ):
             return False
         return bool(np.array_equal(self.data, other.data))
 

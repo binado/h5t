@@ -123,6 +123,35 @@ def test_in_memory_dataset_slicing_and_equality() -> None:
             pass
 
 
+@pytest.mark.parametrize("typed", [False, True])
+def test_equality_with_array_attributes(typed: bool) -> None:
+    class ArrayAttrs(BaseModel):
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+        calibration: np.ndarray
+
+    def dataset(value: np.ndarray) -> h5t.Dataset:
+        attrs = ArrayAttrs(calibration=value) if typed else {"calibration": value}
+        return h5t.Dataset(np.arange(3), attrs)
+
+    left = dataset(np.arange(2))
+    right = dataset(np.arange(2))
+    assert left == right
+    assert left != dataset(np.array([0, 2]))
+    assert left != dataset(np.arange(2).reshape(1, 2))
+
+    class Owner(h5t.Group):
+        measurement: h5t.Dataset
+
+    assert Owner(measurement=left) == Owner(measurement=right)
+    assert Owner(measurement=left) != Owner(measurement=dataset(np.array([0, 2])))
+
+
+def test_equality_with_different_attribute_keys() -> None:
+    left = h5t.Dataset(np.arange(3), {"calibration": np.arange(2)})
+    right = h5t.Dataset(np.arange(3), {"other": np.arange(2)})
+    assert left != right
+
+
 def test_deleted_source_preserves_snapshot_but_live_access_fails(result_file: Path) -> None:
     measurement = Result.model_validate_hdf5(result_file).measurement
     os.unlink(result_file)
