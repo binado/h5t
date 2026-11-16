@@ -15,6 +15,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   references), and nothing is checked again on load or write. Native Pydantic
   model-building and unresolved-annotation errors propagate unchanged (CLI exit 2).
   Removed `localns=`; use `Model.model_rebuild(_types_namespace={...})` instead.
+- Requires `pydantic>=2.11`. The previous floor (`>=2.4`) was never importable with the
+  `Group[T]` API.
 - **Breaking:** writing is no longer transactional. `model_dump_hdf5` creates nodes one at
   a time, so a failed write leaves the nodes already written, and with `mode="w"` the
   previous file has been truncated by then. Write to a temporary file and rename it if the

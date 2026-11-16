@@ -337,7 +337,7 @@ requires-dist = [
     { name = "h5py", specifier = ">=3.10" },
     { name = "jaxtyping", specifier = ">=0.2.36" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "pydantic", specifier = ">=2.4,<3" },
+    { name = "pydantic", specifier = ">=2.11,<3" },
 ]
 
 [package.metadata.requires-dev]

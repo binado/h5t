@@ -28,7 +28,7 @@ dependencies = [
     "h5py>=3.10",
     "jaxtyping>=0.2.36",
     "numpy>=1.26",
-    "pydantic>=2.4,<3",
+    "pydantic>=2.11,<3",
 ]
 
 [project.urls]

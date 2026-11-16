@@ -375,7 +375,7 @@ class Group(BaseModel, Generic[T]):
     ) -> core_schema.CoreSchema:
         # With unresolved forward references the fields are not final yet; Pydantic defers
         # the build and calls this hook again once they resolve.
-        if getattr(cls, "__pydantic_fields_complete__", True):
+        if cls.__pydantic_fields_complete__:
             _check_declarations(cls)
         return handler(source)
 
