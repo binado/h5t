@@ -13,7 +13,6 @@ from jaxtyping import Float
 from pydantic import BaseModel, ConfigDict, Field
 
 import h5t
-from h5t._array import _DATA_NOT_LOADED
 
 
 class InnerAttrs(BaseModel):
@@ -94,7 +93,10 @@ def test_dataset_items_read_no_data(tmp_path: Path) -> None:
     path = _write(tmp_path / "a.h5", build)
     out = Root.model_validate_hdf5(path)
     assert out.arrs["x"].shape == (4,)
-    assert out.arrs["x"]._h5t_data is _DATA_NOT_LOADED
+    # Nothing was read while loading: values changed afterwards are the ones seen.
+    with h5py.File(path, "r+") as f:
+        f["arrs/x"][...] = 7.0
+    assert out.arrs["x"][:].tolist() == [7.0] * 4
 
 
 def test_ndarray_and_jaxtyping_items_share_scope_with_owner(tmp_path: Path) -> None:

@@ -105,6 +105,8 @@ _MARKERS = (_NdarraySchema, _JaxtypingSchema)
 
 _NONE = type(None)
 _UNIONS = (typing.Union, types.UnionType)
+# ``typing_extensions.TypeAliasType`` is a separate class that ``type X = ...`` aliases are
+# not instances of, so only the stdlib one (Python >= 3.12) is of use here.
 _alias_type = getattr(typing, "TypeAliasType", None)
 _TYPE_ALIAS_TYPES: tuple[type, ...] = (_alias_type,) if isinstance(_alias_type, type) else ()
 _MAX_ALIAS_DEPTH = 16
@@ -156,13 +158,10 @@ def _dataset_class(tp: Any) -> type[Dataset[Any]] | None:
 # ---------------------------------------------------------------------------
 
 
-def _forbids_extras(model_cls: type[BaseModel]) -> bool:
+def _check_extra(model_cls: type[BaseModel]) -> None:
     raw = model_cls.model_config.get("extra", "ignore")
-    if raw is None or raw == "ignore":
-        return False
-    if raw == "forbid":
-        return True
-    raise SchemaError(f"{model_cls.__name__}: extra must be 'ignore' or 'forbid', got {raw!r}")
+    if raw not in (None, "ignore", "forbid"):
+        raise SchemaError(f"{model_cls.__name__}: extra must be 'ignore' or 'forbid', got {raw!r}")
 
 
 def _h5_name(owner: type, py_name: str, field: FieldInfo) -> str:
@@ -187,7 +186,7 @@ def _check_unique_names(owner: type, fields: Mapping[str, FieldInfo], what: str)
 
 def _check_attrs(model_type: type[BaseModel]) -> None:
     """Reject what an attributes model cannot be stored as; Pydantic checks the rest."""
-    _forbids_extras(model_type)
+    _check_extra(model_type)
     _check_unique_names(model_type, model_type.model_fields, "HDF5 attribute name")
     for py_name, field in model_type.model_fields.items():
         core, _ = _unwrap(field.annotation)
@@ -295,7 +294,7 @@ def _check_declarations(group_cls: type[Group[Any]]) -> None:
     Only this class is checked: nested groups run the same check when Pydantic builds
     their schema, so nothing here recurses through the model tree.
     """
-    _forbids_extras(group_cls)
+    _check_extra(group_cls)
     attrs_type = _attrs_model(group_cls)
     if attrs_type is not None:
         _check_attrs(attrs_type)
@@ -456,6 +455,7 @@ class Group(BaseModel, Generic[T]):
             try:
                 return cls.model_validate(_GroupView(node))
             except PydanticValidationError as exc:
+                # A user's own model validator on ``cls`` runs outside `_h5t_load`.
                 raise _located_error(exc, normalized_root) from exc
 
     def model_dump_hdf5(

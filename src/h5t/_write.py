@@ -9,7 +9,7 @@ and checking only what HDF5 itself imposes: child names and storable attribute v
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from enum import Enum
 from typing import Any, Literal
 
@@ -19,7 +19,14 @@ from pydantic import BaseModel
 from pydantic_core import PydanticSerializationError
 
 from h5t._array import _DATA_NOT_LOADED, Dataset
-from h5t._compile import Group, _check_attrs, _filesystem_path, _normalize_root, _unwrap
+from h5t._compile import (
+    Group,
+    _check_attrs,
+    _filesystem_path,
+    _h5_name,
+    _normalize_root,
+    _unwrap,
+)
 from h5t._errors import ValidationError, attr_path, child_path
 
 _H5PY_ERRORS = (TypeError, ValueError, OSError)
@@ -33,7 +40,7 @@ def _children(group: Group[Any]) -> Iterator[tuple[str, Any]]:
         value = getattr(group, name)
         if value is None and _unwrap(field.annotation)[1]:
             continue
-        yield (field.alias if field.alias is not None else name), value
+        yield _h5_name(type(group), name, field), value
 
 
 # ---------------------------------------------------------------------------
@@ -101,11 +108,18 @@ def _write_attrs(node: h5py.Group | h5py.Dataset, attrs: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _create(make: Callable[..., Any], kind: str, path: str, *args: Any, **kwargs: Any) -> Any:
+def _create_group(parent: h5py.Group, name: str, path: str) -> h5py.Group:
     try:
-        return make(*args, **kwargs)
+        return parent.create_group(name)
     except _H5PY_ERRORS as exc:
-        raise ValidationError(path, f"cannot write {kind}: {exc}") from exc
+        raise ValidationError(path, f"cannot write group: {exc}") from exc
+
+
+def _create_dataset(parent: h5py.Group, name: str, path: str, data: np.ndarray) -> h5py.Dataset:
+    try:
+        return parent.create_dataset(name, data=data)
+    except _H5PY_ERRORS as exc:
+        raise ValidationError(path, f"cannot write dataset: {exc}") from exc
 
 
 def _read_lazy(dataset: Dataset[Any], path: str) -> np.ndarray:
@@ -123,9 +137,9 @@ def _read_lazy(dataset: Dataset[Any], path: str) -> np.ndarray:
 def _write_member(parent: h5py.Group, name: str, value: Any) -> None:
     path = child_path(parent.name, name)
     if isinstance(value, Group):
-        _write_group(_create(parent.create_group, "group", path, name), value)
+        _write_group(_create_group(parent, name, path), value)
     elif isinstance(value, Mapping):
-        node = _create(parent.create_group, "group", path, name)
+        node = _create_group(parent, name, path)
         for key, item in value.items():
             if not isinstance(key, str) or not key or "/" in key or key in (".", ".."):
                 raise ValidationError(
@@ -134,10 +148,10 @@ def _write_member(parent: h5py.Group, name: str, value: Any) -> None:
                 )
             _write_member(node, key, item)
     elif isinstance(value, Dataset):
-        data = _read_lazy(value, path)
-        _write_attrs(_create(parent.create_dataset, "dataset", path, name, data=data), value.attrs)
+        node = _create_dataset(parent, name, path, _read_lazy(value, path))
+        _write_attrs(node, value.attrs)
     else:
-        _create(parent.create_dataset, "dataset", path, name, data=np.asarray(value))
+        _create_dataset(parent, name, path, np.asarray(value))
 
 
 def _write_group(node: h5py.Group, group: Group[Any]) -> None:

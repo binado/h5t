@@ -364,7 +364,7 @@ class Dataset(Generic[T]):
 
             def validate_untyped(value: Any) -> Dataset[Any]:
                 if isinstance(value, h5py.Dataset):
-                    return cls._from_node(value, MappingProxyType(dict(value.attrs)))
+                    return cls._from_node(value, MappingProxyType(_normalized_attrs(value)))
                 return _require_dataset(value, cls)
 
             return core_schema.no_info_plain_validator_function(validate_untyped)

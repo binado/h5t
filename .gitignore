@@ -16,3 +16,8 @@ build/
 
 # Docs
 docs/_build/
+
+# Local files
+.DS_Store
+.coverage
+.handoff/

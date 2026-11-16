@@ -84,6 +84,19 @@ def test_untyped_dataset_and_group_expose_raw_attrs_mapping(result_file: Path) -
     assert result.measurement.attrs["extra"] == "measurement"
 
 
+def test_untyped_attrs_are_python_values_on_groups_and_datasets(tmp_path: Path) -> None:
+    class Owner(h5t.Group):
+        measurement: h5t.Dataset
+
+    path = tmp_path / "attrs.h5"
+    with h5py.File(path, "w") as file:
+        file.attrs["count"] = np.int64(2)
+        file.create_dataset("measurement", data=np.zeros(2)).attrs["count"] = np.int64(3)
+    result = Owner.model_validate_hdf5(path)
+    assert type(result.attrs["count"]) is int
+    assert type(result.measurement.attrs["count"]) is int
+
+
 def test_forward_reference_to_a_group_defined_later_in_the_module_resolves(tmp_path: Path) -> None:
     path = tmp_path / "forward.h5"
     with h5py.File(path, "w") as file:

@@ -251,3 +251,25 @@ def test_before_model_validator_on_group_sees_a_read_only_mapping_on_load(
 
     assert Schema.model_validate_hdf5(attrs_file).attrs["count"] == 3
     assert len(seen) == 1
+
+
+@pytest.mark.parametrize("mode", ["after", "wrap"])
+def test_user_model_validator_error_on_group_is_located_at_the_root(
+    attrs_file: Path, mode: Literal["after", "wrap"]
+) -> None:
+    # A subclass's own model validator runs outside the group's loader.
+    class After(h5t.Group):
+        @model_validator(mode="after")
+        def explode(self) -> After:
+            raise ValueError("boom")
+
+    class Wrap(h5t.Group):
+        @model_validator(mode="wrap")
+        @classmethod
+        def explode(cls, data: Any, handler: Any) -> Any:
+            handler(data)
+            raise ValueError("boom")
+
+    schema = After if mode == "after" else Wrap
+    with pytest.raises(h5t.ValidationError, match=r"^/: Value error, boom"):
+        schema.model_validate_hdf5(attrs_file)

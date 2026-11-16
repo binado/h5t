@@ -16,7 +16,6 @@ from jaxtyping import Float
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer, computed_field
 
 import h5t
-from h5t._array import _DATA_NOT_LOADED
 from tests.conftest import (
     MeasurementAttrs,
     Nested,
@@ -493,4 +492,7 @@ def test_dump_does_not_cache_lazy_data_from_another_file(tmp_path: Path) -> None
         file.create_dataset("measurement", data=np.arange(3)).attrs["unit"] = "m"
     loaded = _TypedDatasetGroup.model_validate_hdf5(source)
     loaded.model_dump_hdf5(tmp_path / "copy.h5")
-    assert loaded.measurement._h5t_data is _DATA_NOT_LOADED
+    # The dump kept no copy of the array: a later read sees the source as it is now.
+    with h5py.File(source, "r+") as file:
+        file["measurement"][...] = 9
+    assert loaded.measurement.data.tolist() == [9, 9, 9]

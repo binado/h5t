@@ -328,5 +328,6 @@ def test_type_adapter_untyped_dataset_exposes_read_only_attrs(tmp_path: Path) ->
     with h5py.File(path, "r") as f:
         ds = TypeAdapter(h5t.Dataset).validate_python(f["m"])
     assert dict(ds.attrs) == {"k": 1}
+    assert type(ds.attrs["k"]) is int  # normalised like a group attribute, not numpy.int64
     with pytest.raises(TypeError):
         ds.attrs["k"] = 2  # type: ignore[index]

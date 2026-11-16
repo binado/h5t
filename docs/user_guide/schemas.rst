@@ -114,7 +114,9 @@ Declare typed attributes on a :class:`pydantic.BaseModel` subclass ``T`` and pas
 directly on attribute fields.
 
 If ``T`` is omitted (bare ``h5t.Group`` or ``h5t.Dataset``), ``.attrs`` is a read-only
-``Mapping[str, Any]`` containing the raw ``h5py`` attribute values.
+``Mapping[str, Any]`` of the attribute values as ``h5py`` reads them, with NumPy scalars and
+strings converted to Python values (``int``, ``float``, ``str``, ...) and arrays left as
+arrays.
 
 Extras policy
 -------------
