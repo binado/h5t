@@ -296,16 +296,11 @@ def test_invalid_shape_string_error_propagates() -> None:
             x: Float[np.ndarray, "n, m"]
 
 
-def test_unsupported_array_type_is_a_schema_error(tmp_path: Path) -> None:
-    # The class itself builds (the annotation only concerns h5t); the declaration check
-    # fires at operation time, from _unwrap_jaxtyping via _check_group.
-    class R(h5t.Group):
-        x: Float[list, "n"]  # ty: ignore
+def test_unsupported_array_type_is_a_schema_error() -> None:
+    with pytest.raises(h5t.SchemaError, match=r"R\.x.*not supported"):
 
-    with pytest.raises(h5t.SchemaError, match=r"not supported"):
-        R.model_validate_hdf5(write(tmp_path / "a.h5", x=np.zeros(3)))
-    with pytest.raises(h5t.SchemaError, match=r"not supported"):
-        R.model_construct(x=[1, 2]).model_dump_hdf5(tmp_path / "b.h5")
+        class R(h5t.Group):
+            x: Float[list, "n"]  # ty: ignore
 
 
 def test_foreign_jaxtyping_models_do_not_break_when_h5t_is_imported() -> None:

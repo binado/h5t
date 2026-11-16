@@ -78,12 +78,6 @@ def test_missing_wrong_kind_and_forbidden_extra_fail_with_paths(tmp_path: Path) 
 
     path = tmp_path / "errors.h5"
     with h5py.File(path, "w") as file:
-        file.attrs["extra"] = 1
-    with pytest.raises(h5t.ValidationError) as caught:
-        Strict.model_validate_hdf5(path)
-    assert caught.value.path == "/@extra"
-
-    with h5py.File(path, "w") as file:
         file.create_group("value")
     with pytest.raises(
         h5t.ValidationError, match="Input should be an instance of ndarray"

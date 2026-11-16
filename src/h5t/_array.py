@@ -14,10 +14,11 @@ import h5py
 import numpy as np
 from jaxtyping import jaxtyped
 from pydantic import BaseModel, GetCoreSchemaHandler, ValidatorFunctionWrapHandler
+from pydantic import ValidationError as PydanticValidationError
 from pydantic_core import PydanticCustomError, core_schema
 from typing_extensions import TypeVar
 
-from h5t._errors import SchemaError, ValidationError
+from h5t._errors import SchemaError, ValidationError, _located_error
 from h5t._h5view import _GroupView, _normalized_attrs
 
 _DATA_NOT_LOADED = object()
@@ -47,22 +48,17 @@ def _readonly(array: np.ndarray) -> np.ndarray:
     return view
 
 
-def _reject_not_a_dataset(value: Any, expected: type) -> None:
-    """Raise unless ``value`` is a `Dataset` (and an ``expected`` instance)."""
+def _require_dataset(value: Any, expected: type[Dataset[Any]]) -> Any:
+    """Return ``value`` if it is an ``expected`` instance, or raise a Pydantic error."""
     if isinstance(value, _GroupView):
         raise PydanticCustomError("dataset_type", "expected a dataset, found a group")
-    if not isinstance(value, Dataset):
-        raise PydanticCustomError(
-            "dataset_type",
-            "Input should be an instance of Dataset, got {actual}",
-            {"actual": type(value).__name__},
-        )
     if not isinstance(value, expected):
         raise PydanticCustomError(
             "dataset_type",
             "Input should be an instance of {expected}, got {actual}",
             {"expected": expected.__name__, "actual": type(value).__name__},
         )
+    return value
 
 
 class Dataset(Generic[T]):
@@ -183,30 +179,16 @@ class Dataset(Generic[T]):
             self._h5t_attrs = typing.cast(T, MappingProxyType(raw_map))
 
     @classmethod
-    def _build(
-        cls,
-        filename: str | None,
-        path: str | None,
-        shape: tuple[int, ...],
-        dtype: np.dtype[Any],
-        attrs: Any,
-        cached: object = _DATA_NOT_LOADED,
-    ) -> Self:
-        """Create an instance directly from its state (the one place that does so)."""
+    def _from_node(cls, node: h5py.Dataset, attrs: Any) -> Self:
+        """Create a lazy instance pointing at an open ``h5py.Dataset``, reading no data."""
         instance = object.__new__(cls)
-        instance._h5t_filename = filename
-        instance._h5t_path = path
-        instance._h5t_shape = shape
-        instance._h5t_dtype = dtype
+        instance._h5t_filename = node.file.filename
+        instance._h5t_path = node.name
+        instance._h5t_shape = tuple(node.shape)
+        instance._h5t_dtype = np.dtype(node.dtype)
         instance._h5t_attrs = attrs
-        instance._h5t_data = cached
+        instance._h5t_data = _DATA_NOT_LOADED
         return instance
-
-    def _clone_with(self, target_cls: type[Dataset[Any]], attrs: Any) -> Dataset[Any]:
-        """Copy this dataset's location and cached data into ``target_cls`` with ``attrs``."""
-        return target_cls._build(
-            self.filename, self.path, self.shape, self.dtype, attrs, self._h5t_data
-        )
 
     @property
     def filename(self) -> str | None:
@@ -375,68 +357,31 @@ class Dataset(Generic[T]):
     def __get_pydantic_core_schema__(
         cls, source_type: Any, handler: GetCoreSchemaHandler
     ) -> core_schema.CoreSchema:
+        # Either way an in-memory value must already be an instance of ``cls``; only a raw
+        # ``h5py.Dataset`` (handed over by `_GroupView` while loading) is converted.
         attrs_type = cls._h5t_attrs_type
-        if attrs_type is None:
-            args = typing.get_args(source_type)
-            if args and isinstance(args[0], type) and issubclass(args[0], BaseModel):
-                attrs_type = args[0]
-
-        target_cls: type[Dataset[Any]] = (
-            cls if attrs_type is None or cls._h5t_attrs_type is not None else cls[attrs_type]
-        )
-
         if attrs_type is None:
 
             def validate_untyped(value: Any) -> Dataset[Any]:
                 if isinstance(value, h5py.Dataset):
-                    return target_cls._build(
-                        value.file.filename,
-                        value.name,
-                        tuple(value.shape),
-                        np.dtype(value.dtype),
-                        MappingProxyType(dict(value.attrs)),
-                    )
-                _reject_not_a_dataset(value, cls)
-                if not isinstance(value.attrs, Mapping):
-                    raise PydanticCustomError(
-                        "dataset_attrs",
-                        "Expected Mapping for dataset attrs, got {actual}",
-                        {"actual": type(value.attrs).__name__},
-                    )
-                return value
+                    return cls._from_node(value, MappingProxyType(dict(value.attrs)))
+                return _require_dataset(value, cls)
 
             return core_schema.no_info_plain_validator_function(validate_untyped)
-
-        attrs_schema = handler.generate_schema(attrs_type)
 
         def validate_typed(
             value: Any, validate_attrs: ValidatorFunctionWrapHandler
         ) -> Dataset[Any]:
-            if isinstance(value, h5py.Dataset):
+            if not isinstance(value, h5py.Dataset):
+                return _require_dataset(value, cls)
+            try:
+                # Attribute dims bind in their own scope, apart from the dataset's shape.
                 with jaxtyped("context"):
                     attrs = validate_attrs(_normalized_attrs(value))
-                return target_cls._build(
-                    value.file.filename,
-                    value.name,
-                    tuple(value.shape),
-                    np.dtype(value.dtype),
-                    attrs,
-                )
-            # The typed branch deliberately skips the ``expected`` check: any Dataset
-            # is accepted and cloned into ``target_cls`` with validated attrs.
-            _reject_not_a_dataset(value, Dataset)
-            if isinstance(value.attrs, attrs_type):
-                if isinstance(value, target_cls):
-                    return value
-                return value._clone_with(target_cls, value.attrs)
-            if isinstance(value.attrs, Mapping):
-                with jaxtyped("context"):
-                    validated_attrs = validate_attrs(dict(value.attrs))
-                return value._clone_with(target_cls, validated_attrs)
-            raise PydanticCustomError(
-                "dataset_attrs",
-                "Expected {expected} for dataset attrs, got {actual}",
-                {"expected": attrs_type.__name__, "actual": type(value.attrs).__name__},
-            )
+            except PydanticValidationError as exc:
+                raise _located_error(exc, value.name, in_attrs=True) from exc
+            return cls._from_node(value, attrs)
 
-        return core_schema.no_info_wrap_validator_function(validate_typed, attrs_schema)
+        return core_schema.no_info_wrap_validator_function(
+            validate_typed, handler.generate_schema(attrs_type)
+        )

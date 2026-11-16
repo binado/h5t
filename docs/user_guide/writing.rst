@@ -51,15 +51,19 @@ Attribute serialization
   HDF5 attributes.
 - Collection keys must be non-empty, contain no ``/``, and not be ``"."`` or ``".."``.
 
-Two-phase planning
-------------------
+Writing is not transactional
+----------------------------
 
-The whole group tree is planned and every :class:`h5t.Dataset` data is read *before* the
-file is opened, so a failed check never touches the target file (and saving into the file a
-lazy ``Dataset`` came from is safe).
+The group tree is written in one pass, node by node. A check that fails part-way through
+(an invalid collection key, an attribute h5py cannot store, a lazy ``Dataset`` whose source
+has gone) raises :class:`h5t.ValidationError` and leaves the nodes written so far in the
+file. With ``mode="w"`` the previous file has already been truncated by then, so write to
+a new path and rename it if the old content must survive a failure.
 
-Lazy datasets are copied: an uncached ``Dataset`` is read from its source file at save time,
-without caching it on your instance.
+Lazy datasets are copied one at a time: an uncached ``Dataset`` is read from its source file
+just before it is stored, without caching it on your instance. The exception is a lazy
+``Dataset`` that lives in the target file itself: it is read (and cached on your instance)
+before the file is opened for writing, so saving into the file it came from is safe.
 
 Runtime subclasses
 ------------------
@@ -67,5 +71,4 @@ Runtime subclasses
 Each nested group is written using its runtime class's ``model_fields``, so additional
 subclass fields are included even when the parent annotation names a base class. This
 also applies to collection items. Attribute models use their runtime declared fields
-and serializers; computed fields are excluded. HDF5 declaration checks happen during
-planning, before opening the destination, without revalidating instance values.
+and serializers; computed fields are excluded. Instance values are not revalidated.

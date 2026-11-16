@@ -122,8 +122,8 @@ Extras policy
 Configure ``model_config = ConfigDict(extra="ignore")`` (the default) or
 ``ConfigDict(extra="forbid")``:
 
-- On a :class:`h5t.Group` subclass, ``extra="forbid"`` rejects undeclared HDF5 child nodes
-  (and any attributes if the group does not declare a typed ``Group[T]`` model).
+- On a :class:`h5t.Group` subclass, ``extra="forbid"`` rejects undeclared HDF5 child nodes.
+  It says nothing about attributes: to reject those, give the group an attributes model.
 - On an attributes :class:`pydantic.BaseModel` ``T`` in ``Group[T]`` or ``Dataset[T]``,
   ``extra="forbid"`` rejects undeclared HDF5 attributes on that group or dataset.
 
@@ -132,7 +132,7 @@ Errors
 
 All errors derive from :class:`h5t.H5TError`:
 
-- :class:`h5t.SchemaError`: an HDF5 declaration is invalid. Checked before file access on load or write.
+- :class:`h5t.SchemaError`: an HDF5 declaration is invalid. Raised when the group class is defined.
 - Native Pydantic model-building and unresolved-annotation errors propagate unchanged.
 - :class:`h5t.ValidationError`: the file or model does not conform. Fail-fast and
   path-aware, e.g. ``/fiducials: the size of dimension n is 4 which does not equal the

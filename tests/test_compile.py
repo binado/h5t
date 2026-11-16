@@ -185,27 +185,17 @@ def test_localns_keyword_is_removed() -> None:
 
 
 @pytest.mark.parametrize("collection", [False, True])
-def test_nested_invalid_declaration_precedes_file_access(
-    tmp_path: Path, collection: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class Bad(h5t.Group):
-        value: int
-
-    annotation = dict[str, Bad] if collection else Bad
-
-    class Outer(h5t.Group):
-        child: annotation
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("declaration checking opened a file")
-
-    monkeypatch.setattr(h5py, "File", forbidden)
+def test_invalid_declaration_fails_when_the_class_is_defined(collection: bool) -> None:
     with pytest.raises(h5t.SchemaError, match="Bad.value"):
-        Outer.model_validate_hdf5(tmp_path / "absent.h5")
-    child = Bad(value=1)
-    value = Outer(child={"one": child} if collection else child)
-    with pytest.raises(h5t.SchemaError, match="Bad.value"):
-        value.model_dump_hdf5(tmp_path / "absent.h5")
+
+        class Bad(h5t.Group):
+            value: int
+
+    annotation = dict[str, int] if collection else int
+    with pytest.raises(h5t.SchemaError, match="Outer.child"):
+
+        class Outer(h5t.Group):
+            child: annotation
 
 
 def test_ndarray_aliases_roundtrip(tmp_path: Path) -> None:

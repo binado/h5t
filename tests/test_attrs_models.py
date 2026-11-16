@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from jaxtyping import Float
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import ValidationError as PydanticValidationError
 
 import h5t
 
@@ -97,13 +98,15 @@ def test_invalid_group_attrs_type_argument_is_schema_error() -> None:
         BadGroup.model_validate_hdf5("never-opened.h5")
 
 
-def test_in_memory_group_construction_validates_dataset_attrs() -> None:
+def test_in_memory_group_construction_requires_the_declared_dataset_class() -> None:
     class Owner(h5t.Group):
         measurement: h5t.Dataset[MeasurementAttrs]
 
-    owner = Owner(measurement=h5t.Dataset(np.arange(3), {"unit": "m"}))
+    owner = Owner(measurement=h5t.Dataset[MeasurementAttrs](np.arange(3), {"unit": "m"}))
     assert isinstance(owner.measurement.attrs, MeasurementAttrs)
     assert owner.measurement.attrs.unit == "m"
+    with pytest.raises(PydanticValidationError, match=r"instance of Dataset\[MeasurementAttrs\]"):
+        Owner(measurement=h5t.Dataset(np.arange(3), {"unit": "m"}))
 
 
 class _GroupAttrs(BaseModel):

@@ -255,9 +255,9 @@ def typed_adapter() -> TypeAdapter[h5t.Dataset[MeasurementAttrs]]:
             h5t.Dataset(np.arange(3), _OtherAttrs()), "MeasurementAttrs", id="wrong-attrs-model"
         ),
         pytest.param(
-            h5t.Dataset(np.arange(3), {"unit": "parsec"}),
-            "unit",
-            id="invalid-attrs-mapping",
+            h5t.Dataset(np.arange(3), {"unit": "m"}),
+            "MeasurementAttrs",
+            id="untyped-dataset",
         ),
     ],
 )
@@ -268,28 +268,12 @@ def test_dataset_schema_rejects_bad_values(
         typed_adapter.validate_python(value)
 
 
-def test_dataset_schema_clone_of_lazy_dataset_stays_lazy(
+def test_typed_dataset_schema_rejects_an_untyped_dataset(
     result_file: Path, typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]]
 ) -> None:
     raw = Result.model_validate_hdf5(result_file).raw_measurement
-    clone = typed_adapter.validate_python(raw)
-    assert isinstance(clone, h5t.Dataset[MeasurementAttrs])
-    assert (clone.filename, clone.path) == (raw.filename, raw.path)
-    assert clone.attrs.unit == "m"
-    with h5py.File(result_file, "a") as file:
-        file["raw_measurement"][...] = np.arange(5) + 100
-    np.testing.assert_array_equal(clone[:2], [100, 101])  # still reads from the file
-
-
-def test_dataset_schema_clone_keeps_cached_data(
-    result_file: Path, typed_adapter: TypeAdapter[h5t.Dataset[MeasurementAttrs]]
-) -> None:
-    raw = Result.model_validate_hdf5(result_file).raw_measurement
-    cached = raw.data
-    with h5py.File(result_file, "a") as file:
-        file["raw_measurement"][...] = np.arange(5) + 100
-    clone = typed_adapter.validate_python(raw)
-    assert clone.data is cached
+    with pytest.raises(PydanticValidationError, match=r"instance of Dataset\[MeasurementAttrs\]"):
+        typed_adapter.validate_python(raw)
 
 
 def test_dataset_subscript_with_mapping_returns_the_untyped_base() -> None:

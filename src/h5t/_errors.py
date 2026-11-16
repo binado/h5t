@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+from h5t._h5view import ATTRS_KEY
+
 
 def child_path(parent: str, name: str) -> str:
     """Join an absolute group path and one immediate child name."""
@@ -20,9 +24,9 @@ class H5TError(Exception):
 class SchemaError(H5TError):
     """A schema class declaration is incoherent or unsupported.
 
-    Raised during HDF5 operations, before opening the file. Type-owned schema hooks
-    may also raise this while Pydantic builds a model. Native Pydantic model-building
-    and unresolved-annotation errors propagate unchanged.
+    Raised while Pydantic builds the model: when the class is defined, or at the
+    ``model_rebuild`` (or first use) that resolves its forward references. Native Pydantic
+    model-building and unresolved-annotation errors propagate unchanged.
     """
 
 
@@ -50,3 +54,26 @@ class ValidationError(H5TError):
         super().__init__(f"{path}: {message}")
         self.path = path
         self.message = message
+
+
+def _located_error(exc: Any, path: str, *, in_attrs: bool = False) -> ValidationError:
+    """Turn the first error of a Pydantic ``ValidationError`` into one located under ``path``.
+
+    ``path`` is the HDF5 node that was being validated. Pydantic reports locations by alias,
+    which is the HDF5 name, so the parts of ``loc`` extend ``path`` directly: child names
+    for a group, or one attribute name followed by a location inside that attribute's value.
+    """
+    first = exc.errors(include_url=False, include_context=False, include_input=False)[0]
+    loc = [str(part) for part in first["loc"]]
+    message = str(first["msg"])
+    if loc and loc[0] == ATTRS_KEY:
+        in_attrs = True
+        del loc[0]
+    if not in_attrs:
+        for part in loc:
+            path = child_path(path, part)
+    elif loc:
+        path = attr_path(path, loc[0])
+        if loc[1:]:
+            message = f"{'.'.join(loc[1:])}: {message}"
+    return ValidationError(path, message)

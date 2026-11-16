@@ -16,6 +16,7 @@ from jaxtyping import Float
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer, computed_field
 
 import h5t
+from h5t._array import _DATA_NOT_LOADED
 from tests.conftest import (
     MeasurementAttrs,
     Nested,
@@ -198,19 +199,6 @@ def test_load_save_load_result_file(tmp_path: Path) -> None:
     assert Snap.model_validate_hdf5(dst).attrs["version"] == 2
 
 
-def test_untyped_forbid_rejects_undeclared_attrs_on_dump(tmp_path: Path) -> None:
-    class Strict(h5t.Group):
-        model_config = ConfigDict(extra="forbid")
-
-    ok = Strict()
-    ok.model_dump_hdf5(tmp_path / "ok.h5")
-    bad = Strict.model_construct(attrs={"zzz": 1})
-    with pytest.raises(h5t.ValidationError, match="unexpected attribute") as info:
-        bad.model_dump_hdf5(tmp_path / "bad.h5")
-    assert info.value.path == "/@zzz"
-    assert not (tmp_path / "bad.h5").exists()
-
-
 @pytest.mark.parametrize(
     ("overrides", "path"),
     [
@@ -219,25 +207,27 @@ def test_untyped_forbid_rejects_undeclared_attrs_on_dump(tmp_path: Path) -> None
         ({"items": {".": Item(attrs=ItemAttrs(n=1))}}, "/items/."),
     ],
 )
-def test_dump_of_invalid_collection_key_raises_and_leaves_no_file(
+def test_dump_of_invalid_collection_key_raises(
     tmp_path: Path, overrides: dict[str, Any], path: str
 ) -> None:
     target = tmp_path / "doc.h5"
     with pytest.raises(h5t.ValidationError) as info:
         make_doc(**overrides).model_dump_hdf5(target)
     assert info.value.path == path
-    assert not target.exists()
 
 
-def test_failures_leave_existing_file_bytes_unchanged(tmp_path: Path) -> None:
+def test_failure_in_append_mode_keeps_the_nodes_already_in_the_file(tmp_path: Path) -> None:
     target = tmp_path / "doc.h5"
-    make_doc().model_dump_hdf5(target)
-    before = target.read_bytes()
+    doc = make_doc()
+    doc.model_dump_hdf5(target)
     with pytest.raises(h5t.ValidationError):
         make_doc(items={"a/b": Item(attrs=ItemAttrs(n=1))}).model_dump_hdf5(
             target, root="/other", mode="a"
         )
-    assert target.read_bytes() == before
+    assert_doc_equal(Doc.model_validate_hdf5(target), doc)
+    # Writing is not transactional: what preceded the failure stays in the file.
+    with h5py.File(target) as file:
+        assert "fisher" in file["other"]
 
 
 def test_unstorable_attribute_requires_serializer(tmp_path: Path) -> None:
@@ -356,7 +346,7 @@ class _TypedDatasetGroup(h5t.Group):
     measurement: h5t.Dataset[MeasurementAttrs]
 
 
-def test_dump_of_dataset_whose_source_file_was_deleted_leaves_no_file(tmp_path: Path) -> None:
+def test_dump_of_dataset_whose_source_file_was_deleted_reports_its_path(tmp_path: Path) -> None:
     source = tmp_path / "source.h5"
     with h5py.File(source, "w") as file:
         file.create_dataset("measurement", data=np.arange(3)).attrs["unit"] = "m"
@@ -366,7 +356,6 @@ def test_dump_of_dataset_whose_source_file_was_deleted_leaves_no_file(tmp_path: 
     with pytest.raises(h5t.ValidationError, match="cannot read dataset data") as caught:
         loaded.model_dump_hdf5(target)
     assert caught.value.path == "/measurement"
-    assert not target.exists()
 
 
 @pytest.mark.parametrize("value", ["a\x00b", np.zeros(70_000)], ids=["embedded-nul", "too-large"])
@@ -470,26 +459,7 @@ def test_runtime_attrs_subclass_optional_alias_and_serializer(tmp_path: Path) ->
             assert dict(node.attrs) == {"version": 1, "label-on-disk": "v2"}
 
 
-def test_invalid_runtime_subclass_leaves_existing_file_unchanged(tmp_path: Path) -> None:
-    class Base(h5t.Group):
-        pass
-
-    class Bad(Base):
-        invalid: int
-
-    class Outer(h5t.Group):
-        child: Base
-
-    path = tmp_path / "existing.h5"
-    with h5py.File(path, "w") as file:
-        file["original"] = np.arange(3)
-    before = path.read_bytes()
-    with pytest.raises(h5t.SchemaError, match="Bad.invalid"):
-        Outer(child=Bad(invalid=1)).model_dump_hdf5(path, mode="w")
-    assert path.read_bytes() == before
-
-
-def test_invalid_runtime_attrs_leave_existing_file_unchanged(tmp_path: Path) -> None:
+def test_invalid_runtime_attrs_model_is_a_schema_error(tmp_path: Path) -> None:
     class BaseAttrs(BaseModel):
         version: int
 
@@ -501,8 +471,26 @@ def test_invalid_runtime_attrs_leave_existing_file_unchanged(tmp_path: Path) -> 
         pass
 
     value = Owner(attrs=BadAttrs(version=1, same=2))
-    path = tmp_path / "unchanged.h5"
-    path.write_bytes(b"untouched")
     with pytest.raises(h5t.SchemaError, match="duplicate HDF5 attribute"):
-        value.model_dump_hdf5(path, mode="w")
-    assert path.read_bytes() == b"untouched"
+        value.model_dump_hdf5(tmp_path / "attrs.h5")
+
+
+@pytest.mark.parametrize("mode", ["w", "a"])
+def test_dump_into_the_file_a_lazy_dataset_came_from(tmp_path: Path, mode: str) -> None:
+    path = tmp_path / "same.h5"
+    with h5py.File(path, "w") as file:
+        file.create_dataset("measurement", data=np.arange(3)).attrs["unit"] = "m"
+    loaded = _TypedDatasetGroup.model_validate_hdf5(path)
+    loaded.model_dump_hdf5(path, mode=mode, overwrite=True)
+    again = _TypedDatasetGroup.model_validate_hdf5(path)
+    np.testing.assert_array_equal(again.measurement.data, np.arange(3))
+    assert again.measurement.attrs.unit == "m"
+
+
+def test_dump_does_not_cache_lazy_data_from_another_file(tmp_path: Path) -> None:
+    source = tmp_path / "source.h5"
+    with h5py.File(source, "w") as file:
+        file.create_dataset("measurement", data=np.arange(3)).attrs["unit"] = "m"
+    loaded = _TypedDatasetGroup.model_validate_hdf5(source)
+    loaded.model_dump_hdf5(tmp_path / "copy.h5")
+    assert loaded.measurement._h5t_data is _DATA_NOT_LOADED

@@ -8,21 +8,21 @@ Subclassing :class:`h5t.Group` builds an ordinary Pydantic model. Pydantic resol
 annotations and provides ``model_fields``; h5t has no separate compiled schema or
 annotation namespace. Ordinary in-memory construction uses Pydantic validation.
 
-HDF5 declaration checks run when loading or writing, before the destination or source
-file is opened. They reject unsupported child annotations, duplicate HDF5 names,
-invalid aliases, and unsupported attribute and extra-field policies.
-Loading checks all reachable group declarations, including optional children and
-collection items. Recursive schemas are checked once per operation.
+HDF5 declaration checks run while Pydantic builds a group's schema, so an invalid
+declaration fails where the class is defined, with no file involved. They reject
+unsupported child annotations, duplicate HDF5 names, invalid aliases, and unsupported
+attribute and extra-field policies. Each class checks its own fields; nested groups and
+collection items are checked when their own class is built.
 
 An invalid HDF5 declaration raises :class:`h5t.SchemaError`. Pydantic model-building
 errors propagate unchanged, including ``PydanticUndefinedAnnotation`` for unresolved
-names. Type-owned schema hooks (such as those for datasets and jaxtyping arrays) can
-still reject unsupported types while Pydantic builds the model.
+names. A class with unresolved forward references is checked later, when
+``model_rebuild()`` (or its first use) resolves them.
 
 Forward references
 ------------------
 
-Before inspecting an incomplete model, h5t calls its ``model_rebuild()``. Module-level
+Before loading into an incomplete model, h5t calls its ``model_rebuild()``. Module-level
 forward references and self-references follow Pydantic's normal rules:
 
 .. code-block:: python
@@ -60,4 +60,5 @@ Writing inspects each group's runtime class. A child declared as a base ``Group`
 holding a subclass writes the subclass's additional fields too, including collection
 items. Typed attributes likewise use their runtime model's declared fields and
 serializers. Computed fields are excluded, and nullable attributes holding ``None``
-are omitted. Values are not revalidated during writing.
+are omitted. Values are not revalidated during writing. A runtime attributes model that
+no group declares is checked as it is written.

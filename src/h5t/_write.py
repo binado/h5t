@@ -1,19 +1,15 @@
-"""Schema-validated writing of `Group` instances to HDF5, in two phases.
+"""Writing `Group` instances to HDF5.
 
 Pydantic validated the `Group` when it was constructed (field types, jaxtyping shapes and
-dtypes, attribute models), so the writer does not check any of that again. Phase 1 (*plan*)
-walks runtime model fields on the instance and builds a tree of what to write, checking only
-what HDF5 itself imposes (child names, storable attribute values) and reading the data of
-every lazy `Dataset`. It never touches the target file. Phase 2 (*apply*) opens the file and
-writes the tree.
+dtypes, attribute models), and its declarations were checked when the class was built, so
+the writer checks neither again. It walks the instance once, creating each node as it goes
+and checking only what HDF5 itself imposes: child names and storable attribute values.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import os
-import typing
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from enum import Enum
 from typing import Any, Literal
 
@@ -23,42 +19,53 @@ from pydantic import BaseModel
 from pydantic_core import PydanticSerializationError
 
 from h5t._array import _DATA_NOT_LOADED, Dataset
-from h5t._compile import (
-    Group,
-    _check_attrs,
-    _check_group,
-    _extract_alias,
-    _extract_forbid_extras,
-    _filesystem_path,
-    _normalize_root,
-    _resolve_group_attrs_type,
-    _split_annotation,
-)
-from h5t._errors import SchemaError, ValidationError, attr_path, child_path
+from h5t._compile import Group, _check_attrs, _filesystem_path, _normalize_root, _unwrap
+from h5t._errors import ValidationError, attr_path, child_path
+
+_H5PY_ERRORS = (TypeError, ValueError, OSError)
 
 
-@dataclasses.dataclass
-class _DatasetPlan:
-    data: np.ndarray
-    attrs: dict[str, Any]
-
-
-@dataclasses.dataclass
-class _GroupPlan:
-    attrs: dict[str, Any] = dataclasses.field(default_factory=dict)
-    children: dict[str, _GroupPlan | _DatasetPlan] = dataclasses.field(default_factory=dict)
+def _children(group: Group[Any]) -> Iterator[tuple[str, Any]]:
+    """Yield the on-disk name and value of each child that is to be written."""
+    for name, field in type(group).model_fields.items():
+        if name == "attrs":
+            continue
+        value = getattr(group, name)
+        if value is None and _unwrap(field.annotation)[1]:
+            continue
+        yield (field.alias if field.alias is not None else name), value
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: plan
+# Attributes
 # ---------------------------------------------------------------------------
 
 
-def _read_field(owner_type: type, instance: Any, name: str) -> Any:
+def _attr_values(attrs: Any, path: str) -> Mapping[str, Any]:
+    """Return the attributes to store, by their on-disk names."""
+    if not isinstance(attrs, BaseModel):
+        return attrs
+    # The instance may be of a model no group declared (a subclass, or the attributes of
+    # an untyped ``Dataset``), which no schema build has checked.
+    _check_attrs(type(attrs))
+    fields = type(attrs).model_fields
     try:
-        return getattr(instance, name)
-    except AttributeError as exc:
-        raise SchemaError(f"{owner_type.__name__}.{name}: model has no such attribute") from exc
+        # ``include`` limits the dump to declared fields, so computed fields are not stored.
+        dumped = attrs.model_dump(mode="python", by_alias=True, include=set(fields))
+    except (PydanticSerializationError, TypeError) as exc:
+        cause = (
+            exc.__cause__ if isinstance(exc, PydanticSerializationError) and exc.__cause__ else exc
+        )
+        raise ValidationError(path, f"attribute serializer failed: {cause}") from cause
+    # A nullable attribute holding ``None`` is simply absent from the file.
+    nullable = {
+        field.serialization_alias or field.alias or name
+        for name, field in fields.items()
+        if _unwrap(field.annotation)[1]
+    }
+    return {
+        name: value for name, value in dumped.items() if value is not None or name not in nullable
+    }
 
 
 def _check_storable(value: Any, path: str) -> None:
@@ -76,58 +83,35 @@ def _check_storable(value: Any, path: str) -> None:
         )
 
 
-def _attr_values(attrs_val: Any, path: str) -> Mapping[str, Any]:
-    """Return the attribute names and values to store, by their on-disk names."""
-    if not isinstance(attrs_val, BaseModel):
-        return typing.cast(Mapping[str, Any], attrs_val)
-    # ``include`` limits the dump to declared fields, so computed fields are not stored.
-    declared = set(type(attrs_val).model_fields)
-    try:
-        return attrs_val.model_dump(mode="python", by_alias=True, include=declared)
-    except (PydanticSerializationError, TypeError) as exc:
-        cause = (
-            exc.__cause__ if isinstance(exc, PydanticSerializationError) and exc.__cause__ else exc
-        )
-        raise ValidationError(path, f"attribute serializer failed: {cause}") from cause
-
-
-def _plan_attrs(
-    attrs_val: Any,
-    path: str,
-    *,
-    forbid_untyped_extras: bool = False,
-) -> dict[str, Any]:
-    optional: set[str] = set()
-    if isinstance(attrs_val, BaseModel):
-        model = type(attrs_val)
-        _check_attrs(model)
-        for name, field in model.model_fields.items():
-            if _split_annotation(model, name, field.annotation)[2]:
-                optional.add(
-                    field.serialization_alias
-                    if field.serialization_alias is not None
-                    else _extract_alias(model, name, field)
-                )
-    out: dict[str, Any] = {}
-    for raw_name, value in _attr_values(attrs_val, path).items():
+def _write_attrs(node: h5py.Group | h5py.Dataset, attrs: Any) -> None:
+    for raw_name, value in _attr_values(attrs, node.name).items():
         name = str(raw_name)
-        if value is None and name in optional:
-            continue
-        apath = attr_path(path, name)
-        if forbid_untyped_extras:
-            raise ValidationError(apath, "unexpected attribute")
+        path = attr_path(node.name, name)
         if isinstance(value, Enum):
             value = value.value
-        _check_storable(value, apath)
-        out[name] = value
-    return out
+        _check_storable(value, path)
+        try:
+            node.attrs[name] = value
+        except _H5PY_ERRORS as exc:
+            raise ValidationError(path, f"cannot write attribute: {exc}") from exc
 
 
-def _materialize(dataset: Dataset[Any], path: str) -> np.ndarray:
-    """Return a dataset's array data without mutating the caller's detached instance."""
-    cached = dataset._h5t_data
-    if cached is not _DATA_NOT_LOADED:
-        return typing.cast(np.ndarray, cached)
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+
+
+def _create(make: Callable[..., Any], kind: str, path: str, *args: Any, **kwargs: Any) -> Any:
+    try:
+        return make(*args, **kwargs)
+    except _H5PY_ERRORS as exc:
+        raise ValidationError(path, f"cannot write {kind}: {exc}") from exc
+
+
+def _read_lazy(dataset: Dataset[Any], path: str) -> np.ndarray:
+    """Return a dataset's array without caching it on the caller's detached instance."""
+    if dataset._h5t_data is not _DATA_NOT_LOADED:
+        return dataset.data
     try:
         with dataset.open() as h5ds:
             return np.asarray(h5ds[()])
@@ -136,81 +120,48 @@ def _materialize(dataset: Dataset[Any], path: str) -> np.ndarray:
         raise ValidationError(path, f"cannot read dataset data: {detail}") from exc
 
 
-def _plan_member(value: Any, path: str) -> _GroupPlan | _DatasetPlan:
+def _write_member(parent: h5py.Group, name: str, value: Any) -> None:
+    path = child_path(parent.name, name)
     if isinstance(value, Group):
-        return _plan_group(value, path)
+        _write_group(_create(parent.create_group, "group", path, name), value)
+    elif isinstance(value, Mapping):
+        node = _create(parent.create_group, "group", path, name)
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or "/" in key or key in (".", ".."):
+                raise ValidationError(
+                    child_path(path, str(key)),
+                    "collection key must be a non-empty str without '/' and not '.' or '..'",
+                )
+            _write_member(node, key, item)
+    elif isinstance(value, Dataset):
+        data = _read_lazy(value, path)
+        _write_attrs(_create(parent.create_dataset, "dataset", path, name, data=data), value.attrs)
+    else:
+        _create(parent.create_dataset, "dataset", path, name, data=np.asarray(value))
+
+
+def _write_group(node: h5py.Group, group: Group[Any]) -> None:
+    _write_attrs(node, group.attrs)
+    for name, value in _children(group):
+        _write_member(node, name, value)
+
+
+# ---------------------------------------------------------------------------
+# Target file
+# ---------------------------------------------------------------------------
+
+
+def _lazy_datasets(value: Any) -> Iterator[Dataset[Any]]:
+    """Yield every `Dataset` reachable from ``value`` whose data is not in memory yet."""
     if isinstance(value, Dataset):
-        return _DatasetPlan(data=_materialize(value, path), attrs=_plan_attrs(value.attrs, path))
-    if isinstance(value, Mapping):
-        return _plan_collection(value, path)
-    return _DatasetPlan(data=np.asarray(value), attrs={})
-
-
-def _plan_collection(value: Mapping[str, Any], path: str) -> _GroupPlan:
-    plan = _GroupPlan()
-    for key, item in value.items():
-        item_path = child_path(path, str(key))
-        if not isinstance(key, str) or not key or "/" in key or key in (".", ".."):
-            raise ValidationError(
-                item_path, "collection key must be a non-empty str without '/' and not '.' or '..'"
-            )
-        plan.children[key] = _plan_member(item, item_path)
-    return plan
-
-
-def _plan_group(group: Group[Any], path: str) -> _GroupPlan:
-    owner = type(group)
-    _check_group(owner)
-    plan = _GroupPlan()
-    attrs = _read_field(owner, group, "attrs")
-    plan.attrs = _plan_attrs(
-        attrs,
-        path,
-        forbid_untyped_extras=(
-            _extract_forbid_extras(owner) and _resolve_group_attrs_type(owner) is None
-        ),
-    )
-    for name, field in owner.model_fields.items():
-        if name == "attrs":
-            continue
-        h5_name = _extract_alias(owner, name, field)
-        member_path = child_path(path, h5_name)
-        value = _read_field(owner, group, name)
-        if value is None and _split_annotation(owner, name, field.annotation)[2]:
-            continue
-        plan.children[h5_name] = _plan_member(value, member_path)
-    return plan
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: apply
-# ---------------------------------------------------------------------------
-
-
-def _write_attrs(node: h5py.Group | h5py.Dataset, attrs: Mapping[str, Any], path: str) -> None:
-    for name, value in attrs.items():
-        try:
-            node.attrs[name] = value
-        except (TypeError, ValueError, OSError) as exc:
-            raise ValidationError(attr_path(path, name), f"cannot write attribute: {exc}") from exc
-
-
-def _write_plan(group: h5py.Group, plan: _GroupPlan, path: str) -> None:
-    _write_attrs(group, plan.attrs, path)
-    for name, child in plan.children.items():
-        cpath = child_path(path, name)
-        kind = "group" if isinstance(child, _GroupPlan) else "dataset"
-        try:
-            if isinstance(child, _GroupPlan):
-                node = group.create_group(name)
-            else:
-                node = group.create_dataset(name, data=child.data)
-        except (TypeError, ValueError, OSError) as exc:
-            raise ValidationError(cpath, f"cannot write {kind}: {exc}") from exc
-        if isinstance(child, _GroupPlan):
-            _write_plan(node, child, cpath)
-        else:
-            _write_attrs(node, child.attrs, cpath)
+        if value._h5t_data is _DATA_NOT_LOADED:
+            yield value
+    elif isinstance(value, Group):
+        for _, child in _children(value):
+            yield from _lazy_datasets(child)
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _lazy_datasets(item)
 
 
 def _prepare_target(file: h5py.File, root: str, overwrite: bool) -> h5py.Group:
@@ -230,20 +181,8 @@ def _prepare_target(file: h5py.File, root: str, overwrite: bool) -> h5py.Group:
         return node
     try:
         return file.require_group(root)
-    except (TypeError, ValueError, OSError) as exc:
+    except _H5PY_ERRORS as exc:
         raise ValidationError(root, f"cannot create root: {exc}") from exc
-
-
-def _apply(
-    filename: str,
-    mode: Literal["w", "w-", "a"],
-    root: str,
-    plan: _GroupPlan,
-    overwrite: bool,
-) -> None:
-    with h5py.File(filename, mode) as h5file:
-        target = _prepare_target(h5file, root, overwrite)
-        _write_plan(target, plan, root)
 
 
 def _dump_group(
@@ -258,5 +197,13 @@ def _dump_group(
     normalized_root = _normalize_root(root)
     filename = _filesystem_path(path)
 
-    plan = _plan_group(group, normalized_root)
-    _apply(filename, "w-" if mode == "x" else mode, normalized_root, plan, overwrite)
+    # A lazy dataset that lives in the target file must be read before that file is opened
+    # for writing (and possibly truncated). ``.data`` caches it on the instance.
+    for dataset in _lazy_datasets(group):
+        if dataset.filename is not None and os.path.realpath(dataset.filename) == os.path.realpath(
+            filename
+        ):
+            _ = dataset.data
+
+    with h5py.File(filename, "w-" if mode == "x" else mode) as h5file:
+        _write_group(_prepare_target(h5file, normalized_root, overwrite), group)
