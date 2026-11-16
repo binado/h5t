@@ -334,17 +334,17 @@ docs = [
 
 [package.metadata]
 requires-dist = [
-    { name = "h5py", specifier = ">=3.10" },
-    { name = "jaxtyping", specifier = ">=0.2.36" },
+    { name = "h5py", specifier = ">=3.13" },
+    { name = "jaxtyping", specifier = ">=0.2.38" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "pydantic", specifier = ">=2.4,<3" },
+    { name = "pydantic", specifier = ">=2.11,<3" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "hypothesis", specifier = ">=6" },
+    { name = "hypothesis", specifier = ">=6.83" },
     { name = "pytest", specifier = ">=8" },
-    { name = "ruff", specifier = ">=0.6" },
+    { name = "ruff", specifier = ">=0.13" },
     { name = "ty", specifier = ">=0.0.74" },
 ]
 docs = [

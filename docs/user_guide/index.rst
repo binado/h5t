@@ -1,13 +1,12 @@
 User guide
 ==========
 
-- :doc:`schemas`: records, field rules, defaults, extras policy and errors.
-- :doc:`arrays`: ``np.ndarray`` versus ``LazyArray`` versus ``Eager``, and snapshot semantics.
+- :doc:`schemas`: ``Group[T]``, ``Dataset[T]``, field rules, defaults, extras policy and errors.
+- :doc:`arrays`: ``Dataset[T]`` versus ``np.ndarray``, slicing, caching and snapshot semantics.
 - :doc:`jaxtyping`: dtype and shape checks from file metadata.
-- :doc:`collections`: ``dict[str, T]`` fields and ``Glob``.
-- :doc:`payload`: loading undecoratable types with ``Payload``.
-- :doc:`writing`: ``h5t.save``.
-- :doc:`compilation`: when schemas compile, forward references and ``localns``.
+- :doc:`collections`: ``dict[str, T]`` fields.
+- :doc:`writing`: ``Group.model_dump_hdf5``.
+- :doc:`compilation`: Pydantic model lifecycle, forward references and explicit rebuilding.
 - :doc:`cli`: the ``h5t check`` command.
 
 .. toctree::
@@ -18,7 +17,6 @@ User guide
    arrays
    jaxtyping
    collections
-   payload
    writing
    compilation
    cli

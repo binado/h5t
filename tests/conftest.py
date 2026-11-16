@@ -1,8 +1,7 @@
-"""Shared record schemas and HDF5 fixtures."""
+"""Shared Group/Dataset schemas and HDF5 fixtures."""
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 from pathlib import Path
@@ -11,58 +10,54 @@ from typing import Annotated, Any, Literal
 import h5py
 import numpy as np
 import pytest
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 import h5t
 
 
-@h5t.dataset(data="data")
-@dataclasses.dataclass
-class EagerMeasurement:
-    """Dataset record carrying typed attrs over an eagerly materialized payload.
-
-    Decorated (rather than used only via ``Annotated[..., h5t.Payload(...)]``) so it
-    doubles as a ``h5t check``/``h5t.load`` fixture for a dataset-kind record: the
-    marker-based tests below still override these bindings explicitly, since an
-    explicit ``Payload(...)`` at a use site always wins over the decorator's own.
-    """
+class MeasurementAttrs(BaseModel):
+    """Dataset attributes for a measurement."""
 
     unit: Literal["m"]
-    data: np.ndarray
     scale: float = 1.0
 
 
-@dataclasses.dataclass
-class LazyMeasurement:
-    """Undecorated record over the same dataset, reached through the ``Payload`` marker."""
+class NestedAttrs(BaseModel):
+    """Attributes for the nested group fixture."""
 
-    unit: Literal["m"]
-    data: h5t.LazyArray
-    scale: float = 1.0
-
-
-@h5t.group(extras="forbid")
-@dataclasses.dataclass
-class Nested:
-    """Nested group fixture schema."""
+    model_config = ConfigDict(extra="forbid")
 
     answer: int
 
 
-@h5t.group(extras="ignore")
-@dataclasses.dataclass
-class Result:
-    """Representative schema containing every supported field kind."""
+class Nested(h5t.Group[NestedAttrs]):
+    """Nested group fixture schema."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ResultAttrs(BaseModel):
+    """Group attributes for the representative ``Result`` schema."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore", populate_by_name=True)
 
     version: int
-    renamed: Annotated[str, h5t.Name("stored-name")]
-    config: Annotated[dict[str, Any], h5t.Attr(converter=json.loads)]
-    array_attr: Annotated[np.ndarray, h5t.Attr()]
+    renamed: str = Field(alias="stored-name")
+    config: Annotated[dict[str, Any], BeforeValidator(json.loads)]
+    array_attr: np.ndarray
+    optional_note: str | None = None
+    defaulted: int = 42
+
+
+class Result(h5t.Group[ResultAttrs]):
+    """Representative schema containing every supported field kind."""
+
+    model_config = ConfigDict(extra="ignore")
+
     values: np.ndarray
-    measurement: Annotated[LazyMeasurement, h5t.Payload("data")]
-    eager_measurement: Annotated[LazyMeasurement, h5t.Payload("data"), h5t.Eager()]
+    measurement: h5t.Dataset[MeasurementAttrs]
+    raw_measurement: h5t.Dataset
     nested: Nested
-    optional_note: str | None
-    defaulted: int = "42"  # type: ignore[assignment]
 
 
 def write_result(path: Path, *, root: str = "/") -> None:
@@ -76,7 +71,7 @@ def write_result(path: Path, *, root: str = "/") -> None:
         group.attrs["undeclared"] = "raw"
         values = group.create_dataset("values", data=np.arange(4))
         values.attrs["ignored"] = "plain arrays do not inspect this"
-        for name in ("measurement", "eager_measurement"):
+        for name in ("measurement", "raw_measurement"):
             dataset = group.create_dataset(name, data=np.arange(5))
             dataset.attrs["unit"] = "m"
             dataset.attrs["extra"] = name
