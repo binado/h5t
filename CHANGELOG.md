@@ -27,6 +27,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking:** `extra="forbid"` on a group concerns child nodes only. It no longer
   rejects attributes on a group with untyped attributes; declare `Group[T]` with
   `extra="forbid"` on `T` for that.
+- **Breaking:** untyped group attributes are read-only when the group is built in memory
+  too (`Group(attrs={...}).attrs` is a `MappingProxyType`), as they already were after
+  loading. Build a new group to change them.
 - **Breaking:** untyped `Dataset` attributes are converted to Python values (`int`, `str`,
   ...) as untyped group attributes already were, instead of NumPy scalars.
 - Nested groups and typed attributes are written using their runtime model fields,

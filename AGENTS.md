@@ -123,8 +123,9 @@ Each *type* converts raw input itself:
   aliases of them) read through the `Annotated` markers `_mark` attached, so `read` or
   `_read_array` runs via Pydantic's standard `Annotated` hook without walking or rewriting raw
   `CoreSchema` dicts.
-- `Group._h5t_load` freezes loaded untyped attrs into a `MappingProxyType`. `extra="forbid"`
-  on a group concerns child nodes only.
+- The `attrs` field validator (`Group._h5t_attrs_scope`) freezes untyped attrs into a
+  `MappingProxyType`, whether loaded or built in memory. `extra="forbid"` on a group concerns
+  child nodes only.
 
 Pydantic's semantics apply: `T | None` without a default is required, defaults are not
 re-validated unless `validate_default`, and under `extra="ignore"` only declared names are read.

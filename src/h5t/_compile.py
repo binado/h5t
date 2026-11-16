@@ -384,27 +384,25 @@ class Group(BaseModel, Generic[T]):
     def _h5t_attrs_scope(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
         # Attribute dims must not bind together with the dims of the group's children.
         with jaxtyped("context"):
-            return handler(value)
+            attrs = handler(value)
+        # Untyped attributes are a read-only snapshot, loaded or built in memory. Pydantic
+        # validated them into a new dict, so the caller's own mapping is not frozen.
+        return MappingProxyType(attrs) if isinstance(attrs, dict) else attrs
 
     @model_validator(mode="wrap")
     @classmethod
     def _h5t_load(cls, values: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
-        loading = isinstance(values, _GroupView)
         try:
             # One jaxtyping scope per group: its children bind dimensions together.
             with jaxtyped("context"):
-                model = handler(values)
+                return handler(values)
         except PydanticValidationError as exc:
-            if not loading:
+            if not isinstance(values, _GroupView):
                 raise
             # This group knows its own HDF5 path, so the error is located here. An
             # ``h5t.ValidationError`` from a nested node already carries its path and is
             # not a ``ValueError``, so it passes through every enclosing group unchanged.
             raise _located_error(exc, values.node.name) from exc
-        if loading and isinstance(model.attrs, dict):
-            # Untyped attributes of a loaded group are a read-only snapshot.
-            object.__setattr__(model, "attrs", MappingProxyType(model.attrs))
-        return model
 
     @classmethod
     def model_validate_hdf5(

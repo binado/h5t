@@ -97,6 +97,24 @@ def test_untyped_attrs_are_python_values_on_groups_and_datasets(tmp_path: Path) 
     assert type(result.measurement.attrs["count"]) is int
 
 
+def test_untyped_group_attrs_are_read_only_in_memory_and_loaded(tmp_path: Path) -> None:
+    source = {"count": 1}
+    group = h5t.Group(attrs=source)
+    with pytest.raises(TypeError):
+        group.attrs["count"] = 2  # type: ignore[index]
+    with pytest.raises(TypeError):
+        h5t.Group().attrs["count"] = 2  # type: ignore[index]
+    source["count"] = 5  # the caller's mapping is neither frozen nor aliased
+    assert group.attrs == {"count": 1}
+
+    path = tmp_path / "attrs.h5"
+    group.model_dump_hdf5(path)
+    loaded = h5t.Group.model_validate_hdf5(path)
+    assert loaded == group
+    with pytest.raises(TypeError):
+        loaded.attrs["count"] = 2  # type: ignore[index]
+
+
 def test_forward_reference_to_a_group_defined_later_in_the_module_resolves(tmp_path: Path) -> None:
     path = tmp_path / "forward.h5"
     with h5py.File(path, "w") as file:
